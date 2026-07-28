@@ -1,4 +1,5 @@
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -73,6 +74,8 @@ def test_one_round_runs_with_real_serialized_client_logits():
     assert metrics["vcaa_enabled"] == 0
     assert metrics["teachers_admitted"] == [2]
     assert metrics["teachers_rejected"] == [0]
+    assert math.isnan(metrics["niabd_anomaly_fraction"][0])
+    assert math.isnan(metrics["niabd_threshold_mean"][0])
     assert any(
         not torch.equal(server_before[key], server.state_dict()[key])
         for key in server_before
@@ -257,4 +260,4 @@ def test_no_admitted_teacher_skips_niabd_and_server_update_cleanly():
     assert metrics["teachers_admitted"] == [0]
     assert metrics["teachers_purified"] == [0]
     assert metrics["server_update_applied"] == [0]
-    assert metrics["niabd_prototype_observations"] == [0.0]
+    assert math.isnan(metrics["niabd_prototype_observations"][0])

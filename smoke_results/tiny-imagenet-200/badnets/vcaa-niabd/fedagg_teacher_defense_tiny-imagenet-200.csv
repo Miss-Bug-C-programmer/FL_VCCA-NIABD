@@ -1,0 +1,5 @@
+run_uid,dataset,seed,round,topology,num_clients,partition_scheme,defense_method,client_id,anomaly_fraction,mean_abs_deviation,max_abs_deviation,mean_suppression,memory_eligible
+7a706d2c38fc,tiny-imagenet-200,0,1,server-client,2,dirichlet,niabd,0,0.0,0.0,0.0,0.0,True
+7a706d2c38fc,tiny-imagenet-200,0,1,server-client,2,dirichlet,niabd,1,0.0,0.0,0.0,0.0,True
+7a706d2c38fc,tiny-imagenet-200,0,2,server-client,2,dirichlet,niabd,0,0.05225000157952309,0.8813959360122681,3.9613492488861084,0.00609847204759717,True
+7a706d2c38fc,tiny-imagenet-200,0,2,server-client,2,dirichlet,niabd,1,0.09525000303983688,0.9582844376564026,4.766519546508789,0.010544958524405956,False

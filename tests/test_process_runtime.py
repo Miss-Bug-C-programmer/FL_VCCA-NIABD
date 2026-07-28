@@ -57,16 +57,16 @@ def _profile():
         "ack_delay_probability": 0.0,
         "ack_delay_s": 0.0,
         "events": {
-            "0:2": {
+            "0:1": {
                 "ack_delay_s_by_attempt": {"1": 0.5},
             },
-            "1:2": {
+            "1:1": {
                 "dropped_attempts": [1],
             },
-            "2:2": {
-                "compute_slowdown_factor": 1.5,
-                "upload_delay_s": 2.5,
-            },
+        "2:2": {
+            "compute_slowdown_factor": 1.5,
+            "upload_delay_s": 5.0,
+        },
         },
     }
 
@@ -100,7 +100,7 @@ def process_result(tmp_path_factory):
         profile=_profile(),
         seed=0,
         num_clients=3,
-        rounds=4,
+        rounds=5,
         warmup_rounds=1,
         participation_rate=1.0,
     )
@@ -134,7 +134,7 @@ def process_result(tmp_path_factory):
             trace=trace,
             config=config,
             local_epochs=1,
-            rounds=4,
+            rounds=5,
             learning_rate=0.01,
             distill_temperature=2.0,
             admission_controller=VersionContentAwareAdmission(
@@ -278,12 +278,12 @@ def test_timeout_retry_and_attempt_drop_reuse_packet_identity(
     timeout_event = next(
         event for event in metrics["runtime_events"]
         if int(event["client_id"]) == 0
-        and int(event["source_round"]) == 2
+        and int(event["source_round"]) == 1
     )
     drop_event = next(
         event for event in metrics["runtime_events"]
         if int(event["client_id"]) == 1
-        and int(event["source_round"]) == 2
+        and int(event["source_round"]) == 1
     )
 
     assert timeout_event["rpc_timeout_count"] == 1

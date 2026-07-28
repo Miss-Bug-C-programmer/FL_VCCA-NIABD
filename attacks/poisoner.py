@@ -44,6 +44,12 @@ class BackdoorBatchPoisoner:
     def round_stats(self) -> PoisonStats:
         return PoisonStats(**self._round_stats.to_dict())
 
+    @property
+    def last_stats(self) -> PoisonStats:
+        """Backward-compatible snapshot of the current round statistics."""
+
+        return self.round_stats
+
     def start_round(self, round_number: int) -> None:
         self._round_number = int(round_number)
         self._round_stats = PoisonStats()

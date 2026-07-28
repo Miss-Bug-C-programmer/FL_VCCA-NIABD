@@ -1,0 +1,27 @@
+{
+  "config": {
+    "attack_end_round": 2,
+    "attack_start_round": 1,
+    "attack_type": "badnets",
+    "blend_alpha": 0.2,
+    "dba_parts": 4,
+    "dynamic_period": 1,
+    "malicious_fraction": 0.5,
+    "poison_interval": 1,
+    "poison_ratio": 0.2,
+    "target_label": 0,
+    "trigger_size": 8,
+    "trigger_value": 1.0
+  },
+  "dba_trigger_assignments": [
+    [
+      0,
+      0
+    ]
+  ],
+  "malicious_client_ids": [
+    0
+  ],
+  "num_clients": 2,
+  "seed": 0
+}

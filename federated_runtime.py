@@ -190,15 +190,15 @@ def _defense_metrics(
     if result is None:
         return {
             "method": str(method),
-            "warmup": 0.0,
-            "prototype_updated": 0.0,
-            "prototype_observations": 0.0,
-            "threshold_mean": 0.0,
-            "threshold_min": 0.0,
-            "threshold_max": 0.0,
-            "anomaly_fraction": 0.0,
-            "mean_suppression": 0.0,
-            "memory_eligible_teachers": 0,
+            "warmup": float("nan"),
+            "prototype_updated": float("nan"),
+            "prototype_observations": float("nan"),
+            "threshold_mean": float("nan"),
+            "threshold_min": float("nan"),
+            "threshold_max": float("nan"),
+            "anomaly_fraction": float("nan"),
+            "mean_suppression": float("nan"),
+            "memory_eligible_teachers": float("nan"),
             "teachers_purified": 0,
             "records": [],
         }
@@ -707,7 +707,7 @@ def run_fedagg_server_client(
             float(defense_metrics["prototype_observations"])
         )
         metrics["niabd_memory_eligible_teachers"].append(
-            int(defense_metrics["memory_eligible_teachers"])
+            float(defense_metrics["memory_eligible_teachers"])
         )
         metrics["teacher_defense_records"].append(
             defense_metrics["records"]

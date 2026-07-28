@@ -1,0 +1,5 @@
+run_uid,dataset,seed,round,runtime,strategy,attack_type,attack_plan_id,target_label,topology,num_clients,partition_scheme,client_id,is_malicious,attack_active,poisoned_samples,eligible_poison_samples,poisoned_batches,dba_trigger_part,admitted,admission_score,niabd_anomaly_fraction,niabd_mean_abs_deviation,niabd_max_abs_deviation,niabd_mean_suppression,niabd_memory_eligible
+84ac19fb7e3e,cinic10,0,1,sync,baseline,dba,64e1dfd2e7ca6a907d0bcbcc0cb549e0101543d60da67622a875e8dccba44214,0,server-client,2,dirichlet,0,True,True,10,52,1,0,True,,,,,,
+84ac19fb7e3e,cinic10,0,1,sync,baseline,dba,64e1dfd2e7ca6a907d0bcbcc0cb549e0101543d60da67622a875e8dccba44214,0,server-client,2,dirichlet,1,False,False,0,0,0,-1,True,,,,,,
+84ac19fb7e3e,cinic10,0,2,sync,baseline,dba,64e1dfd2e7ca6a907d0bcbcc0cb549e0101543d60da67622a875e8dccba44214,0,server-client,2,dirichlet,0,True,True,10,52,1,0,True,,,,,,
+84ac19fb7e3e,cinic10,0,2,sync,baseline,dba,64e1dfd2e7ca6a907d0bcbcc0cb549e0101543d60da67622a875e8dccba44214,0,server-client,2,dirichlet,1,False,False,0,0,0,-1,True,,,,,,

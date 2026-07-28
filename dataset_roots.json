@@ -1,0 +1,5 @@
+{
+  "cifar10": "D:\\research\\experiment\\3-fedaggcvv\\01-cvv\\FL_VCCA-NIABD\\dataset",
+  "cinic10": "D:\\research\\experiment\\3-fedaggcvv\\01-cvv\\FL_VCCA-NIABD\\dataset\\CINIC-10",
+  "tiny-imagenet-200": "D:\\research\\experiment\\3-fedaggcvv\\01-cvv\\FL_VCCA-NIABD\\dataset\\tiny-imagenet-200"
+}

@@ -294,11 +294,12 @@ def _round_rows(
                     round_idx,
                 )
             ),
-            "niabd_memory_eligible_teachers": int(
+            "niabd_memory_eligible_teachers": float(
                 _metric(
                     metrics,
                     "niabd_memory_eligible_teachers",
                     round_idx,
+                    np.nan,
                 )
             ),
             "nonfinite_eval_batches": int(

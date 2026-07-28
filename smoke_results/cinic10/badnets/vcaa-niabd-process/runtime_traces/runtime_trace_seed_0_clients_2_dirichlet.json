@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "seed": 0,
+  "num_clients": 2,
+  "rounds": 3,
+  "warmup_rounds": 1,
+  "profile_name": "test-stale",
+  "events": [
+    {
+      "client_id": 0,
+      "source_round": 1,
+      "selected": true,
+      "available": true,
+      "compute_slowdown_factor": 1.0,
+      "upload_delay_s": 0.0,
+      "dropped_attempts": [],
+      "ack_delay_s_by_attempt": []
+    },
+    {
+      "client_id": 1,
+      "source_round": 1,
+      "selected": true,
+      "available": true,
+      "compute_slowdown_factor": 1.0,
+      "upload_delay_s": 0.0,
+      "dropped_attempts": [],
+      "ack_delay_s_by_attempt": []
+    },
+    {
+      "client_id": 0,
+      "source_round": 2,
+      "selected": true,
+      "available": true,
+      "compute_slowdown_factor": 1.0,
+      "upload_delay_s": 0.0,
+      "dropped_attempts": [],
+      "ack_delay_s_by_attempt": [
+        [
+          1,
+          0.5
+        ]
+      ]
+    },
+    {
+      "client_id": 1,
+      "source_round": 2,
+      "selected": true,
+      "available": true,
+      "compute_slowdown_factor": 3.0,
+      "upload_delay_s": 0.05,
+      "dropped_attempts": [
+        1
+      ],
+      "ack_delay_s_by_attempt": []
+    },
+    {
+      "client_id": 0,
+      "source_round": 3,
+      "selected": true,
+      "available": true,
+      "compute_slowdown_factor": 1.0,
+      "upload_delay_s": 0.0,
+      "dropped_attempts": [],
+      "ack_delay_s_by_attempt": []
+    },
+    {
+      "client_id": 1,
+      "source_round": 3,
+      "selected": true,
+      "available": true,
+      "compute_slowdown_factor": 3.0,
+      "upload_delay_s": 0.05,
+      "dropped_attempts": [],
+      "ack_delay_s_by_attempt": []
+    }
+  ],
+  "run_metadata": {
+    "run_uid": "bf095d6e6adc",
+    "seed": 0,
+    "strategy": "vcaa-niabd",
+    "dataset": "cinic10",
+    "partition_scheme": "dirichlet"
+  }
+}

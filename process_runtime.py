@@ -1543,7 +1543,7 @@ def run_fedagg_server_client_process_async(
                 "niabd_prototype_observations": float(
                     defense_metrics["prototype_observations"]
                 ),
-                "niabd_memory_eligible_teachers": int(
+                "niabd_memory_eligible_teachers": float(
                     defense_metrics["memory_eligible_teachers"]
                 ),
                 "nonfinite_eval_batches": int(nonfinite_eval),
