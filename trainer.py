@@ -62,6 +62,8 @@ def local_train(
     numeric_check_interval=0,
     numeric_stats=None,
     optimizer=None,
+    batch_transform=None,
+    round_number: int = 0,
 ):
     """Train one local client model.
 
@@ -86,6 +88,21 @@ def local_train(
             step += 1
             imgs = imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            if batch_transform is not None:
+                imgs, labels = batch_transform(
+                    imgs,
+                    labels,
+                    round_number=int(round_number),
+                    batch_index=int(step),
+                )
+                if imgs.ndim != 4 or labels.ndim != 1:
+                    raise ValueError(
+                        "batch_transform must return [N,C,H,W] images and [N] labels."
+                    )
+                if int(imgs.shape[0]) != int(labels.shape[0]):
+                    raise ValueError(
+                        "batch_transform changed image/label batch cardinality."
+                    )
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, enabled=amp_enabled):
                 output = model(imgs)

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+from PIL import Image
 import torch.nn.functional as F
 
 
@@ -46,6 +47,57 @@ class ProxyInputDataset(torch.utils.data.Dataset):
         return sample[0]
 
 
+class TinyImageNetValidationDataset(torch.utils.data.Dataset):
+    """Official Tiny-ImageNet validation split with annotation labels."""
+
+    def __init__(self, root: str, class_to_idx: Dict[str, int], transform=None):
+        self.root = os.path.abspath(root)
+        self.transform = transform
+        val_dir = os.path.join(self.root, "val")
+        image_dir = os.path.join(val_dir, "images")
+        annotation_path = os.path.join(val_dir, "val_annotations.txt")
+        if not os.path.isdir(image_dir):
+            raise FileNotFoundError(
+                f"Tiny-ImageNet validation images not found: {image_dir}"
+            )
+        if not os.path.isfile(annotation_path):
+            raise FileNotFoundError(
+                f"Tiny-ImageNet annotations not found: {annotation_path}"
+            )
+        annotation = {}
+        with open(annotation_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.strip().split("\t")
+                if len(fields) < 2:
+                    continue
+                annotation[fields[0]] = fields[1]
+        samples = []
+        for filename in sorted(os.listdir(image_dir)):
+            if filename not in annotation:
+                continue
+            wnid = annotation[filename]
+            if wnid not in class_to_idx:
+                raise ValueError(
+                    f"Tiny-ImageNet validation class {wnid!r} is absent from train classes."
+                )
+            samples.append((os.path.join(image_dir, filename), int(class_to_idx[wnid])))
+        if not samples:
+            raise ValueError("Tiny-ImageNet validation split contains no labeled images.")
+        self.samples = tuple(samples)
+        self.targets = [int(label) for _, label in self.samples]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        path, label = self.samples[int(index)]
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, int(label)
+
+
 @dataclass(frozen=True)
 class FederatedDataPlan:
     """Deterministic process-runtime partition and proxy identity."""
@@ -59,6 +111,7 @@ class FederatedDataPlan:
     partition_scheme: str
     label_skew_classes: int
     quantity_skew_alpha: float
+    dirichlet_alpha: float
     batch_size: int
     transform_identity: str
     proxy_version: str
@@ -225,6 +278,51 @@ def _quantity_skew_partition(indices: List[int], num_clients: int, alpha: float,
     return partitions
 
 
+def _dirichlet_label_partition(
+    targets: List[int],
+    indices: List[int],
+    num_clients: int,
+    alpha: float,
+    seed: int,
+) -> List[List[int]]:
+    """Class-wise Dirichlet label-distribution partition used in FL studies."""
+
+    if float(alpha) <= 0.0:
+        raise ValueError("dirichlet_alpha must be positive.")
+    rng = np.random.default_rng(int(seed) + 509)
+    partitions: List[List[int]] = [[] for _ in range(int(num_clients))]
+    classes = sorted({int(targets[index]) for index in indices})
+    for class_id in classes:
+        class_indices = [
+            int(index) for index in indices
+            if int(targets[index]) == int(class_id)
+        ]
+        rng.shuffle(class_indices)
+        proportions = rng.dirichlet(
+            np.full(int(num_clients), float(alpha), dtype=np.float64)
+        )
+        raw_counts = proportions * len(class_indices)
+        counts = np.floor(raw_counts).astype(int)
+        remainder = len(class_indices) - int(counts.sum())
+        if remainder > 0:
+            fractional = raw_counts - counts
+            for client_id in np.argsort(-fractional)[:remainder]:
+                counts[int(client_id)] += 1
+        cursor = 0
+        for client_id, count in enumerate(counts.tolist()):
+            if count <= 0:
+                continue
+            partitions[client_id].extend(
+                class_indices[cursor : cursor + int(count)]
+            )
+            cursor += int(count)
+        if cursor != len(class_indices):
+            raise RuntimeError("Dirichlet partition lost class samples.")
+    for client_id in range(int(num_clients)):
+        random.Random(int(seed) + 6000 + client_id).shuffle(partitions[client_id])
+    return partitions
+
+
 def _resolve_mp_context(num_workers: int, loader_mp_context: Optional[str]):
     if int(max(0, num_workers)) <= 0:
         return None
@@ -288,7 +386,7 @@ def _split_indices(total_size: int, seed: int, val_ratio: float, proxy_ratio: fl
     return train_idx, proxy_idx, val_idx
 
 
-def _build_partition(trainset, indices: List[int], num_clients: int, partition_scheme: str, seed: int, label_skew_classes: int, quantity_skew_alpha: float) -> List[List[int]]:
+def _build_partition(trainset, indices: List[int], num_clients: int, partition_scheme: str, seed: int, label_skew_classes: int, quantity_skew_alpha: float, dirichlet_alpha: float = 0.5) -> List[List[int]]:
     targets = _extract_targets(trainset)
     scheme = str(partition_scheme).lower()
     rng = random.Random(int(seed) + 301)
@@ -299,6 +397,10 @@ def _build_partition(trainset, indices: List[int], num_clients: int, partition_s
         partitions = _label_skew_partition(targets, indices, num_clients, label_skew_classes, int(seed))
     elif scheme == 'quantity-skew':
         partitions = _quantity_skew_partition(indices, num_clients, quantity_skew_alpha, int(seed))
+    elif scheme == 'dirichlet':
+        partitions = _dirichlet_label_partition(
+            targets, indices, num_clients, dirichlet_alpha, int(seed)
+        )
     else:
         raise ValueError(f'Unsupported partition_scheme: {partition_scheme}')
 
@@ -378,9 +480,51 @@ def _load_dataset_pair(dataset_path: str, dataset_name: str):
         )
     elif name == 'femnist':
         trainset, testset = _load_femnist_datasets(dataset_path)
+    elif name == 'cinic10':
+        train_dir = os.path.join(dataset_path, 'train')
+        test_dir = os.path.join(dataset_path, 'test')
+        if not os.path.isdir(train_dir) or not os.path.isdir(test_dir):
+            raise FileNotFoundError(
+                "CINIC-10 expects dataset/train and dataset/test class directories."
+            )
+        trainset = datasets.ImageFolder(train_dir, transform=transform)
+        testset = datasets.ImageFolder(test_dir, transform=transform)
+        if len(trainset.classes) != 10:
+            raise ValueError(
+                f"CINIC-10 requires 10 train classes, found {len(trainset.classes)}."
+            )
+        if trainset.class_to_idx != testset.class_to_idx:
+            raise ValueError("CINIC-10 train/test class mappings do not match.")
+    elif name in {'tiny-imagenet-200', 'tiny_imagenet_200', 'tinyimagenet200'}:
+        train_dir = os.path.join(dataset_path, 'train')
+        if not os.path.isdir(train_dir):
+            raise FileNotFoundError(
+                f"Tiny-ImageNet training directory not found: {train_dir}"
+            )
+        trainset = datasets.ImageFolder(train_dir, transform=transform)
+        if len(trainset.classes) != 200:
+            raise ValueError(
+                f"Tiny-ImageNet-200 requires 200 train classes, found {len(trainset.classes)}."
+            )
+        official_annotations = os.path.join(
+            dataset_path, 'val', 'val_annotations.txt'
+        )
+        if os.path.isfile(official_annotations):
+            testset = TinyImageNetValidationDataset(
+                dataset_path,
+                trainset.class_to_idx,
+                transform=transform,
+            )
+        else:
+            val_dir = os.path.join(dataset_path, 'val')
+            testset = datasets.ImageFolder(val_dir, transform=transform)
+            if trainset.class_to_idx != testset.class_to_idx:
+                raise ValueError(
+                    "Reorganized Tiny-ImageNet validation class mapping does not match train."
+                )
     else:
         raise ValueError(
-            'Unsupported dataset_name. Use cifar10, cifar100, or femnist.'
+            'Unsupported dataset_name. Use cifar10, cifar100, femnist, cinic10, or tiny-imagenet-200.'
         )
     return trainset, testset
 
@@ -414,7 +558,8 @@ def build_federated_data_plan(
     partition_scheme: str,
     label_skew_classes: int,
     quantity_skew_alpha: float,
-    val_ratio: float,
+    dirichlet_alpha: float = 0.5,
+    val_ratio: float = 0.1,
     proxy_ratio: float,
     proxy_dataset_size: Optional[int],
 ) -> FederatedDataPlan:
@@ -438,6 +583,7 @@ def build_federated_data_plan(
         seed=int(seed),
         label_skew_classes=int(label_skew_classes),
         quantity_skew_alpha=float(quantity_skew_alpha),
+        dirichlet_alpha=float(dirichlet_alpha),
     )
     transform_identity = "tensor-normalize-0.5-v1"
     return FederatedDataPlan(
@@ -453,6 +599,7 @@ def build_federated_data_plan(
         partition_scheme=str(partition_scheme),
         label_skew_classes=int(label_skew_classes),
         quantity_skew_alpha=float(quantity_skew_alpha),
+        dirichlet_alpha=float(dirichlet_alpha),
         batch_size=int(batch_size),
         transform_identity=transform_identity,
         proxy_version=_proxy_version(
@@ -560,6 +707,7 @@ def get_dataloaders(
     partition_scheme: str = 'iid',
     label_skew_classes: int = 2,
     quantity_skew_alpha: float = 0.5,
+    dirichlet_alpha: float = 0.5,
     num_workers: int = 0,
     pin_memory: bool = False,
     val_ratio: float = 0.1,
@@ -586,6 +734,7 @@ def get_dataloaders(
         seed=seed_i,
         label_skew_classes=label_skew_classes,
         quantity_skew_alpha=quantity_skew_alpha,
+        dirichlet_alpha=dirichlet_alpha,
     )
 
     client_loaders = []

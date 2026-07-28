@@ -29,7 +29,14 @@ class FederatedClient:
         self.strict_numeric_checks = bool(strict_numeric_checks)
         self.model_round = 0
 
-    def train_local(self, *, epochs: int, learning_rate: float) -> None:
+    def train_local(
+        self,
+        *,
+        epochs: int,
+        learning_rate: float,
+        batch_transform=None,
+        round_number: int = 0,
+    ) -> None:
         local_train(
             self.model,
             self.train_loader,
@@ -38,6 +45,8 @@ class FederatedClient:
             epochs=int(epochs),
             amp=self.amp,
             strict_numeric_checks=self.strict_numeric_checks,
+            batch_transform=batch_transform,
+            round_number=int(round_number),
         )
         self.model_round += 1
 

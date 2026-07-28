@@ -20,11 +20,15 @@ DATASET_SPECS = {
     "cifar10": DatasetSpec(num_classes=10),
     "cifar100": DatasetSpec(num_classes=100),
     "femnist": DatasetSpec(num_classes=62),
+    "cinic10": DatasetSpec(num_classes=10),
+    "tiny-imagenet-200": DatasetSpec(num_classes=200),
 }
 
 
 def dataset_spec(dataset_name: str) -> DatasetSpec:
     name = str(dataset_name).lower()
+    if name in {"tiny_imagenet_200", "tinyimagenet200"}:
+        name = "tiny-imagenet-200"
     try:
         return DATASET_SPECS[name]
     except KeyError as exc:

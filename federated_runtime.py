@@ -7,6 +7,12 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from attacks import (
+    AttackPlan,
+    BackdoorBatchPoisoner,
+    evaluate_backdoor_suite,
+    split_defense_diagnostics,
+)
 from admission import (
     AdmissionDecision,
     TeacherAdmissionController,
@@ -254,6 +260,7 @@ def run_fedagg_server_client(
     admission_controller: Optional[TeacherAdmissionController] = None,
     defense_controller: Optional[KnowledgeDefenseController] = None,
     enable_client_distillation: bool = True,
+    attack_plan: Optional[AttackPlan] = None,
 ) -> Dict[str, object]:
     """Train real clients through serialized proxy-logits knowledge exchange.
 
@@ -305,6 +312,18 @@ def run_fedagg_server_client(
         amp=bool(amp),
         strict_numeric_checks=bool(strict_numeric_checks),
     )
+    if attack_plan is not None and int(attack_plan.num_clients) != len(clients):
+        raise ValueError(
+            "Attack plan client count must match the active client set."
+        )
+    poisoners = {
+        int(client.client_id): BackdoorBatchPoisoner(
+            plan=attack_plan,
+            client_id=int(client.client_id),
+        )
+        for client in clients
+        if attack_plan is not None and attack_plan.is_malicious(client.client_id)
+    }
 
     metrics: Dict[str, object] = {
         "topology": "server-client",
@@ -372,6 +391,44 @@ def run_fedagg_server_client(
         "nonfinite_eval_batches": [],
         "nonfinite_distill_rollbacks": [],
         "numeric_failure_count": [],
+        "attack_type": (
+            attack_plan.config.attack_type if attack_plan is not None else "none"
+        ),
+        "attack_plan_id": (
+            attack_plan.identity if attack_plan is not None else ""
+        ),
+        "target_label": (
+            int(attack_plan.config.target_label) if attack_plan is not None else -1
+        ),
+        "malicious_client_ids": (
+            list(attack_plan.malicious_client_ids) if attack_plan is not None else []
+        ),
+        "malicious_fraction": (
+            float(attack_plan.config.malicious_fraction) if attack_plan is not None else 0.0
+        ),
+        "poison_ratio": (
+            float(attack_plan.config.poison_ratio) if attack_plan is not None else 0.0
+        ),
+        "attack_start_round": (
+            int(attack_plan.config.attack_start_round) if attack_plan is not None else -1
+        ),
+        "attack_active": [],
+        "poisoned_samples": [],
+        "eligible_poison_samples": [],
+        "basr_global": [],
+        "basr_global_numerator": [],
+        "basr_global_denominator": [],
+        "basr_local_1": [],
+        "basr_local_2": [],
+        "basr_local_3": [],
+        "basr_local_4": [],
+        "malicious_mean_anomaly_fraction": [],
+        "benign_mean_anomaly_fraction": [],
+        "malicious_mean_suppression": [],
+        "benign_mean_suppression": [],
+        "malicious_memory_eligible_rate": [],
+        "benign_memory_eligible_rate": [],
+        "backdoor_client_records": [],
     }
 
     wall_clock = 0.0
@@ -381,11 +438,39 @@ def run_fedagg_server_client(
         round_start = time.perf_counter()
 
         local_start = time.perf_counter()
+        backdoor_records = []
         for client in clients:
+            poisoner = poisoners.get(int(client.client_id))
+            if poisoner is not None:
+                poisoner.start_round(round_number)
             client.train_local(
                 epochs=int(local_epochs),
                 learning_rate=float(learning_rate),
+                batch_transform=poisoner,
+                round_number=round_number,
             )
+            stats = poisoner.round_stats if poisoner is not None else None
+            backdoor_records.append({
+                "client_id": int(client.client_id),
+                "is_malicious": bool(
+                    attack_plan is not None
+                    and attack_plan.is_malicious(client.client_id)
+                ),
+                "attack_active": bool(
+                    attack_plan is not None
+                    and attack_plan.active_for(client.client_id, round_number)
+                ),
+                "poisoned_samples": int(stats.poisoned if stats is not None else 0),
+                "eligible_poison_samples": int(stats.eligible if stats is not None else 0),
+                "poisoned_batches": int(stats.poisoned_batches if stats is not None else 0),
+                "dba_trigger_part": (
+                    int(attack_plan.dba_part(client.client_id))
+                    if attack_plan is not None
+                    and attack_plan.config.attack_type == "dba"
+                    and attack_plan.is_malicious(client.client_id)
+                    else -1
+                ),
+            })
         local_time = time.perf_counter() - local_start
 
         upload_start = time.perf_counter()
@@ -458,6 +543,12 @@ def run_fedagg_server_client(
                 else "none"
             ),
         )
+        defense_split = split_defense_diagnostics(
+            defense_metrics["records"],
+            malicious_client_ids=(
+                attack_plan.malicious_client_ids if attack_plan is not None else ()
+            ),
+        )
 
         client_states = [
             _freeze_state_dict(client.model.state_dict())
@@ -513,6 +604,25 @@ def run_fedagg_server_client(
             device=device_obj,
             amp=bool(amp),
         )
+        if attack_plan is not None:
+            backdoor_eval = evaluate_backdoor_suite(
+                server.model,
+                test_loader,
+                device=device_obj,
+                plan=attack_plan,
+                round_number=round_number,
+                amp=bool(amp),
+            )
+        else:
+            backdoor_eval = {
+                "basr_global": float("nan"),
+                "basr_global_numerator": 0,
+                "basr_global_denominator": 0,
+                "basr_local_1": float("nan"),
+                "basr_local_2": float("nan"),
+                "basr_local_3": float("nan"),
+                "basr_local_4": float("nan"),
+            }
         round_time = time.perf_counter() - round_start
         wall_clock += round_time
 
@@ -605,6 +715,33 @@ def run_fedagg_server_client(
         metrics["nonfinite_eval_batches"].append(int(nonfinite_eval))
         metrics["nonfinite_distill_rollbacks"].append(int(rollback))
         metrics["numeric_failure_count"].append(0.0)
+        metrics["attack_active"].append(
+            int(attack_plan.config.active(round_number))
+            if attack_plan is not None else 0
+        )
+        metrics["poisoned_samples"].append(
+            int(sum(record["poisoned_samples"] for record in backdoor_records))
+        )
+        metrics["eligible_poison_samples"].append(
+            int(sum(record["eligible_poison_samples"] for record in backdoor_records))
+        )
+        for key in (
+            "basr_global",
+            "basr_local_1",
+            "basr_local_2",
+            "basr_local_3",
+            "basr_local_4",
+        ):
+            metrics[key].append(float(backdoor_eval[key]))
+        metrics["basr_global_numerator"].append(
+            int(backdoor_eval["basr_global_numerator"])
+        )
+        metrics["basr_global_denominator"].append(
+            int(backdoor_eval["basr_global_denominator"])
+        )
+        for key, value in defense_split.items():
+            metrics[key].append(float(value))
+        metrics["backdoor_client_records"].append(backdoor_records)
 
         print(
             f"[Round {round_number}] topology=server-client "
@@ -613,7 +750,10 @@ def run_fedagg_server_client(
             f"defense={defense_metrics['method']} "
             f"loss={loss:.4f} local={local_time:.2f}s "
             f"upload={upload_time:.2f}s admission={admission_time:.2f}s "
-            f"niabd={defense_time:.2f}s distill={distill_time:.2f}s"
+            f"niabd={defense_time:.2f}s distill={distill_time:.2f}s "
+            f"attack={metrics['attack_type']} "
+            f"poisoned={metrics['poisoned_samples'][-1]} "
+            f"basr={metrics['basr_global'][-1]:.4f}"
             f"{' rollback=1' if rollback else ''}"
         )
 

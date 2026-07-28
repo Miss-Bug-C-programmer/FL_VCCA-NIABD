@@ -14,6 +14,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from attacks import (
+    AttackPlan,
+    BackdoorBatchPoisoner,
+    evaluate_backdoor_suite,
+    split_defense_diagnostics,
+)
 from admission import (
     AdmissionDecision,
     TeacherAdmissionController,
@@ -408,6 +414,8 @@ def _client_process_main(
     config: ProcessRuntimeConfig,
     seed: int,
     error_queue,
+    attack_plan: Optional[AttackPlan] = None,
+    attack_stats_queue=None,
 ) -> None:
     """Persistent spawned Client owning model, private data and retries."""
 
@@ -443,6 +451,11 @@ def _client_process_main(
         )
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         local_model_version = 0
+        poisoner = (
+            BackdoorBatchPoisoner(plan=attack_plan, client_id=int(client_id))
+            if attack_plan is not None and attack_plan.is_malicious(client_id)
+            else None
+        )
 
         while True:
             response, _, _ = rpc_call(
@@ -501,6 +514,9 @@ def _client_process_main(
                             config.strict_numeric_checks
                         ),
                     )
+                source_round = int(task["source_round"])
+                if poisoner is not None:
+                    poisoner.start_round(source_round)
                 local_train(
                     model,
                     private_loader,
@@ -512,7 +528,40 @@ def _client_process_main(
                         config.strict_numeric_checks
                     ),
                     optimizer=optimizer,
+                    batch_transform=poisoner,
+                    round_number=source_round,
                 )
+                if attack_stats_queue is not None:
+                    stats = poisoner.round_stats if poisoner is not None else None
+                    attack_stats_queue.put({
+                        "task_id": active_task_id,
+                        "client_id": int(client_id),
+                        "source_round": source_round,
+                        "is_malicious": bool(
+                            attack_plan is not None
+                            and attack_plan.is_malicious(client_id)
+                        ),
+                        "attack_active": bool(
+                            attack_plan is not None
+                            and attack_plan.active_for(client_id, source_round)
+                        ),
+                        "poisoned_samples": int(
+                            stats.poisoned if stats is not None else 0
+                        ),
+                        "eligible_poison_samples": int(
+                            stats.eligible if stats is not None else 0
+                        ),
+                        "poisoned_batches": int(
+                            stats.poisoned_batches if stats is not None else 0
+                        ),
+                        "dba_trigger_part": (
+                            int(attack_plan.dba_part(client_id))
+                            if attack_plan is not None
+                            and attack_plan.config.attack_type == "dba"
+                            and attack_plan.is_malicious(client_id)
+                            else -1
+                        ),
+                    })
                 if not _model_is_finite(model):
                     raise RuntimeError(
                         "Client model became non-finite after local update."
@@ -893,6 +942,19 @@ def _unconsumed_event_from_state(
     return event
 
 
+def _drain_attack_stats(attack_stats_queue, cache: Dict[str, Dict[str, object]]) -> None:
+    if attack_stats_queue is None:
+        return
+    while True:
+        try:
+            record = attack_stats_queue.get_nowait()
+        except queue.Empty:
+            return
+        if not isinstance(record, dict) or "task_id" not in record:
+            raise RuntimeError("Client attack stats queue returned an invalid record.")
+        cache[str(record["task_id"])] = dict(record)
+
+
 def _append_metric(metrics: Dict[str, object], key: str, value) -> None:
     values = metrics.setdefault(key, [])
     if not isinstance(values, list):
@@ -906,6 +968,7 @@ def _initialize_metrics(
     admission_controller,
     defense_controller,
     config: ProcessRuntimeConfig,
+    attack_plan: Optional[AttackPlan] = None,
 ) -> Dict[str, object]:
     return {
         "topology": "server-client",
@@ -932,6 +995,28 @@ def _initialize_metrics(
         "runtime_events": [],
         "teacher_admission_records": [],
         "teacher_defense_records": [],
+        "attack_type": (
+            attack_plan.config.attack_type if attack_plan is not None else "none"
+        ),
+        "attack_plan_id": (
+            attack_plan.identity if attack_plan is not None else ""
+        ),
+        "target_label": (
+            int(attack_plan.config.target_label) if attack_plan is not None else -1
+        ),
+        "malicious_client_ids": (
+            list(attack_plan.malicious_client_ids) if attack_plan is not None else []
+        ),
+        "malicious_fraction": (
+            float(attack_plan.config.malicious_fraction) if attack_plan is not None else 0.0
+        ),
+        "poison_ratio": (
+            float(attack_plan.config.poison_ratio) if attack_plan is not None else 0.0
+        ),
+        "attack_start_round": (
+            int(attack_plan.config.attack_start_round) if attack_plan is not None else -1
+        ),
+        "backdoor_client_records": [],
     }
 
 
@@ -949,6 +1034,7 @@ def run_fedagg_server_client_process_async(
     admission_controller: Optional[TeacherAdmissionController] = None,
     defense_controller: Optional[KnowledgeDefenseController] = None,
     enable_client_distillation: bool = True,
+    attack_plan: Optional[AttackPlan] = None,
 ) -> Dict[str, object]:
     """Run real persistent Client processes through localhost TCP RPC."""
 
@@ -956,6 +1042,8 @@ def run_fedagg_server_client_process_async(
         raise ValueError("Runtime trace rounds do not match the run.")
     if data_plan.num_clients != int(trace.num_clients):
         raise ValueError("Runtime trace client count does not match data plan.")
+    if attack_plan is not None and int(attack_plan.num_clients) != data_plan.num_clients:
+        raise ValueError("Attack plan client count does not match data plan.")
     proxy_loader = server_dataloaders.get("proxy")
     test_loader = server_dataloaders.get("test")
     if proxy_loader is None or test_loader is None:
@@ -991,6 +1079,7 @@ def run_fedagg_server_client_process_async(
     host, port = rpc_server.address
     context = torch.multiprocessing.get_context("spawn")
     error_queue = context.Queue()
+    attack_stats_queue = context.Queue()
     processes = [
         context.Process(
             target=_client_process_main,
@@ -1003,6 +1092,8 @@ def run_fedagg_server_client_process_async(
                 "config": config,
                 "seed": int(trace.seed),
                 "error_queue": error_queue,
+                "attack_plan": attack_plan,
+                "attack_stats_queue": attack_stats_queue,
             },
             name=f"fedagg-client-{client_id}",
         )
@@ -1013,6 +1104,7 @@ def run_fedagg_server_client_process_async(
         admission_controller=admission_controller,
         defense_controller=defense_controller,
         config=config,
+        attack_plan=attack_plan,
     )
     latest_server_packet = ServerLogitsPacket.from_logits(
         model_round=0,
@@ -1021,6 +1113,7 @@ def run_fedagg_server_client_process_async(
         logits=initial_logits,
     )
     reference_times: List[float] = []
+    attack_stats_cache: Dict[str, Dict[str, object]] = {}
     wall_start = time.monotonic()
     try:
         for process in processes:
@@ -1086,6 +1179,7 @@ def run_fedagg_server_client_process_async(
                 ),
             )
             candidates = service.drain_mailbox()
+            _drain_attack_stats(attack_stats_queue, attack_stats_cache)
             consumed_at_s = time.monotonic()
             knowledge_by_client: Dict[int, TeacherKnowledge] = {}
             round_events: List[Dict[str, object]] = []
@@ -1113,6 +1207,43 @@ def run_fedagg_server_client_process_async(
                     consumed_at_s=consumed_at_s,
                     state=state,
                 )
+                _drain_attack_stats(attack_stats_queue, attack_stats_cache)
+                attack_record = attack_stats_cache.get(str(packet.task_id))
+                event.update({
+                    "is_malicious": bool(
+                        attack_plan is not None
+                        and attack_plan.is_malicious(packet.client_id)
+                    ),
+                    "attack_active": bool(
+                        attack_plan is not None
+                        and attack_plan.active_for(
+                            packet.client_id, packet.source_round
+                        )
+                    ),
+                    "poisoned_samples": (
+                        int(attack_record["poisoned_samples"])
+                        if attack_record is not None else _nan()
+                    ),
+                    "eligible_poison_samples": (
+                        int(attack_record["eligible_poison_samples"])
+                        if attack_record is not None else _nan()
+                    ),
+                    "poisoned_batches": (
+                        int(attack_record["poisoned_batches"])
+                        if attack_record is not None else _nan()
+                    ),
+                    "dba_trigger_part": (
+                        int(attack_record["dba_trigger_part"])
+                        if attack_record is not None else (
+                            int(attack_plan.dba_part(packet.client_id))
+                            if attack_plan is not None
+                            and attack_plan.config.attack_type == "dba"
+                            and attack_plan.is_malicious(packet.client_id)
+                            else -1
+                        )
+                    ),
+                    "attack_stats_missing": int(attack_record is None),
+                })
                 round_events.append(event)
                 coordinator.mark_consumed(
                     task_id=packet.task_id,
@@ -1203,6 +1334,13 @@ def run_fedagg_server_client_process_async(
                     else "none"
                 ),
             )
+            defense_split = split_defense_diagnostics(
+                defense_metrics["records"],
+                malicious_client_ids=(
+                    attack_plan.malicious_client_ids
+                    if attack_plan is not None else ()
+                ),
+            )
             defense_by_client = (
                 {
                     int(record.client_id): record
@@ -1259,6 +1397,25 @@ def run_fedagg_server_client_process_async(
                 device=torch.device(config.server_device),
                 amp=bool(config.amp),
             )
+            if attack_plan is not None:
+                backdoor_eval = evaluate_backdoor_suite(
+                    server.model,
+                    test_loader,
+                    device=torch.device(config.server_device),
+                    plan=attack_plan,
+                    round_number=server_round,
+                    amp=bool(config.amp),
+                )
+            else:
+                backdoor_eval = {
+                    "basr_global": _nan(),
+                    "basr_global_numerator": 0,
+                    "basr_global_denominator": 0,
+                    "basr_local_1": _nan(),
+                    "basr_local_2": _nan(),
+                    "basr_local_3": _nan(),
+                    "basr_local_4": _nan(),
+                }
             round_time = time.monotonic() - round_started
             version_lags = [
                 int(event["version_lag"]) for event in round_events
@@ -1394,6 +1551,59 @@ def run_fedagg_server_client_process_async(
                 "numeric_failure_count": float(
                     nonfinite_eval + rollback
                 ),
+                "attack_active": (
+                    int(attack_plan.config.active(server_round))
+                    if attack_plan is not None else 0
+                ),
+                "poisoned_samples": int(sum(
+                    int(event["poisoned_samples"])
+                    for event in round_events
+                    if not (
+                        isinstance(event["poisoned_samples"], float)
+                        and math.isnan(event["poisoned_samples"])
+                    )
+                )),
+                "eligible_poison_samples": int(sum(
+                    int(event["eligible_poison_samples"])
+                    for event in round_events
+                    if not (
+                        isinstance(event["eligible_poison_samples"], float)
+                        and math.isnan(event["eligible_poison_samples"])
+                    )
+                )),
+                "attack_stats_missing_count": sum(
+                    int(event["attack_stats_missing"])
+                    for event in round_events
+                ),
+                "basr_global": float(backdoor_eval["basr_global"]),
+                "basr_global_numerator": int(
+                    backdoor_eval["basr_global_numerator"]
+                ),
+                "basr_global_denominator": int(
+                    backdoor_eval["basr_global_denominator"]
+                ),
+                "basr_local_1": float(backdoor_eval["basr_local_1"]),
+                "basr_local_2": float(backdoor_eval["basr_local_2"]),
+                "basr_local_3": float(backdoor_eval["basr_local_3"]),
+                "basr_local_4": float(backdoor_eval["basr_local_4"]),
+                "malicious_mean_anomaly_fraction": float(
+                    defense_split["malicious_mean_anomaly_fraction"]
+                ),
+                "benign_mean_anomaly_fraction": float(
+                    defense_split["benign_mean_anomaly_fraction"]
+                ),
+                "malicious_mean_suppression": float(
+                    defense_split["malicious_mean_suppression"]
+                ),
+                "benign_mean_suppression": float(
+                    defense_split["benign_mean_suppression"]
+                ),
+                "malicious_memory_eligible_rate": float(
+                    defense_split["malicious_memory_eligible_rate"]
+                ),
+                "benign_memory_eligible_rate": float(
+                    defense_split["benign_memory_eligible_rate"]
+                ),
                 "selected_clients": len(dispatch.selected_clients),
                 "dispatched_clients": len(
                     dispatch.dispatched_clients
@@ -1452,6 +1662,24 @@ def run_fedagg_server_client_process_async(
                 admission_records
             )
             metrics["teacher_defense_records"].append(defense_records)
+            metrics["backdoor_client_records"].append([
+                {
+                    "client_id": int(event["client_id"]),
+                    "task_id": str(event["task_id"]),
+                    "packet_id": str(event["packet_id"]),
+                    "source_round": int(event["source_round"]),
+                    "consumed_round": int(event["consumed_round"]),
+                    "version_lag": int(event["version_lag"]),
+                    "is_malicious": bool(event["is_malicious"]),
+                    "attack_active": bool(event["attack_active"]),
+                    "poisoned_samples": event["poisoned_samples"],
+                    "eligible_poison_samples": event["eligible_poison_samples"],
+                    "poisoned_batches": event["poisoned_batches"],
+                    "dba_trigger_part": int(event["dba_trigger_part"]),
+                    "attack_stats_missing": int(event["attack_stats_missing"]),
+                }
+                for event in round_events
+            ])
             metrics["runtime_events"].extend(round_events)
             print(
                 f"[Round {server_round}] runtime=process-semi-async "
@@ -1460,7 +1688,10 @@ def run_fedagg_server_client_process_async(
                 f"packets={len(round_events)} "
                 f"fresh={metric_values['fresh_packets']} "
                 f"stale={len(round_events) - metric_values['fresh_packets']} "
-                f"admitted={len(admitted_ids)} acc={accuracy:.4f}"
+                f"admitted={len(admitted_ids)} acc={accuracy:.4f} "
+                f"attack={metrics['attack_type']} "
+                f"poisoned={metric_values['poisoned_samples']} "
+                f"basr={metric_values['basr_global']:.4f}"
             )
 
         coordinator.request_shutdown()
@@ -1481,6 +1712,7 @@ def run_fedagg_server_client_process_async(
             )
         _raise_child_error(error_queue, processes)
         coordinator.expire_unfinished()
+        _drain_attack_stats(attack_stats_queue, attack_stats_cache)
         consumed_packet_ids = {
             str(event["packet_id"])
             for event in metrics["runtime_events"]
@@ -1495,6 +1727,38 @@ def run_fedagg_server_client_process_async(
                     _unconsumed_event_from_state(state)
                 )
         for event in metrics["runtime_events"]:
+            if "is_malicious" not in event:
+                task_id = str(event["task_id"])
+                attack_record = attack_stats_cache.get(task_id)
+                client_id = int(event["client_id"])
+                source_round = int(event["source_round"])
+                event.update({
+                    "is_malicious": bool(
+                        attack_plan is not None
+                        and attack_plan.is_malicious(client_id)
+                    ),
+                    "attack_active": bool(
+                        attack_plan is not None
+                        and attack_plan.active_for(client_id, source_round)
+                    ),
+                    "poisoned_samples": (
+                        int(attack_record["poisoned_samples"])
+                        if attack_record is not None else _nan()
+                    ),
+                    "eligible_poison_samples": (
+                        int(attack_record["eligible_poison_samples"])
+                        if attack_record is not None else _nan()
+                    ),
+                    "poisoned_batches": (
+                        int(attack_record["poisoned_batches"])
+                        if attack_record is not None else _nan()
+                    ),
+                    "dba_trigger_part": (
+                        int(attack_record["dba_trigger_part"])
+                        if attack_record is not None else -1
+                    ),
+                    "attack_stats_missing": int(attack_record is None),
+                })
             state = service.event_state(str(event["packet_id"]))
             event["upload_attempts"] = int(state["upload_attempts"])
             event["upload_attempt_drop_count"] = int(
@@ -1525,3 +1789,5 @@ def run_fedagg_server_client_process_async(
         rpc_server.close()
         error_queue.close()
         error_queue.join_thread()
+        attack_stats_queue.close()
+        attack_stats_queue.join_thread()

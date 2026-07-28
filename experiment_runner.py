@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from attacks import AttackConfig, AttackPlan
 from data_utils import (
     build_federated_data_plan,
     build_server_dataloaders_from_plan,
@@ -23,7 +24,7 @@ from device_utils import (
     supports_pin_memory,
     use_amp_for_device,
 )
-from model_factory import build_model, build_models
+from model_factory import build_model, build_models, dataset_spec
 from federated_runtime import run_fedagg_server_client
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from process_runtime import (
@@ -108,6 +109,83 @@ def _round_rows(
             "niabd_enabled": int(metrics.get("niabd_enabled", 0)),
             "defense_method": str(
                 metrics.get("defense_method", "none")
+            ),
+            "attack_type": str(metrics.get("attack_type", "none")),
+            "attack_plan_id": str(metrics.get("attack_plan_id", "")),
+            "target_label": int(metrics.get("target_label", -1)),
+            "malicious_fraction": float(metrics.get("malicious_fraction", 0.0)),
+            "poison_ratio": float(metrics.get("poison_ratio", 0.0)),
+            "attack_start_round": int(metrics.get("attack_start_round", -1)),
+            "attack_active": int(_metric(metrics, "attack_active", round_idx, 0)),
+            "poisoned_samples": int(_metric(metrics, "poisoned_samples", round_idx, 0)),
+            "eligible_poison_samples": int(
+                _metric(metrics, "eligible_poison_samples", round_idx, 0)
+            ),
+            "attack_stats_missing_count": int(
+                _metric(metrics, "attack_stats_missing_count", round_idx, 0)
+            ),
+            "basr_global": float(
+                _metric(metrics, "basr_global", round_idx, np.nan)
+            ),
+            "basr_global_numerator": int(
+                _metric(metrics, "basr_global_numerator", round_idx, 0)
+            ),
+            "basr_global_denominator": int(
+                _metric(metrics, "basr_global_denominator", round_idx, 0)
+            ),
+            "basr_local_1": float(
+                _metric(metrics, "basr_local_1", round_idx, np.nan)
+            ),
+            "basr_local_2": float(
+                _metric(metrics, "basr_local_2", round_idx, np.nan)
+            ),
+            "basr_local_3": float(
+                _metric(metrics, "basr_local_3", round_idx, np.nan)
+            ),
+            "basr_local_4": float(
+                _metric(metrics, "basr_local_4", round_idx, np.nan)
+            ),
+            "malicious_mean_anomaly_fraction": float(
+                _metric(
+                    metrics,
+                    "malicious_mean_anomaly_fraction",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "benign_mean_anomaly_fraction": float(
+                _metric(
+                    metrics,
+                    "benign_mean_anomaly_fraction",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "malicious_mean_suppression": float(
+                _metric(
+                    metrics, "malicious_mean_suppression", round_idx, np.nan
+                )
+            ),
+            "benign_mean_suppression": float(
+                _metric(
+                    metrics, "benign_mean_suppression", round_idx, np.nan
+                )
+            ),
+            "malicious_memory_eligible_rate": float(
+                _metric(
+                    metrics,
+                    "malicious_memory_eligible_rate",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "benign_memory_eligible_rate": float(
+                _metric(
+                    metrics,
+                    "benign_memory_eligible_rate",
+                    round_idx,
+                    np.nan,
+                )
             ),
             "accuracy": float(_metric(metrics, "acc_list", round_idx)),
             "loss": float(_metric(metrics, "loss_list", round_idx)),
@@ -341,6 +419,12 @@ def _summary_row(
         "admission_method": last["admission_method"],
         "niabd_enabled": last["niabd_enabled"],
         "defense_method": last["defense_method"],
+        "attack_type": last.get("attack_type", "none"),
+        "attack_plan_id": last.get("attack_plan_id", ""),
+        "target_label": last.get("target_label", -1),
+        "malicious_fraction": last.get("malicious_fraction", 0.0),
+        "poison_ratio": last.get("poison_ratio", 0.0),
+        "attack_start_round": last.get("attack_start_round", -1),
         "rounds": len(rows),
         "final_accuracy": last["accuracy"],
         "best_accuracy": max(float(row["accuracy"]) for row in rows),
@@ -397,6 +481,31 @@ def _summary_row(
         ])) if any(
             not pd.isna(row["max_version_lag"]) for row in rows
         ) else np.nan,
+        "final_basr_global": last.get("basr_global", np.nan),
+        "final_basr_local_1": last.get("basr_local_1", np.nan),
+        "final_basr_local_2": last.get("basr_local_2", np.nan),
+        "final_basr_local_3": last.get("basr_local_3", np.nan),
+        "final_basr_local_4": last.get("basr_local_4", np.nan),
+        "total_poisoned_samples": sum(
+            int(row.get("poisoned_samples", 0)) for row in rows
+        ),
+        "total_attack_stats_missing": sum(
+            int(row.get("attack_stats_missing_count", 0)) for row in rows
+        ),
+        "mean_attack_window_basr": (
+            float(np.mean([
+                float(row["basr_global"])
+                for row in rows
+                if int(row.get("attack_active", 0)) == 1
+                and not pd.isna(row.get("basr_global", np.nan))
+            ]))
+            if any(
+                int(row.get("attack_active", 0)) == 1
+                and not pd.isna(row.get("basr_global", np.nan))
+                for row in rows
+            )
+            else np.nan
+        ),
     }
     events = [
         event for event in (runtime_events or [])
@@ -525,6 +634,84 @@ def _defense_rows(
             }
 
 
+def _backdoor_rows(
+    metrics,
+    *,
+    run_uid: str,
+    dataset_name: str,
+    seed: int,
+    num_clients: int,
+    partition_scheme: str,
+) -> Iterable[dict]:
+    attack_type = str(metrics.get("attack_type", "none"))
+    strategy = str(metrics.get("strategy", "baseline"))
+    admissions = metrics.get("teacher_admission_records", [])
+    defenses = metrics.get("teacher_defense_records", [])
+    all_records = metrics.get("backdoor_client_records", [])
+    for round_idx, records in enumerate(all_records, start=1):
+        admission_by_client = {
+            int(record["client_id"]): record
+            for record in (
+                admissions[round_idx - 1]
+                if round_idx - 1 < len(admissions) else []
+            )
+        }
+        defense_by_client = {
+            int(record["client_id"]): record
+            for record in (
+                defenses[round_idx - 1]
+                if round_idx - 1 < len(defenses) else []
+            )
+        }
+        for record in records:
+            client_id = int(record["client_id"])
+            admission = admission_by_client.get(client_id)
+            defense = defense_by_client.get(client_id)
+            yield {
+                "run_uid": run_uid,
+                "dataset": dataset_name,
+                "seed": int(seed),
+                "round": int(round_idx),
+                "runtime": str(metrics.get("runtime", "sync")),
+                "strategy": strategy,
+                "attack_type": attack_type,
+                "attack_plan_id": str(metrics.get("attack_plan_id", "")),
+                "target_label": int(metrics.get("target_label", -1)),
+                "topology": "server-client",
+                "num_clients": int(num_clients),
+                "partition_scheme": str(partition_scheme),
+                **record,
+                "admitted": (
+                    bool(admission["admitted"])
+                    if admission is not None else True
+                ),
+                "admission_score": (
+                    float(admission["score"])
+                    if admission is not None else np.nan
+                ),
+                "niabd_anomaly_fraction": (
+                    float(defense["anomaly_fraction"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_mean_abs_deviation": (
+                    float(defense["mean_abs_deviation"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_max_abs_deviation": (
+                    float(defense["max_abs_deviation"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_mean_suppression": (
+                    float(defense["mean_suppression"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_memory_eligible": (
+                    bool(defense["memory_eligible"])
+                    if defense is not None else np.nan
+                ),
+            }
+
+
 def _runtime_event_rows(
     metrics,
     *,
@@ -593,6 +780,7 @@ def run_experiment(
     partition_schemes: List[str],
     label_skew_classes: int,
     quantity_skew_alpha: float,
+    dirichlet_alpha: float,
     outdir: str,
     append: bool,
     num_workers: int,
@@ -616,6 +804,8 @@ def run_experiment(
     runtime_profile: str = "",
     runtime_trace_path: str = "",
     runtime_trace_out: str = "",
+    attack_config: AttackConfig | None = None,
+    attack_plan_path: str = "",
 ) -> None:
     os.makedirs(outdir, exist_ok=True)
     round_csv = os.path.join(
@@ -638,6 +828,10 @@ def run_experiment(
         outdir,
         f"fedagg_runtime_events_{dataset_name}.csv",
     )
+    backdoor_csv = os.path.join(
+        outdir,
+        f"fedagg_backdoor_defense_{dataset_name}.csv",
+    )
     runtime = str(runtime).lower()
     if runtime not in {"sync", "process-semi-async"}:
         raise ValueError(f"Unsupported runtime={runtime!r}.")
@@ -650,10 +844,12 @@ def run_experiment(
             admission_csv,
             defense_csv,
             runtime_event_csv,
+            backdoor_csv,
         ):
             if os.path.exists(path):
                 os.remove(path)
 
+    attack_config = attack_config or AttackConfig(attack_type="none")
     seeds = seeds or [0]
     num_clients_list = num_clients_list or [6]
     partition_schemes = partition_schemes or ["iid"]
@@ -696,6 +892,7 @@ def run_experiment(
                         partition_scheme=str(partition_scheme),
                         label_skew_classes=int(label_skew_classes),
                         quantity_skew_alpha=float(quantity_skew_alpha),
+                        dirichlet_alpha=float(dirichlet_alpha),
                         num_workers=int(num_workers),
                         pin_memory=bool(pin_memory),
                         val_ratio=float(val_ratio),
@@ -724,6 +921,7 @@ def run_experiment(
                         partition_scheme=str(partition_scheme),
                         label_skew_classes=int(label_skew_classes),
                         quantity_skew_alpha=float(quantity_skew_alpha),
+                        dirichlet_alpha=float(dirichlet_alpha),
                         val_ratio=float(val_ratio),
                         proxy_ratio=float(proxy_ratio),
                         proxy_dataset_size=(
@@ -774,6 +972,21 @@ def run_experiment(
                 metrics = None
                 admission_controller = None
                 defense_controller = None
+                attack_plan = AttackPlan.resolve(
+                    seed=int(seed),
+                    num_clients=int(num_clients),
+                    config=attack_config,
+                    plan_path=(attack_plan_path or None),
+                )
+                attack_plan_file = os.path.join(
+                    outdir,
+                    "attack_plans",
+                    (
+                        f"attack_plan_{dataset_name}_seed_{seed}_clients_{num_clients}_"
+                        f"{partition_scheme}_{attack_config.attack_type}.json"
+                    ),
+                )
+                attack_plan.save(attack_plan_file)
                 try:
                     if runtime == "sync":
                         client_models, server_model = build_models(
@@ -819,6 +1032,7 @@ def run_experiment(
                             enable_client_distillation=bool(
                                 enable_client_distillation
                             ),
+                            attack_plan=attack_plan,
                         )
                         metrics.update({
                             "runtime": "sync",
@@ -850,6 +1064,7 @@ def run_experiment(
                                 enable_client_distillation=bool(
                                     enable_client_distillation
                                 ),
+                                attack_plan=attack_plan,
                             )
                         )
                     strategy = _strategy_name(
@@ -857,6 +1072,8 @@ def run_experiment(
                         enable_niabd,
                     )
                     metrics["strategy"] = strategy
+                    metrics["attack_plan_path"] = attack_plan_file
+                    metrics["dirichlet_alpha"] = float(dirichlet_alpha)
                     if runtime == "process-semi-async" and runtime_trace_out:
                         assert trace is not None
                         trace_path = _trace_output_path(
@@ -954,6 +1171,23 @@ def run_experiment(
                             ),
                             index=False,
                         )
+                    backdoor_rows = list(
+                        _backdoor_rows(
+                            metrics,
+                            run_uid=run_uid,
+                            dataset_name=dataset_name,
+                            seed=int(seed),
+                            num_clients=int(num_clients),
+                            partition_scheme=str(partition_scheme),
+                        )
+                    )
+                    if backdoor_rows:
+                        pd.DataFrame(backdoor_rows).to_csv(
+                            backdoor_csv,
+                            mode="a",
+                            header=not os.path.exists(backdoor_csv),
+                            index=False,
+                        )
                     print(f"[write] {round_csv}")
                     print(f"[write] {summary_csv}")
                     if admission_rows:
@@ -962,6 +1196,9 @@ def run_experiment(
                         print(f"[write] {defense_csv}")
                     if runtime_rows:
                         print(f"[write] {runtime_event_csv}")
+                    if backdoor_rows:
+                        print(f"[write] {backdoor_csv}")
+                    print(f"[write] {attack_plan_file}")
                 finally:
                     cleanup_dataloaders(dataloaders)
                     del metrics, client_models, server_model, dataloaders
@@ -979,7 +1216,13 @@ def main() -> None:
     parser.add_argument(
         "--dataset-name",
         default="cifar10",
-        choices=["cifar10", "cifar100", "femnist"],
+        choices=[
+            "cifar10",
+            "cifar100",
+            "femnist",
+            "cinic10",
+            "tiny-imagenet-200",
+        ],
     )
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=1)
@@ -989,10 +1232,11 @@ def main() -> None:
     parser.add_argument(
         "--partition-schemes",
         default="iid",
-        help="Comma-separated: iid,label-skew,quantity-skew",
+        help="Comma-separated: iid,label-skew,quantity-skew,dirichlet",
     )
     parser.add_argument("--label-skew-classes", type=int, default=2)
     parser.add_argument("--quantity-skew-alpha", type=float, default=0.5)
+    parser.add_argument("--dirichlet-alpha", type=float, default=0.5)
     parser.add_argument("--proxy-ratio", type=float, default=0.1)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--proxy-dataset-size", type=int, default=0)
@@ -1050,6 +1294,42 @@ def main() -> None:
     )
     parser.add_argument("--runtime-trace", default="")
     parser.add_argument("--runtime-trace-out", default="")
+    parser.add_argument(
+        "--method",
+        choices=["baseline", "vcaa", "niabd", "vcaa-niabd"],
+        default="",
+        help="Optional formal-method alias; existing --enable-vcaa/--enable-niabd flags remain supported.",
+    )
+    parser.add_argument(
+        "--attack",
+        choices=["none", "badnets", "dba", "blend", "dynamic"],
+        default="none",
+    )
+    parser.add_argument("--target-label", type=int, default=0)
+    parser.add_argument("--malicious-fraction", type=float, default=0.2)
+    parser.add_argument("--poison-ratio", type=float, default=0.2)
+    parser.add_argument("--attack-start-round", type=int, default=15)
+    parser.add_argument(
+        "--attack-end-round",
+        type=int,
+        default=0,
+        help="0 means the final configured FL round.",
+    )
+    parser.add_argument("--poison-interval", type=int, default=1)
+    parser.add_argument(
+        "--trigger-size",
+        type=int,
+        default=0,
+        help="0 selects 4 for 32x32 datasets and 8 for Tiny-ImageNet-200.",
+    )
+    parser.add_argument("--trigger-value", type=float, default=1.0)
+    parser.add_argument("--blend-alpha", type=float, default=0.2)
+    parser.add_argument("--dynamic-period", type=int, default=10)
+    parser.add_argument(
+        "--attack-plan",
+        default="",
+        help="Optional exact AttackPlan JSON to replay; generated plans are always exported.",
+    )
     parser.add_argument(
         "--enable-vcaa",
         action="store_true",
@@ -1181,6 +1461,47 @@ def main() -> None:
     parser.add_argument("--append", action="store_true")
     args = parser.parse_args()
 
+    enable_vcaa = bool(args.enable_vcaa)
+    enable_niabd = bool(args.enable_niabd)
+    if args.method:
+        method_flags = {
+            "baseline": (False, False),
+            "vcaa": (True, False),
+            "niabd": (False, True),
+            "vcaa-niabd": (True, True),
+        }[args.method]
+        explicitly_enabled = (bool(args.enable_vcaa), bool(args.enable_niabd))
+        if any(explicitly_enabled) and explicitly_enabled != method_flags:
+            raise ValueError(
+                "--method conflicts with explicit --enable-vcaa/--enable-niabd flags."
+            )
+        enable_vcaa, enable_niabd = method_flags
+    trigger_size = int(args.trigger_size)
+    if trigger_size <= 0:
+        trigger_size = 8 if args.dataset_name == "tiny-imagenet-200" else 4
+    attack_end_round = (
+        int(args.rounds)
+        if int(args.attack_end_round) == 0
+        else int(args.attack_end_round)
+    )
+    attack_config = AttackConfig(
+        attack_type=args.attack,
+        target_label=args.target_label,
+        malicious_fraction=args.malicious_fraction,
+        poison_ratio=args.poison_ratio,
+        attack_start_round=args.attack_start_round,
+        attack_end_round=attack_end_round,
+        poison_interval=args.poison_interval,
+        trigger_size=trigger_size,
+        trigger_value=args.trigger_value,
+        blend_alpha=args.blend_alpha,
+        dynamic_period=args.dynamic_period,
+    )
+    if int(attack_config.target_label) >= int(dataset_spec(args.dataset_name).num_classes):
+        raise ValueError(
+            f"target_label={attack_config.target_label} is outside dataset class range."
+        )
+
     device = normalize_device(args.device)
     server_device = normalize_device(
         args.server_device if args.server_device else args.device
@@ -1275,6 +1596,7 @@ def main() -> None:
         partition_schemes=_parse_str_list(args.partition_schemes),
         label_skew_classes=args.label_skew_classes,
         quantity_skew_alpha=args.quantity_skew_alpha,
+        dirichlet_alpha=args.dirichlet_alpha,
         outdir=args.outdir,
         append=args.append,
         num_workers=args.num_workers,
@@ -1288,9 +1610,9 @@ def main() -> None:
         proxy_dataset_size=args.proxy_dataset_size,
         distill_temperature=args.distill_temperature,
         strict_numeric_checks=args.strict_numeric_checks,
-        enable_vcaa=args.enable_vcaa,
+        enable_vcaa=enable_vcaa,
         vcaa_config=vcaa_config,
-        enable_niabd=args.enable_niabd,
+        enable_niabd=enable_niabd,
         niabd_config=niabd_config,
         enable_client_distillation=not args.disable_client_distillation,
         runtime=args.runtime,
@@ -1302,6 +1624,8 @@ def main() -> None:
             if args.runtime_trace_out
             else os.path.join(args.outdir, "runtime_traces")
         ),
+        attack_config=attack_config,
+        attack_plan_path=args.attack_plan,
     )
 
 
