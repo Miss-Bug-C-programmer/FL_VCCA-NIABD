@@ -16,9 +16,18 @@ from runtime_trace import RuntimeTrace, generate_runtime_trace, load_runtime_pro
 
 def _load_json_or_inline(value: str) -> dict:
     path = Path(value)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return json.loads(value)
+    if path.is_file():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    elif str(value).lstrip().startswith("{"):
+        loaded = json.loads(value)
+    else:
+        raise FileNotFoundError(
+            "dataset-roots must be an existing JSON file or an inline "
+            f"JSON object; file not found: {path}"
+        )
+    if not isinstance(loaded, dict):
+        raise ValueError("dataset-roots must decode to a JSON object.")
+    return loaded
 
 
 def _job_dir(root: Path, dataset: str, attack: str, method: str, seed: int) -> Path:
@@ -85,6 +94,10 @@ def build_command(
     client_device: str,
     num_workers: int,
     runtime_trace: Path | None,
+    runtime_registration_timeout_s: float,
+    runtime_shutdown_timeout_s: float,
+    soft_deadline_s: float,
+    hard_deadline_s: float,
 ) -> list[str]:
     trigger_size = 8 if dataset == "tiny-imagenet-200" else 4
     command = [
@@ -156,7 +169,29 @@ def build_command(
     if str(config["runtime"]) == "process-semi-async":
         if runtime_trace is None:
             raise ValueError("Process runtime requires a shared runtime trace.")
-        command.extend(["--runtime-trace", str(runtime_trace)])
+        command.extend([
+            "--runtime-trace",
+            str(runtime_trace),
+            "--runtime-registration-timeout-s",
+            str(runtime_registration_timeout_s),
+            "--runtime-shutdown-timeout-s",
+            str(runtime_shutdown_timeout_s),
+        ])
+        if float(soft_deadline_s) > 0.0 or float(hard_deadline_s) > 0.0:
+            if (
+                float(soft_deadline_s) <= 0.0
+                or float(hard_deadline_s) <= float(soft_deadline_s)
+            ):
+                raise ValueError(
+                    "Process absolute deadlines require "
+                    "0 < soft-deadline-s < hard-deadline-s."
+                )
+            command.extend([
+                "--soft-deadline-s",
+                str(soft_deadline_s),
+                "--hard-deadline-s",
+                str(hard_deadline_s),
+            ])
     return command
 
 
@@ -181,6 +216,18 @@ def main() -> None:
     parser.add_argument("--server-device", default="cuda")
     parser.add_argument("--client-device", default="cpu")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--runtime-registration-timeout-s",
+        type=float,
+        default=60.0,
+    )
+    parser.add_argument(
+        "--runtime-shutdown-timeout-s",
+        type=float,
+        default=60.0,
+    )
+    parser.add_argument("--soft-deadline-s", type=float, default=0.0)
+    parser.add_argument("--hard-deadline-s", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
@@ -239,6 +286,14 @@ def main() -> None:
             client_device=args.client_device,
             num_workers=int(args.num_workers),
             runtime_trace=trace_path,
+            runtime_registration_timeout_s=float(
+                args.runtime_registration_timeout_s
+            ),
+            runtime_shutdown_timeout_s=float(
+                args.runtime_shutdown_timeout_s
+            ),
+            soft_deadline_s=float(args.soft_deadline_s),
+            hard_deadline_s=float(args.hard_deadline_s),
         )
         print(f"[{index}/{len(jobs)}] {' '.join(command)}", flush=True)
         if not args.dry_run:

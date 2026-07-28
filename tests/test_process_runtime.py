@@ -15,11 +15,32 @@ from model_factory import build_model
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from process_runtime import (
     ProcessRuntimeConfig,
+    _require_warmup_progress,
+    _resolve_process_device,
     run_fedagg_server_client_process_async,
 )
 from round_coordinator import SemiAsyncRoundCoordinator
 from runtime_trace import generate_runtime_trace
 from vcaa import VCAAConfig, VersionContentAwareAdmission
+
+
+def test_empty_process_warmup_fails_before_advancing_rounds():
+    with pytest.raises(
+        TimeoutError,
+        match="warmup received no ClientLogitsPacket",
+    ):
+        _require_warmup_progress(
+            warmup=True,
+            dispatched_count=4,
+            available_packets=0,
+            hard_deadline_s=900.0,
+        )
+
+
+def test_process_cuda_device_without_index_resolves_to_visible_device_zero():
+    assert _resolve_process_device("cuda") == torch.device("cuda:0")
+    assert _resolve_process_device("cuda:2") == torch.device("cuda:2")
+    assert _resolve_process_device("cpu") == torch.device("cpu")
 
 
 def _write_femnist(root):

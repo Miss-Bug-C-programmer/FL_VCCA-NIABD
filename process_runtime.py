@@ -61,6 +61,13 @@ from runtime_trace import RuntimeTrace
 from trainer import distill_with_logits, local_train, predict_logits
 
 
+def _resolve_process_device(value) -> torch.device:
+    device = torch.device(str(value))
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", 0)
+    return device
+
+
 @dataclass(frozen=True)
 class ProcessRuntimeConfig:
     participation_rate: float = 1.0
@@ -421,13 +428,20 @@ def _client_process_main(
 
     torch.set_num_threads(int(config.client_torch_threads))
     torch.manual_seed(int(seed) + 10000 + int(client_id))
-    if str(config.client_device).startswith("cuda"):
+    device = _resolve_process_device(config.client_device)
+    if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "client_device requests CUDA but CUDA is unavailable."
             )
-        torch.cuda.set_device(torch.device(config.client_device))
-    device = torch.device(config.client_device)
+        device_count = int(torch.cuda.device_count())
+        assert device.index is not None
+        if not 0 <= int(device.index) < device_count:
+            raise RuntimeError(
+                f"client_device={device} is outside the visible CUDA "
+                f"device range [0, {device_count})."
+            )
+        torch.cuda.set_device(int(device.index))
     dataloaders = None
     active_task_id = ""
     try:
@@ -807,6 +821,29 @@ def _wait_collection_window(
         time.sleep(0.01)
 
 
+def _require_warmup_progress(
+    *,
+    warmup: bool,
+    dispatched_count: int,
+    available_packets: int,
+    hard_deadline_s: float,
+) -> None:
+    if (
+        bool(warmup)
+        and int(dispatched_count) > 0
+        and int(available_packets) == 0
+    ):
+        raise TimeoutError(
+            "Process runtime warmup received no ClientLogitsPacket before "
+            f"the {float(hard_deadline_s):.3f}s hard deadline after "
+            f"dispatching {int(dispatched_count)} clients. Client tasks "
+            "may still be training; increasing shutdown timeout does not "
+            "accelerate them. Increase --client-torch-threads when CPU "
+            "capacity permits, use a larger warmup hard deadline, or run "
+            "a separately labelled smaller real-data smoke configuration."
+        )
+
+
 def _nan() -> float:
     return float("nan")
 
@@ -979,7 +1016,9 @@ def _initialize_metrics(
         "client_role": "persistent-process-local-teacher",
         "num_clients": int(num_clients),
         "server_device": str(config.server_device),
-        "client_device": str(config.client_device),
+        "client_device": str(
+            _resolve_process_device(config.client_device)
+        ),
         "admission_method": (
             admission_controller.name
             if admission_controller is not None
@@ -1177,6 +1216,14 @@ def run_fedagg_server_client_process_async(
                 warmup=(
                     server_round <= int(config.warmup_rounds)
                 ),
+            )
+            _require_warmup_progress(
+                warmup=(
+                    server_round <= int(config.warmup_rounds)
+                ),
+                dispatched_count=dispatched_count,
+                available_packets=service.mailbox_size(),
+                hard_deadline_s=hard_deadline_s,
             )
             candidates = service.drain_mailbox()
             _drain_attack_stats(attack_stats_queue, attack_stats_cache)
@@ -1689,6 +1736,8 @@ def run_fedagg_server_client_process_async(
                 f"fresh={metric_values['fresh_packets']} "
                 f"stale={len(round_events) - metric_values['fresh_packets']} "
                 f"admitted={len(admitted_ids)} acc={accuracy:.4f} "
+                f"quorum={int(quorum_reached)} "
+                f"update={metric_values['server_update_applied']} "
                 f"attack={metrics['attack_type']} "
                 f"poisoned={metric_values['poisoned_samples']} "
                 f"basr={metric_values['basr_global']:.4f}"

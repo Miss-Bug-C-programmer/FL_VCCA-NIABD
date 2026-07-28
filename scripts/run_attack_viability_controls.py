@@ -12,9 +12,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _load_json_or_inline(value: str) -> dict:
     path = Path(value)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return json.loads(value)
+    if path.is_file():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    elif str(value).lstrip().startswith("{"):
+        loaded = json.loads(value)
+    else:
+        raise FileNotFoundError(
+            "dataset-roots must be an existing JSON file or an inline "
+            f"JSON object; file not found: {path}"
+        )
+    if not isinstance(loaded, dict):
+        raise ValueError("dataset-roots must decode to a JSON object.")
+    return loaded
 
 
 def main() -> None:
@@ -41,6 +50,9 @@ def main() -> None:
     if not config_path.is_absolute():
         config_path = REPO_ROOT / config_path
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    missing = set(config["datasets"]) - set(roots)
+    if missing:
+        raise ValueError(f"dataset-roots is missing: {sorted(missing)}")
     jobs = list(product(config["datasets"], config["seeds"]))
     if len(jobs) != 15:
         raise ValueError(f"Expected 15 control runs, found {len(jobs)}.")

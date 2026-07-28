@@ -899,6 +899,74 @@ strategy-independent shared runtime trace，再把同一 dataset/seed trace 重�
 给所有 attack/method 组合，因此 selection、availability、compute slowdown、
 upload delay、attempt drop 和 ACK delay 不会因为防御策略变化。
 
+真实数据上使用 CPU Client 时，本地 ResNet-18 一轮训练可能超过默认的 60 秒
+首轮校准时间。增加 timeout 只会增加等待上限，不会加速 Client；尤其
+`--client-torch-threads 1` 会让每个 Client 以单 CPU 线程训练完整私有分区。
+若 warmup 已派发 Client、但 hard deadline 前一个 packet 都没有收到，运行时会
+立即报出明确的 warmup `TimeoutError`，不会继续推进没有任何 Server update 的
+空轮，也不会再额外等待一次完整 shutdown timeout。
+
+完整数据 process 运行应根据容器可用 CPU 核数合理设置每个 Client 的线程数。
+例如 4 个 Client、节点至少有 16 个可用 CPU 核时可先测试
+`--client-torch-threads 4`。不得通过减少正式矩阵的 Client 数处理性能问题。
+真实数据 smoke 可以使用单独标记的缩小配置验证程序路径，例如：
+
+```bash
+python experiment_runner.py \
+  --dataset ./dataset \
+  --dataset-name cifar10 \
+  --method vcaa-niabd \
+  --attack badnets \
+  --target-label 0 \
+  --malicious-fraction 0.25 \
+  --poison-ratio 0.2 \
+  --attack-start-round 1 \
+  --attack-end-round 2 \
+  --poison-interval 1 \
+  --rounds 2 \
+  --epochs 1 \
+  --batch-size 64 \
+  --num-clients-list 4 \
+  --seeds 0 \
+  --partition-schemes dirichlet \
+  --dirichlet-alpha 0.5 \
+  --proxy-ratio 0.1 \
+  --val-ratio 0.89 \
+  --proxy-dataset-size 64 \
+  --runtime process-semi-async \
+  --device cuda \
+  --server-device cuda \
+  --client-device cpu \
+  --client-torch-threads 4 \
+  --num-workers 0 \
+  --runtime-registration-timeout-s 300 \
+  --runtime-shutdown-timeout-s 300 \
+  --outdir ./results/process_attack_smoke
+```
+
+这个命令仍使用真实 CIFAR 图像、真实 trigger、真实 ResNet-18、真实 TCP/RPC
+和序列化 logits，但缩小数据划分只用于 smoke，不能替代正式配置或论文结果。
+首轮成功返回 packet 后，后续相对 deadline 会由首轮真实 compute/transport
+时间校准。若正式矩阵切换为 `process-semi-async`，矩阵入口支持统一传入：
+
+```bash
+python scripts/run_main_backdoor_matrix.py \
+  --dataset-roots dataset_roots.json \
+  --runtime-registration-timeout-s 900 \
+  --runtime-shutdown-timeout-s 900
+```
+
+这些时间参数对矩阵中所有 Methods 完全相同；strategy-independent runtime
+trace 的选择、可用性、slowdown、upload delay、drop 和 ACK delay 仍保持共享。
+
+若 Client 也使用 CUDA，`--client-device cuda` 会规范化为当前容器可见的
+`cuda:0`；也可以显式写 `--client-device cuda:0`。每个 Client 仍是独立进程并
+独立持有模型，多个 Client process 只是共享同一可见加速卡，Server 仍只能通过
+localhost TCP 接收序列化 logits。使用前必须确认 CoreX 支持多进程共享设备且
+显存足以同时容纳 Server、所有 Client model、梯度和激活。若容器通过
+`COREX_VISIBLE_DEVICES=0` 只暴露一张卡，则进程内唯一合法索引是 `cuda:0`，
+不能使用宿主机物理编号代替容器内可见编号。
+
 ## 13. 新增输出
 
 原有 CSV 全部保留：
