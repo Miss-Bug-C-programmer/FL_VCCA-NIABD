@@ -1,5 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.pytest_tmp_codex/
+.pytest_cache/
 *.py[codz]
 *$py.class
 
@@ -8,6 +10,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+results/
 build/
 dataset/
 develop-eggs/
