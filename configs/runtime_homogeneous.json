@@ -1,0 +1,13 @@
+{
+  "name": "homogeneous",
+  "slow_client_fraction": 0.0,
+  "normal_compute_slowdown_factor": 1.0,
+  "slow_compute_slowdown_factor": 1.0,
+  "normal_upload_delay_s": 0.0,
+  "slow_upload_delay_s": 0.0,
+  "availability_probability": 1.0,
+  "upload_attempt_drop_probability": 0.0,
+  "ack_delay_probability": 0.0,
+  "ack_delay_s": 0.0,
+  "events": {}
+}

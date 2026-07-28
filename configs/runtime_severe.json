@@ -1,0 +1,13 @@
+{
+  "name": "severe",
+  "slow_client_fraction": 0.4,
+  "normal_compute_slowdown_factor": 1.2,
+  "slow_compute_slowdown_factor": 4.0,
+  "normal_upload_delay_s": 0.05,
+  "slow_upload_delay_s": 0.5,
+  "availability_probability": 0.75,
+  "upload_attempt_drop_probability": 0.15,
+  "ack_delay_probability": 0.15,
+  "ack_delay_s": 1.0,
+  "events": {}
+}

@@ -1,0 +1,13 @@
+{
+  "name": "moderate",
+  "slow_client_fraction": 0.25,
+  "normal_compute_slowdown_factor": 1.0,
+  "slow_compute_slowdown_factor": 2.0,
+  "normal_upload_delay_s": 0.01,
+  "slow_upload_delay_s": 0.1,
+  "availability_probability": 0.9,
+  "upload_attempt_drop_probability": 0.05,
+  "ack_delay_probability": 0.05,
+  "ack_delay_s": 0.5,
+  "events": {}
+}

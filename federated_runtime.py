@@ -1,0 +1,620 @@
+from __future__ import annotations
+
+import copy
+import time
+from typing import Dict, List, Optional, Sequence
+
+import torch
+import torch.nn as nn
+
+from admission import (
+    AdmissionDecision,
+    TeacherAdmissionController,
+)
+from defense import DefenseResult, KnowledgeDefenseController
+from federated_client import FederatedClient
+from federated_server import FederatedServer
+
+
+def _freeze_state_dict(state_dict: dict) -> dict:
+    frozen = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            frozen[key] = value.detach().cpu().clone()
+        else:
+            frozen[key] = copy.deepcopy(value)
+    return frozen
+
+
+def _restore_model(model: nn.Module, state: dict, device) -> None:
+    model.load_state_dict(state, strict=True)
+    model.to(device)
+
+
+def _model_is_finite(model: nn.Module) -> bool:
+    return all(
+        torch.isfinite(value).all()
+        for value in model.state_dict().values()
+    )
+
+
+def _forward_logits(model: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    outputs = model(inputs)
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
+    return outputs
+
+
+def evaluate_with_loss(
+    model: nn.Module,
+    dataloader,
+    *,
+    device="cpu",
+    amp: bool = False,
+) -> tuple[float, float, int]:
+    model.eval()
+    loss_fn = nn.CrossEntropyLoss()
+    total = 0
+    correct = 0
+    loss_sum = 0.0
+    nonfinite_batches = 0
+    amp_enabled = bool(amp) and torch.device(device).type == "cuda"
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True).long()
+            if amp_enabled:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits = _forward_logits(model, images)
+            else:
+                logits = _forward_logits(model, images)
+
+            if not bool(torch.isfinite(logits).all().item()):
+                nonfinite_batches += 1
+            logits = torch.nan_to_num(
+                logits,
+                nan=0.0,
+                posinf=30.0,
+                neginf=-30.0,
+            ).clamp(-30.0, 30.0)
+            loss = loss_fn(logits, labels)
+            if not bool(torch.isfinite(loss).item()):
+                nonfinite_batches += 1
+                continue
+
+            batch_size = int(labels.numel())
+            total += batch_size
+            correct += int((logits.argmax(dim=1) == labels).sum().item())
+            loss_sum += float(loss.item()) * batch_size
+
+    return (
+        float(correct) / float(max(total, 1)),
+        float(loss_sum) / float(max(total, 1)),
+        int(nonfinite_batches),
+    )
+
+
+def _decision_metrics(
+    decision: Optional[AdmissionDecision],
+    *,
+    num_clients: int,
+) -> Dict[str, object]:
+    if decision is None:
+        return {
+            "method": "none",
+            "threshold": 0.0,
+            "admitted": int(num_clients),
+            "rejected": 0,
+            "utilization": 1.0,
+            "score_mean": 0.0,
+            "version_score_mean": 0.0,
+            "content_score_mean": 0.0,
+            "proxy_accuracy_mean": 0.0,
+            "entropy_mean": 0.0,
+            "kl_mean": 0.0,
+            "records": [],
+        }
+
+    records = list(decision.records)
+
+    def component_mean(key: str) -> float:
+        values = [
+            float(record.components[key])
+            for record in records
+            if key in record.components
+        ]
+        return float(sum(values) / len(values)) if values else 0.0
+
+    admitted = len(decision.admitted_client_ids)
+    return {
+        "method": str(decision.method),
+        "threshold": float(decision.threshold),
+        "admitted": int(admitted),
+        "rejected": int(len(decision.rejected_client_ids)),
+        "utilization": float(admitted) / float(max(num_clients, 1)),
+        "score_mean": (
+            float(sum(record.score for record in records) / len(records))
+            if records
+            else 0.0
+        ),
+        "version_score_mean": component_mean("version_score"),
+        "content_score_mean": component_mean("content_score"),
+        "proxy_accuracy_mean": component_mean("proxy_accuracy"),
+        "entropy_mean": component_mean("mean_entropy"),
+        "kl_mean": component_mean("mean_kl"),
+        "records": [
+            {
+                "client_id": int(record.client_id),
+                "admitted": bool(record.admitted),
+                "score": float(record.score),
+                **{
+                    str(key): float(value)
+                    for key, value in record.components.items()
+                },
+            }
+            for record in records
+        ],
+    }
+
+
+def _validate_decision(
+    decision: AdmissionDecision,
+    client_ids: Sequence[int],
+) -> None:
+    expected = {int(client_id) for client_id in client_ids}
+    admitted = set(decision.admitted_client_ids)
+    rejected = set(decision.rejected_client_ids)
+    if (
+        admitted.intersection(rejected)
+        or len(admitted) != len(decision.admitted_client_ids)
+        or len(rejected) != len(decision.rejected_client_ids)
+        or admitted.union(rejected) != expected
+    ):
+        raise ValueError(
+            "Admission decision must classify every client exactly once."
+        )
+
+
+def _defense_metrics(
+    result: Optional[DefenseResult],
+    *,
+    method: str,
+) -> Dict[str, object]:
+    if result is None:
+        return {
+            "method": str(method),
+            "warmup": 0.0,
+            "prototype_updated": 0.0,
+            "prototype_observations": 0.0,
+            "threshold_mean": 0.0,
+            "threshold_min": 0.0,
+            "threshold_max": 0.0,
+            "anomaly_fraction": 0.0,
+            "mean_suppression": 0.0,
+            "memory_eligible_teachers": 0,
+            "teachers_purified": 0,
+            "records": [],
+        }
+    records = [
+        {
+            "client_id": int(record.client_id),
+            "anomaly_fraction": float(record.anomaly_fraction),
+            "mean_abs_deviation": float(record.mean_abs_deviation),
+            "max_abs_deviation": float(record.max_abs_deviation),
+            "mean_suppression": float(record.mean_suppression),
+            "memory_eligible": bool(record.memory_eligible),
+        }
+        for record in result.records
+    ]
+    return {
+        "method": str(result.method),
+        "warmup": float(result.metrics.get("warmup", 0.0)),
+        "prototype_updated": float(
+            result.metrics.get("prototype_updated", 0.0)
+        ),
+        "prototype_observations": float(
+            result.metrics.get("prototype_observations", 0.0)
+        ),
+        "threshold_mean": float(
+            result.metrics.get("threshold_mean", 0.0)
+        ),
+        "threshold_min": float(
+            result.metrics.get("threshold_min", 0.0)
+        ),
+        "threshold_max": float(
+            result.metrics.get("threshold_max", 0.0)
+        ),
+        "anomaly_fraction": float(
+            result.metrics.get("anomaly_fraction", 0.0)
+        ),
+        "mean_suppression": float(
+            result.metrics.get("mean_suppression", 0.0)
+        ),
+        "memory_eligible_teachers": int(
+            result.metrics.get("memory_eligible_teachers", 0.0)
+        ),
+        "teachers_purified": len(result.purified_knowledge),
+        "records": records,
+    }
+
+
+def run_fedagg_server_client(
+    client_models: Sequence[nn.Module],
+    server_model: nn.Module,
+    dataloaders: Dict[str, object],
+    *,
+    device="cpu",
+    local_epochs: int = 1,
+    rounds: int = 3,
+    learning_rate: float = 0.01,
+    distill_temperature: float = 2.0,
+    amp: bool = False,
+    strict_numeric_checks: bool = False,
+    admission_controller: Optional[TeacherAdmissionController] = None,
+    defense_controller: Optional[KnowledgeDefenseController] = None,
+    enable_client_distillation: bool = True,
+) -> Dict[str, object]:
+    """Train real clients through serialized proxy-logits knowledge exchange.
+
+    Each client owns its model and private loader, performs local optimization,
+    evaluates the shared proxy set, and emits a byte-serialized logits packet.
+    The server receives only those packets and public metadata. It never
+    dereferences a client model during admission, aggregation, or student
+    distillation.
+    """
+
+    client_loaders = dataloaders.get("client")
+    proxy_loader = dataloaders.get("proxy")
+    test_loader = dataloaders.get("test")
+    if not isinstance(client_loaders, list) or not client_loaders:
+        raise ValueError(
+            "dataloaders['client'] must contain at least one loader."
+        )
+    if proxy_loader is None:
+        raise ValueError("dataloaders['proxy'] is required.")
+    if test_loader is None:
+        raise ValueError("dataloaders['test'] is required.")
+    if len(client_models) != len(client_loaders):
+        raise ValueError(
+            "The number of client models must match dataloaders['client']."
+        )
+    if int(rounds) <= 0:
+        raise ValueError("rounds must be positive.")
+    if int(local_epochs) <= 0:
+        raise ValueError("local_epochs must be positive.")
+
+    device_obj = torch.device(device)
+    clients = [
+        FederatedClient(
+            client_id=client_id,
+            model=model,
+            train_loader=loader,
+            device=device_obj,
+            amp=bool(amp),
+            strict_numeric_checks=bool(strict_numeric_checks),
+        )
+        for client_id, (model, loader) in enumerate(
+            zip(client_models, client_loaders)
+        )
+    ]
+    server = FederatedServer(
+        model=server_model,
+        proxy_loader=proxy_loader,
+        device=device_obj,
+        amp=bool(amp),
+        strict_numeric_checks=bool(strict_numeric_checks),
+    )
+
+    metrics: Dict[str, object] = {
+        "topology": "server-client",
+        "knowledge_interface": "serialized-proxy-logits",
+        "aggregation_rule": "mean-soft-probabilities",
+        "server_role": "global-student",
+        "client_role": "local-teacher",
+        "num_clients": len(clients),
+        "admission_method": (
+            str(admission_controller.name)
+            if admission_controller is not None
+            else "none"
+        ),
+        "vcaa_enabled": int(
+            admission_controller is not None
+            and str(admission_controller.name).lower() == "vcaa"
+        ),
+        "defense_method": (
+            str(defense_controller.name)
+            if defense_controller is not None
+            else "none"
+        ),
+        "niabd_enabled": int(
+            defense_controller is not None
+            and str(defense_controller.name).lower() == "niabd"
+        ),
+        "acc_list": [],
+        "loss_list": [],
+        "local_train_time_s": [],
+        "upload_time_s": [],
+        "admission_time_s": [],
+        "defense_time_s": [],
+        "distill_time_s": [],
+        "round_time_s": [],
+        "wall_clock_time_s": [],
+        "clients_trained": [],
+        "client_upload_bytes": [],
+        "server_broadcast_bytes": [],
+        "server_client_distillations": [],
+        "server_updates_from_clients": [],
+        "client_reverse_distillations": [],
+        "server_update_applied": [],
+        "teachers_admitted": [],
+        "teachers_rejected": [],
+        "teacher_utilization": [],
+        "admission_threshold": [],
+        "admission_score_mean": [],
+        "vcaa_version_score_mean": [],
+        "vcaa_content_score_mean": [],
+        "vcaa_proxy_accuracy_mean": [],
+        "vcaa_entropy_mean": [],
+        "vcaa_kl_mean": [],
+        "teacher_admission_records": [],
+        "teachers_purified": [],
+        "niabd_warmup": [],
+        "niabd_anomaly_fraction": [],
+        "niabd_mean_suppression": [],
+        "niabd_threshold_mean": [],
+        "niabd_threshold_min": [],
+        "niabd_threshold_max": [],
+        "niabd_prototype_updated": [],
+        "niabd_prototype_observations": [],
+        "niabd_memory_eligible_teachers": [],
+        "teacher_defense_records": [],
+        "nonfinite_eval_batches": [],
+        "nonfinite_distill_rollbacks": [],
+        "numeric_failure_count": [],
+    }
+
+    wall_clock = 0.0
+    distill_lr = max(float(learning_rate) * 0.2, 1e-4)
+    for round_idx in range(int(rounds)):
+        round_number = int(round_idx + 1)
+        round_start = time.perf_counter()
+
+        local_start = time.perf_counter()
+        for client in clients:
+            client.train_local(
+                epochs=int(local_epochs),
+                learning_rate=float(learning_rate),
+            )
+        local_time = time.perf_counter() - local_start
+
+        upload_start = time.perf_counter()
+        query_id = f"proxy-round-{round_number}"
+        packets = []
+        for client in clients:
+            packets.append(
+                client.upload_proxy_logits(
+                    proxy_loader,
+                    query_id=query_id,
+                )
+            )
+        knowledge_by_client = server.receive_client_uploads(
+            packets,
+            query_id=query_id,
+            expected_client_ids=[client.client_id for client in clients],
+        )
+        upload_time = time.perf_counter() - upload_start
+        admission_start = time.perf_counter()
+        decision = server.apply_admission(
+            knowledge_by_client,
+            current_round=round_number,
+            controller=admission_controller,
+        )
+        if decision is None:
+            admitted_ids = [client.client_id for client in clients]
+        else:
+            _validate_decision(
+                decision,
+                [client.client_id for client in clients],
+            )
+            admitted_ids = list(decision.admitted_client_ids)
+        admission_time = time.perf_counter() - admission_start
+        admission_metrics = _decision_metrics(
+            decision,
+            num_clients=len(clients),
+        )
+        defense_start = time.perf_counter()
+        defense_result = server.apply_defense(
+            knowledge_by_client,
+            admitted_client_ids=admitted_ids,
+            current_round=round_number,
+            controller=defense_controller,
+        )
+        if defense_result is not None:
+            purified_by_id = {
+                int(item.metadata.client_id): item
+                for item in defense_result.purified_knowledge
+            }
+            if (
+                len(purified_by_id)
+                != len(defense_result.purified_knowledge)
+                or set(purified_by_id)
+                != {int(client_id) for client_id in admitted_ids}
+            ):
+                raise ValueError(
+                    "Defense result must return one purified packet for "
+                    "every admitted teacher."
+                )
+            knowledge_by_client = {
+                **knowledge_by_client,
+                **purified_by_id,
+            }
+        defense_time = time.perf_counter() - defense_start
+        defense_metrics = _defense_metrics(
+            defense_result,
+            method=(
+                str(defense_controller.name)
+                if defense_controller is not None
+                else "none"
+            ),
+        )
+
+        client_states = [
+            _freeze_state_dict(client.model.state_dict())
+            for client in clients
+        ]
+        server_state = _freeze_state_dict(server.model.state_dict())
+
+        distill_start = time.perf_counter()
+        aggregated_probabilities = server.aggregate_admitted_probabilities(
+            knowledge_by_client,
+            admitted_ids,
+            temperature=float(distill_temperature),
+        )
+        server_updated = server.train_from_teacher_probabilities(
+            aggregated_probabilities,
+            learning_rate=distill_lr,
+            temperature=float(distill_temperature),
+        )
+        broadcast_bytes = 0
+        reverse_distillations = 0
+        if enable_client_distillation:
+            broadcast = server.build_server_broadcast(
+                current_round=round_number,
+                query_id=query_id,
+            )
+            broadcast_bytes = int(broadcast.payload_bytes) * len(clients)
+            for client in clients:
+                client.distill_from_server(
+                    proxy_loader,
+                    broadcast,
+                    learning_rate=distill_lr,
+                    temperature=float(distill_temperature),
+                )
+                reverse_distillations += 1
+        distill_time = time.perf_counter() - distill_start
+
+        nonfinite_models: List[str] = []
+        if not _model_is_finite(server.model):
+            nonfinite_models.append("server")
+        for client in clients:
+            if not _model_is_finite(client.model):
+                nonfinite_models.append(f"client_{client.client_id}")
+
+        rollback = int(bool(nonfinite_models))
+        if rollback:
+            _restore_model(server.model, server_state, device_obj)
+            for client, state in zip(clients, client_states):
+                _restore_model(client.model, state, device_obj)
+
+        accuracy, loss, nonfinite_eval = evaluate_with_loss(
+            server.model,
+            test_loader,
+            device=device_obj,
+            amp=bool(amp),
+        )
+        round_time = time.perf_counter() - round_start
+        wall_clock += round_time
+
+        metrics["acc_list"].append(float(accuracy))
+        metrics["loss_list"].append(float(loss))
+        metrics["local_train_time_s"].append(float(local_time))
+        metrics["upload_time_s"].append(float(upload_time))
+        metrics["admission_time_s"].append(float(admission_time))
+        metrics["defense_time_s"].append(float(defense_time))
+        metrics["distill_time_s"].append(float(distill_time))
+        metrics["round_time_s"].append(float(round_time))
+        metrics["wall_clock_time_s"].append(float(wall_clock))
+        metrics["clients_trained"].append(len(clients))
+        metrics["client_upload_bytes"].append(
+            int(sum(packet.payload_bytes for packet in packets))
+        )
+        metrics["server_broadcast_bytes"].append(int(broadcast_bytes))
+        metrics["server_client_distillations"].append(len(admitted_ids))
+        metrics["server_updates_from_clients"].append(len(admitted_ids))
+        metrics["client_reverse_distillations"].append(
+            int(reverse_distillations)
+        )
+        metrics["server_update_applied"].append(int(server_updated))
+        metrics["teachers_admitted"].append(
+            int(admission_metrics["admitted"])
+        )
+        metrics["teachers_rejected"].append(
+            int(admission_metrics["rejected"])
+        )
+        metrics["teacher_utilization"].append(
+            float(admission_metrics["utilization"])
+        )
+        metrics["admission_threshold"].append(
+            float(admission_metrics["threshold"])
+        )
+        metrics["admission_score_mean"].append(
+            float(admission_metrics["score_mean"])
+        )
+        metrics["vcaa_version_score_mean"].append(
+            float(admission_metrics["version_score_mean"])
+        )
+        metrics["vcaa_content_score_mean"].append(
+            float(admission_metrics["content_score_mean"])
+        )
+        metrics["vcaa_proxy_accuracy_mean"].append(
+            float(admission_metrics["proxy_accuracy_mean"])
+        )
+        metrics["vcaa_entropy_mean"].append(
+            float(admission_metrics["entropy_mean"])
+        )
+        metrics["vcaa_kl_mean"].append(
+            float(admission_metrics["kl_mean"])
+        )
+        metrics["teacher_admission_records"].append(
+            admission_metrics["records"]
+        )
+        metrics["teachers_purified"].append(
+            int(defense_metrics["teachers_purified"])
+        )
+        metrics["niabd_warmup"].append(
+            float(defense_metrics["warmup"])
+        )
+        metrics["niabd_anomaly_fraction"].append(
+            float(defense_metrics["anomaly_fraction"])
+        )
+        metrics["niabd_mean_suppression"].append(
+            float(defense_metrics["mean_suppression"])
+        )
+        metrics["niabd_threshold_mean"].append(
+            float(defense_metrics["threshold_mean"])
+        )
+        metrics["niabd_threshold_min"].append(
+            float(defense_metrics["threshold_min"])
+        )
+        metrics["niabd_threshold_max"].append(
+            float(defense_metrics["threshold_max"])
+        )
+        metrics["niabd_prototype_updated"].append(
+            float(defense_metrics["prototype_updated"])
+        )
+        metrics["niabd_prototype_observations"].append(
+            float(defense_metrics["prototype_observations"])
+        )
+        metrics["niabd_memory_eligible_teachers"].append(
+            int(defense_metrics["memory_eligible_teachers"])
+        )
+        metrics["teacher_defense_records"].append(
+            defense_metrics["records"]
+        )
+        metrics["nonfinite_eval_batches"].append(int(nonfinite_eval))
+        metrics["nonfinite_distill_rollbacks"].append(int(rollback))
+        metrics["numeric_failure_count"].append(0.0)
+
+        print(
+            f"[Round {round_number}] topology=server-client "
+            f"interface=serialized-proxy-logits clients={len(clients)} "
+            f"admitted={len(admitted_ids)} acc={accuracy:.4f} "
+            f"defense={defense_metrics['method']} "
+            f"loss={loss:.4f} local={local_time:.2f}s "
+            f"upload={upload_time:.2f}s admission={admission_time:.2f}s "
+            f"niabd={defense_time:.2f}s distill={distill_time:.2f}s"
+            f"{' rollback=1' if rollback else ''}"
+        )
+
+    return metrics

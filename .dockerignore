@@ -1,0 +1,24 @@
+.git
+.gitignore
+.gitattributes
+.pytest_cache
+.pytest_tmp*
+__pycache__
+**/__pycache__
+*.py[cod]
+*.pyo
+*.log
+
+dataset
+experiment_results*
+outputs
+build
+
+.fedagg
+.settings
+.ipynb_checkpoints
+
+# Keep source tests out of the runtime image.
+tests
+pytest.ini
+requirements-dev.txt
