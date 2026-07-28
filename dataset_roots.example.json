@@ -1,0 +1,5 @@
+{
+  "cifar10": "/data/cifar10",
+  "cinic10": "/data/CINIC-10",
+  "tiny-imagenet-200": "/data/tiny-imagenet-200"
+}
