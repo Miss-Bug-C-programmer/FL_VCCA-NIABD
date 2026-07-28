@@ -2,6 +2,8 @@ name: export-source
 on:
   push:
     branches: [chatgpt-export-backdoor]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
