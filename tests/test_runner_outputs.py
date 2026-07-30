@@ -1,8 +1,15 @@
+from pathlib import Path
+
+import pandas as pd
+
 from experiment_runner import (
+    PROCESS_ONLY_ROUND_FIELDS,
+    _ensure_csv_header,
     _admission_rows,
     _defense_rows,
     _round_rows,
     _runtime_event_rows,
+    _standard_csv_columns,
     _summary_row,
 )
 
@@ -218,3 +225,105 @@ def test_packet_runtime_events_keep_run_and_strategy_lineage():
     assert rows[0]["strategy"] == "vcaa-niabd"
     assert rows[0]["runtime"] == "process-semi-async"
     assert rows[0]["version_lag"] == 2
+
+
+def test_sync_process_only_round_and_summary_metrics_are_missing():
+    metrics = _metrics()
+    metrics["runtime"] = "sync"
+    rows = list(
+        _round_rows(
+            metrics,
+            run_uid="sync",
+            dataset_name="cifar10",
+            seed=0,
+            num_clients=3,
+            partition_scheme="iid",
+        )
+    )
+
+    assert all(
+        pd.isna(row[key])
+        for row in rows
+        for key in PROCESS_ONLY_ROUND_FIELDS
+    )
+    summary = _summary_row(rows)
+    assert pd.isna(summary["total_client_wire_bytes"])
+    assert pd.isna(summary["total_packets_consumed"])
+    assert pd.isna(summary["total_stale_packets"])
+    assert pd.isna(summary["max_version_lag"])
+
+
+def test_process_observed_zero_is_preserved():
+    metrics = _metrics()
+    metrics["runtime"] = "process-semi-async"
+    metrics.update({
+        key: [0, 0]
+        for key in PROCESS_ONLY_ROUND_FIELDS
+    })
+    rows = list(
+        _round_rows(
+            metrics,
+            run_uid="process-zero",
+            dataset_name="cifar10",
+            seed=0,
+            num_clients=3,
+            partition_scheme="iid",
+        )
+    )
+
+    assert all(
+        row[key] == 0
+        for row in rows
+        for key in PROCESS_ONLY_ROUND_FIELDS
+    )
+    summary = _summary_row(rows)
+    assert summary["total_client_wire_bytes"] == 0
+    assert summary["total_packets_consumed"] == 0
+    assert summary["total_stale_packets"] == 0
+    assert summary["max_version_lag"] == 0
+
+
+def test_process_observed_nonzero_is_preserved():
+    metrics = _metrics()
+    metrics["runtime"] = "process-semi-async"
+    metrics.update({
+        key: [2, 3]
+        for key in PROCESS_ONLY_ROUND_FIELDS
+    })
+    rows = list(
+        _round_rows(
+            metrics,
+            run_uid="process-nonzero",
+            dataset_name="cifar10",
+            seed=0,
+            num_clients=3,
+            partition_scheme="iid",
+        )
+    )
+
+    assert rows[0]["client_wire_bytes"] == 2
+    assert rows[1]["retry_count"] == 3
+    summary = _summary_row(rows)
+    assert summary["total_client_wire_bytes"] == 5
+    assert summary["total_packets_consumed"] == 5
+    assert summary["total_stale_packets"] == 15
+    assert summary["max_version_lag"] == 3
+
+
+def test_baseline_sync_standard_tables_can_be_header_only(tmp_path: Path):
+    schemas = _standard_csv_columns()
+    expected = {
+        "fedagg_experiment_results_cifar10.csv": "round",
+        "fedagg_run_summary_cifar10.csv": "summary",
+        "fedagg_teacher_admission_cifar10.csv": "admission",
+        "fedagg_teacher_defense_cifar10.csv": "defense",
+        "fedagg_runtime_events_cifar10.csv": "runtime",
+        "fedagg_backdoor_defense_cifar10.csv": "backdoor",
+    }
+    for filename, schema_name in expected.items():
+        path = tmp_path / filename
+        _ensure_csv_header(str(path), schemas[schema_name])
+        frame = pd.read_csv(path)
+        assert path.is_file()
+        assert tuple(frame.columns) == schemas[schema_name]
+        assert frame.empty

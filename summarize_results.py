@@ -76,8 +76,15 @@ def summarize(indir: str) -> pd.DataFrame:
         row["runs"] = int(len(group))
         for metric in METRIC_COLUMNS:
             values = pd.to_numeric(group[metric], errors="coerce")
-            row[f"{metric}_mean"] = float(values.mean())
-            row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            observed = values.dropna()
+            row[f"{metric}_mean"] = (
+                float(observed.mean()) if not observed.empty else float("nan")
+            )
+            row[f"{metric}_std"] = (
+                float(observed.std(ddof=1))
+                if len(observed) > 1
+                else (0.0 if len(observed) == 1 else float("nan"))
+            )
         rows.append(row)
     return pd.DataFrame(rows).sort_values(GROUP_COLUMNS).reset_index(drop=True)
 

@@ -78,3 +78,33 @@ def test_real_batch_poisoning_flows_through_serialized_logits_and_niabd():
         for row in metrics["backdoor_client_records"][1]
     )
     assert metrics["niabd_enabled"] == 1
+
+
+def test_triggered_no_poison_keeps_basr_and_reports_zero_poisoning():
+    plan = AttackPlan.build(
+        seed=7,
+        num_clients=2,
+        config=AttackConfig(
+            attack_type="badnets",
+            target_label=0,
+            malicious_fraction=0.5,
+            poison_ratio=0.0,
+            attack_start_round=1,
+            attack_end_round=1,
+            trigger_size=2,
+        ),
+    )
+    metrics = run_fedagg_server_client(
+        [_TinyVisionModel(), _TinyVisionModel()],
+        _TinyVisionModel(),
+        _loaders(),
+        device="cpu",
+        rounds=1,
+        local_epochs=1,
+        learning_rate=0.01,
+        attack_plan=plan,
+    )
+
+    assert metrics["poisoned_samples"] == [0]
+    assert metrics["basr_global_denominator"][0] > 0
+    assert 0.0 <= metrics["basr_global"][0] <= 1.0

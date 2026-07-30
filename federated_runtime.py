@@ -261,6 +261,8 @@ def run_fedagg_server_client(
     defense_controller: Optional[KnowledgeDefenseController] = None,
     enable_client_distillation: bool = True,
     attack_plan: Optional[AttackPlan] = None,
+    enable_backdoor_diagnostics: bool = False,
+    backdoor_diagnostics_dataset: str = "",
 ) -> Dict[str, object]:
     """Train real clients through serialized proxy-logits knowledge exchange.
 
@@ -429,6 +431,7 @@ def run_fedagg_server_client(
         "malicious_memory_eligible_rate": [],
         "benign_memory_eligible_rate": [],
         "backdoor_client_records": [],
+        "backdoor_diagnostics_enabled": int(enable_backdoor_diagnostics),
     }
 
     wall_clock = 0.0
@@ -623,6 +626,25 @@ def run_fedagg_server_client(
                 "basr_local_3": float("nan"),
                 "basr_local_4": float("nan"),
             }
+        if enable_backdoor_diagnostics:
+            if attack_plan is None:
+                raise ValueError(
+                    "Backdoor diagnostics require an explicit AttackPlan."
+                )
+            diagnostics_by_client = {
+                int(client.client_id): client.compute_backdoor_diagnostics(
+                    proxy_loader,
+                    plan=attack_plan,
+                    dataset_name=str(backdoor_diagnostics_dataset),
+                    experiment_seed=int(attack_plan.seed),
+                    source_round=round_number,
+                )
+                for client in clients
+            }
+            for record in backdoor_records:
+                record.update(
+                    diagnostics_by_client[int(record["client_id"])]
+                )
         round_time = time.perf_counter() - round_start
         wall_clock += round_time
 

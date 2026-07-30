@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from itertools import product
 import json
 from pathlib import Path
@@ -34,8 +35,44 @@ def _job_dir(root: Path, dataset: str, attack: str, method: str, seed: int) -> P
     return root / dataset / attack / method / f"seed_{seed}"
 
 
-def _summary_exists(job_dir: Path, dataset: str) -> bool:
-    return (job_dir / f"fedagg_run_summary_{dataset}.csv").is_file()
+def _summary_complete(
+    job_dir: Path,
+    *,
+    dataset: str,
+    attack: str,
+    method: str,
+    seed: int,
+    rounds: int,
+    runtime: str,
+) -> bool:
+    path = job_dir / f"fedagg_run_summary_{dataset}.csv"
+    if not path.is_file():
+        return False
+    required = {
+        "dataset", "seed", "runtime", "strategy", "attack_type", "rounds",
+        "final_accuracy", "final_loss",
+    }
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not required.issubset(set(reader.fieldnames or ())):
+                return False
+            rows = list(reader)
+        if len(rows) != 1:
+            return False
+        row = rows[0]
+        return (
+            row["dataset"] == str(dataset)
+            and row["attack_type"] == str(attack)
+            and row["strategy"] == str(method)
+            and row["runtime"] == str(runtime)
+            and int(row["seed"]) == int(seed)
+            and int(row["rounds"]) == int(rounds)
+            and row["final_accuracy"] != ""
+            and row["final_loss"] != ""
+        )
+    except (OSError, TypeError, ValueError, csv.Error):
+        return False
 
 
 def _ensure_trace(
@@ -260,7 +297,15 @@ def main() -> None:
     root_out = Path(args.outdir)
     for index, (dataset, attack, method, seed) in enumerate(jobs, start=1):
         job_out = _job_dir(root_out, dataset, attack, method, int(seed))
-        if args.resume and _summary_exists(job_out, dataset):
+        if args.resume and _summary_complete(
+            job_out,
+            dataset=dataset,
+            attack=attack,
+            method=method,
+            seed=int(seed),
+            rounds=int(config["rounds"]),
+            runtime=str(config["runtime"]),
+        ):
             print(f"[{index}/{len(jobs)}] skip complete {job_out}", flush=True)
             continue
         trace_path = None

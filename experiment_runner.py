@@ -39,6 +39,94 @@ from runtime_trace import (
 from vcaa import VCAAConfig, VersionContentAwareAdmission
 
 
+PROCESS_RUNTIME = "process-semi-async"
+PROCESS_ONLY_ROUND_FIELDS = (
+    "aggregation_time_s",
+    "client_wire_bytes",
+    "selected_clients",
+    "dispatched_clients",
+    "busy_skipped_clients",
+    "offline_clients",
+    "packets_consumed",
+    "fresh_packets",
+    "mild_stale_packets",
+    "moderate_stale_packets",
+    "severe_stale_packets",
+    "mean_version_lag",
+    "max_version_lag",
+    "mean_knowledge_age_s",
+    "max_knowledge_age_s",
+    "upload_attempt_drop_count",
+    "rpc_timeout_count",
+    "retry_count",
+    "quorum_required",
+    "quorum_reached",
+    "soft_deadline_s",
+    "hard_deadline_s",
+)
+
+ADMISSION_COLUMNS = (
+    "run_uid", "dataset", "seed", "round", "topology", "num_clients",
+    "partition_scheme", "admission_method", "client_id", "admitted",
+    "score", "version_score", "age_seconds", "model_round",
+    "minimum_accepted_round", "proxy_accuracy", "mean_entropy", "mean_kl",
+    "num_classes", "accuracy_term", "entropy_term", "divergence_term",
+    "content_score", "task_id", "packet_id", "source_round",
+    "consumed_round", "version_lag", "knowledge_age_s",
+)
+
+DEFENSE_COLUMNS = (
+    "run_uid", "dataset", "seed", "round", "topology", "num_clients",
+    "partition_scheme", "defense_method", "client_id", "anomaly_fraction",
+    "mean_abs_deviation", "max_abs_deviation", "mean_suppression",
+    "memory_eligible", "task_id", "packet_id", "source_round",
+    "consumed_round", "version_lag",
+)
+
+RUNTIME_EVENT_COLUMNS = (
+    "run_uid", "dataset", "seed", "runtime", "strategy", "topology",
+    "num_clients", "partition_scheme", "server_device", "client_device",
+    "client_id", "client_pid", "task_id", "packet_id", "payload_sha256",
+    "inference_sha256", "source_round", "base_server_round",
+    "receive_server_round", "consumed_round", "local_model_version",
+    "dispatch_at_s", "dispatched_at_s", "compute_started_at_s",
+    "compute_finished_at_s", "generated_at_s",
+    "first_upload_attempt_at_s", "received_at_s", "consumed_at_s",
+    "actual_compute_time_s", "proxy_inference_time_s",
+    "injected_compute_delay_s", "total_compute_phase_s",
+    "injected_upload_delay_s", "knowledge_age_s", "transport_age_s",
+    "version_lag", "base_version_lag", "upload_attempts",
+    "upload_attempt_drop_count", "rpc_timeout_count", "retry_count",
+    "duplicate_receive_count", "rpc_elapsed_s", "payload_bytes",
+    "wire_bytes", "logits_dtype", "logits_shape", "proxy_version",
+    "local_train_count", "predict_logits_calls", "transport_status",
+    "rpc_accept_status", "vcaa_version_score", "vcaa_content_score",
+    "vcaa_final_score", "vcaa_threshold", "proxy_accuracy",
+    "mean_entropy", "mean_kl", "admitted", "niabd_anomaly_fraction",
+    "niabd_mean_suppression", "is_malicious", "attack_active",
+    "poisoned_samples", "eligible_poison_samples", "poisoned_batches",
+    "dba_trigger_part", "attack_stats_missing",
+)
+
+BACKDOOR_COLUMNS = (
+    "run_uid", "dataset", "seed", "round", "runtime", "strategy",
+    "attack_type", "attack_plan_id", "target_label", "topology",
+    "num_clients", "partition_scheme", "client_id", "task_id", "packet_id",
+    "source_round", "consumed_round", "version_lag", "is_malicious",
+    "attack_active", "poisoned_samples", "eligible_poison_samples",
+    "poisoned_batches", "dba_trigger_part", "attack_stats_missing",
+    "admitted", "admission_score", "niabd_anomaly_fraction",
+    "niabd_mean_abs_deviation", "niabd_max_abs_deviation",
+    "niabd_mean_suppression", "niabd_memory_eligible", "diagnostic_scope",
+    "diagnostic_usage", "diagnostic_reporter_trust", "diagnostic_seed",
+    "diagnostic_proxy_samples", "clean_proxy_target_probability",
+    "triggered_proxy_target_probability",
+    "clean_trigger_logit_l1_deviation",
+    "clean_trigger_logit_l2_deviation",
+    "clean_trigger_prediction_flip_rate",
+)
+
+
 def _parse_int_list(value: str) -> List[int]:
     items = [item.strip() for item in str(value).split(",") if item.strip()]
     return [int(item) for item in items]
@@ -61,6 +149,14 @@ def _metric(metrics, key: str, round_idx: int, default=0.0):
     if not isinstance(values, list) or round_idx >= len(values):
         return default
     return values[round_idx]
+
+
+def _process_metric(metrics, key: str, round_idx: int):
+    """Return measured process data, or NaN when the runtime cannot emit it."""
+
+    if str(metrics.get("runtime", "sync")).lower() != PROCESS_RUNTIME:
+        return np.nan
+    return _metric(metrics, key, round_idx, np.nan)
 
 
 def _round_rows(
@@ -311,86 +407,10 @@ def _round_rows(
             "numeric_failure_count": float(
                 _metric(metrics, "numeric_failure_count", round_idx)
             ),
-            "aggregation_time_s": float(
-                _metric(metrics, "aggregation_time_s", round_idx)
-            ),
-            "client_wire_bytes": int(
-                _metric(metrics, "client_wire_bytes", round_idx)
-            ),
-            "selected_clients": int(
-                _metric(metrics, "selected_clients", round_idx)
-            ),
-            "dispatched_clients": int(
-                _metric(metrics, "dispatched_clients", round_idx)
-            ),
-            "busy_skipped_clients": int(
-                _metric(metrics, "busy_skipped_clients", round_idx)
-            ),
-            "offline_clients": int(
-                _metric(metrics, "offline_clients", round_idx)
-            ),
-            "packets_consumed": int(
-                _metric(metrics, "packets_consumed", round_idx)
-            ),
-            "fresh_packets": int(
-                _metric(metrics, "fresh_packets", round_idx)
-            ),
-            "mild_stale_packets": int(
-                _metric(metrics, "mild_stale_packets", round_idx)
-            ),
-            "moderate_stale_packets": int(
-                _metric(metrics, "moderate_stale_packets", round_idx)
-            ),
-            "severe_stale_packets": int(
-                _metric(metrics, "severe_stale_packets", round_idx)
-            ),
-            "mean_version_lag": float(
-                _metric(metrics, "mean_version_lag", round_idx, np.nan)
-            ),
-            "max_version_lag": float(
-                _metric(metrics, "max_version_lag", round_idx, np.nan)
-            ),
-            "mean_knowledge_age_s": float(
-                _metric(
-                    metrics,
-                    "mean_knowledge_age_s",
-                    round_idx,
-                    np.nan,
-                )
-            ),
-            "max_knowledge_age_s": float(
-                _metric(
-                    metrics,
-                    "max_knowledge_age_s",
-                    round_idx,
-                    np.nan,
-                )
-            ),
-            "upload_attempt_drop_count": int(
-                _metric(
-                    metrics,
-                    "upload_attempt_drop_count",
-                    round_idx,
-                )
-            ),
-            "rpc_timeout_count": int(
-                _metric(metrics, "rpc_timeout_count", round_idx)
-            ),
-            "retry_count": int(
-                _metric(metrics, "retry_count", round_idx)
-            ),
-            "quorum_required": int(
-                _metric(metrics, "quorum_required", round_idx)
-            ),
-            "quorum_reached": int(
-                _metric(metrics, "quorum_reached", round_idx)
-            ),
-            "soft_deadline_s": float(
-                _metric(metrics, "soft_deadline_s", round_idx)
-            ),
-            "hard_deadline_s": float(
-                _metric(metrics, "hard_deadline_s", round_idx)
-            ),
+            **{
+                key: _process_metric(metrics, key, round_idx)
+                for key in PROCESS_ONLY_ROUND_FIELDS
+            },
         }
 
 
@@ -401,6 +421,21 @@ def _summary_row(
     if not rows:
         raise ValueError("Cannot summarize an empty run.")
     last = rows[-1]
+    is_process = str(last["runtime"]).lower() == PROCESS_RUNTIME
+
+    def process_total(keys: str | tuple[str, ...]):
+        if not is_process:
+            return np.nan
+        selected = (keys,) if isinstance(keys, str) else keys
+        values = [
+            row[key]
+            for row in rows
+            for key in selected
+        ]
+        if any(pd.isna(value) for value in values):
+            return np.nan
+        return sum(values)
+
     summary = {
         "run_uid": last["run_uid"],
         "dataset": last["dataset"],
@@ -465,18 +500,13 @@ def _summary_row(
         "total_numeric_failures": max(
             float(row["numeric_failure_count"]) for row in rows
         ),
-        "total_client_wire_bytes": sum(
-            int(row["client_wire_bytes"]) for row in rows
-        ),
-        "total_packets_consumed": sum(
-            int(row["packets_consumed"]) for row in rows
-        ),
-        "total_stale_packets": sum(
-            int(row["mild_stale_packets"])
-            + int(row["moderate_stale_packets"])
-            + int(row["severe_stale_packets"])
-            for row in rows
-        ),
+        "total_client_wire_bytes": process_total("client_wire_bytes"),
+        "total_packets_consumed": process_total("packets_consumed"),
+        "total_stale_packets": process_total((
+            "mild_stale_packets",
+            "moderate_stale_packets",
+            "severe_stale_packets",
+        )),
         "max_version_lag": float(np.nanmax([
             row["max_version_lag"] for row in rows
         ])) if any(
@@ -738,6 +768,37 @@ def _runtime_event_rows(
         }
 
 
+def _standard_csv_columns() -> dict[str, tuple[str, ...]]:
+    """Return stable schemas, including tables that may have no data rows."""
+
+    placeholder_metrics = {
+        "acc_list": [np.nan],
+        "runtime": "sync",
+    }
+    placeholder_round = next(_round_rows(
+        placeholder_metrics,
+        run_uid="",
+        dataset_name="",
+        seed=0,
+        num_clients=1,
+        partition_scheme="",
+    ))
+    placeholder_summary = _summary_row([placeholder_round])
+    return {
+        "round": tuple(placeholder_round),
+        "summary": tuple(placeholder_summary),
+        "admission": ADMISSION_COLUMNS,
+        "defense": DEFENSE_COLUMNS,
+        "runtime": RUNTIME_EVENT_COLUMNS,
+        "backdoor": BACKDOOR_COLUMNS,
+    }
+
+
+def _ensure_csv_header(path: str, columns: tuple[str, ...]) -> None:
+    if not os.path.exists(path):
+        pd.DataFrame(columns=list(columns)).to_csv(path, index=False)
+
+
 def _strategy_name(enable_vcaa: bool, enable_niabd: bool) -> str:
     if enable_vcaa and enable_niabd:
         return "vcaa-niabd"
@@ -807,6 +868,7 @@ def run_experiment(
     runtime_trace_out: str = "",
     attack_config: AttackConfig | None = None,
     attack_plan_path: str = "",
+    enable_backdoor_diagnostics: bool = False,
 ) -> None:
     os.makedirs(outdir, exist_ok=True)
     round_csv = os.path.join(
@@ -838,6 +900,12 @@ def run_experiment(
         raise ValueError(f"Unsupported runtime={runtime!r}.")
     if runtime == "process-semi-async" and process_config is None:
         raise ValueError("process_config is required for process runtime.")
+    if enable_backdoor_diagnostics and runtime != "sync":
+        raise ValueError(
+            "Experiment-only backdoor diagnostics currently support only "
+            "sync runtime so process scheduling, deadlines, and traces remain "
+            "unchanged."
+        )
     if not append:
         for path in (
             round_csv,
@@ -849,6 +917,16 @@ def run_experiment(
         ):
             if os.path.exists(path):
                 os.remove(path)
+    schemas = _standard_csv_columns()
+    for path, schema_name in (
+        (round_csv, "round"),
+        (summary_csv, "summary"),
+        (admission_csv, "admission"),
+        (defense_csv, "defense"),
+        (runtime_event_csv, "runtime"),
+        (backdoor_csv, "backdoor"),
+    ):
+        _ensure_csv_header(path, schemas[schema_name])
 
     attack_config = attack_config or AttackConfig(attack_type="none")
     seeds = seeds or [0]
@@ -1034,6 +1112,10 @@ def run_experiment(
                                 enable_client_distillation
                             ),
                             attack_plan=attack_plan,
+                            enable_backdoor_diagnostics=bool(
+                                enable_backdoor_diagnostics
+                            ),
+                            backdoor_diagnostics_dataset=dataset_name,
                         )
                         metrics.update({
                             "runtime": "sync",
@@ -1104,19 +1186,21 @@ def run_experiment(
                             partition_scheme=str(partition_scheme),
                         )
                     )
-                    pd.DataFrame(rows).to_csv(
+                    pd.DataFrame(rows).reindex(
+                        columns=schemas["round"]
+                    ).to_csv(
                         round_csv,
                         mode="a",
-                        header=not os.path.exists(round_csv),
+                        header=False,
                         index=False,
                     )
                     pd.DataFrame([_summary_row(
                         rows,
                         list(metrics.get("runtime_events", [])),
-                    )]).to_csv(
+                    )]).reindex(columns=schemas["summary"]).to_csv(
                         summary_csv,
                         mode="a",
-                        header=not os.path.exists(summary_csv),
+                        header=False,
                         index=False,
                     )
                     admission_rows = list(
@@ -1130,10 +1214,12 @@ def run_experiment(
                         )
                     )
                     if admission_rows:
-                        pd.DataFrame(admission_rows).to_csv(
+                        pd.DataFrame(admission_rows).reindex(
+                            columns=schemas["admission"]
+                        ).to_csv(
                             admission_csv,
                             mode="a",
-                            header=not os.path.exists(admission_csv),
+                            header=False,
                             index=False,
                         )
                     defense_rows = list(
@@ -1147,10 +1233,12 @@ def run_experiment(
                         )
                     )
                     if defense_rows:
-                        pd.DataFrame(defense_rows).to_csv(
+                        pd.DataFrame(defense_rows).reindex(
+                            columns=schemas["defense"]
+                        ).to_csv(
                             defense_csv,
                             mode="a",
-                            header=not os.path.exists(defense_csv),
+                            header=False,
                             index=False,
                         )
                     runtime_rows = list(
@@ -1164,12 +1252,12 @@ def run_experiment(
                         )
                     )
                     if runtime_rows:
-                        pd.DataFrame(runtime_rows).to_csv(
+                        pd.DataFrame(runtime_rows).reindex(
+                            columns=schemas["runtime"]
+                        ).to_csv(
                             runtime_event_csv,
                             mode="a",
-                            header=not os.path.exists(
-                                runtime_event_csv
-                            ),
+                            header=False,
                             index=False,
                         )
                     backdoor_rows = list(
@@ -1183,22 +1271,20 @@ def run_experiment(
                         )
                     )
                     if backdoor_rows:
-                        pd.DataFrame(backdoor_rows).to_csv(
+                        pd.DataFrame(backdoor_rows).reindex(
+                            columns=schemas["backdoor"]
+                        ).to_csv(
                             backdoor_csv,
                             mode="a",
-                            header=not os.path.exists(backdoor_csv),
+                            header=False,
                             index=False,
                         )
                     print(f"[write] {round_csv}")
                     print(f"[write] {summary_csv}")
-                    if admission_rows:
-                        print(f"[write] {admission_csv}")
-                    if defense_rows:
-                        print(f"[write] {defense_csv}")
-                    if runtime_rows:
-                        print(f"[write] {runtime_event_csv}")
-                    if backdoor_rows:
-                        print(f"[write] {backdoor_csv}")
+                    print(f"[write] {admission_csv}")
+                    print(f"[write] {defense_csv}")
+                    print(f"[write] {runtime_event_csv}")
+                    print(f"[write] {backdoor_csv}")
                     print(f"[write] {attack_plan_file}")
                 finally:
                     cleanup_dataloaders(dataloaders)
@@ -1330,6 +1416,14 @@ def main() -> None:
         "--attack-plan",
         default="",
         help="Optional exact AttackPlan JSON to replay; generated plans are always exported.",
+    )
+    parser.add_argument(
+        "--enable-backdoor-diagnostics",
+        action="store_true",
+        help=(
+            "Enable sync-only experiment oracle diagnostics after all "
+            "admission, defense, aggregation, and student updates."
+        ),
     )
     parser.add_argument(
         "--enable-vcaa",
@@ -1627,6 +1721,7 @@ def main() -> None:
         ),
         attack_config=attack_config,
         attack_plan_path=args.attack_plan,
+        enable_backdoor_diagnostics=args.enable_backdoor_diagnostics,
     )
 
 

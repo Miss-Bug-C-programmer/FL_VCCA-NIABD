@@ -8,6 +8,8 @@ import pytest
 
 from scripts.run_attack_viability_controls import (
     _load_json_or_inline as load_control_roots,
+    build_control_command,
+    build_control_jobs,
 )
 from scripts.run_main_backdoor_matrix import (
     _load_json_or_inline as load_matrix_roots,
@@ -100,3 +102,59 @@ def test_process_matrix_passes_shared_timeouts_and_deadlines():
     )
     assert command[command.index("--soft-deadline-s") + 1] == "300.0"
     assert command[command.index("--hard-deadline-s") + 1] == "600.0"
+
+
+def test_attack_viability_control_modes_are_separate_from_formal_matrix():
+    config = json.loads(
+        Path("configs/main_backdoor_experiment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    clean = build_control_jobs(config, "clean")
+    triggered = build_control_jobs(config, "triggered-no-poison")
+    both = build_control_jobs(config, "both")
+
+    assert len(clean) == 15
+    assert len(triggered) == 60
+    assert len(both) == 75
+    assert all(attack == "none" for _, attack, _ in clean)
+    assert all(attack in config["attacks"] for _, attack, _ in triggered)
+
+
+def test_triggered_no_poison_control_passes_formal_configuration():
+    config = json.loads(
+        Path("configs/main_backdoor_experiment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    command = build_control_command(
+        dataset_root="/data",
+        dataset="cifar10",
+        attack="badnets",
+        seed=3,
+        config=config,
+        outdir=Path("/controls/triggered-no-poison/cifar10/badnets/seed_3"),
+        device="cuda:0",
+        num_workers=2,
+    )
+
+    assert command[command.index("--method") + 1] == "baseline"
+    assert command[command.index("--attack") + 1] == "badnets"
+    assert command[command.index("--poison-ratio") + 1] == "0.0"
+    assert command[command.index("--target-label") + 1] == str(
+        config["target_label"]
+    )
+    assert command[command.index("--malicious-fraction") + 1] == str(
+        config["malicious_fraction"]
+    )
+    assert command[command.index("--attack-start-round") + 1] == str(
+        config["attack_start_round"]
+    )
+    assert command[command.index("--attack-end-round") + 1] == str(
+        config["attack_end_round"]
+    )
+    assert command[command.index("--proxy-dataset-size") + 1] == str(
+        config["proxy_dataset_size"]
+    )
+    assert command[command.index("--runtime") + 1] == config["runtime"]
+    assert command[command.index("--num-workers") + 1] == "2"
