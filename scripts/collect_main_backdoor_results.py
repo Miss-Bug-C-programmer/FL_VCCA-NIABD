@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import pandas as pd
+
+from compute_statistics import _ci
 
 
 def main() -> None:
@@ -83,10 +84,11 @@ def main() -> None:
         sort=True,
     )
     def ci95(series: pd.Series) -> float:
-        values = series.dropna()
+        values = pd.to_numeric(series, errors="coerce").dropna().to_numpy()
         if len(values) <= 1:
             return float("nan")
-        return float(1.96 * values.std(ddof=1) / math.sqrt(len(values)))
+        _, lower, upper = _ci(values, 0.95)
+        return float((upper - lower) / 2.0)
 
     table = grouped.agg(
         runs=("seed", "count"),

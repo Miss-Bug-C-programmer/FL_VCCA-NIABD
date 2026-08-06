@@ -165,7 +165,10 @@ def process_result(tmp_path_factory):
                 )
             ),
             defense_controller=NeuroInspiredAdaptiveBackdoorDefense(
-                NIABDConfig(warmup_rounds=1)
+                NIABDConfig(
+                    warmup_rounds=1,
+                    minimum_consensus_teachers=3,
+                )
             ),
             enable_client_distillation=True,
         )

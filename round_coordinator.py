@@ -19,6 +19,7 @@ CLIENT_STOPPED = "STOPPED"
 TASK_DISPATCHED = "DISPATCHED"
 TASK_IN_FLIGHT = "IN_FLIGHT"
 TASK_KNOWLEDGE_RECEIVED = "KNOWLEDGE_RECEIVED"
+TASK_RESERVED = "RESERVED"
 TASK_CONSUMED = "CONSUMED"
 TASK_FAILED = "FAILED"
 TASK_EXPIRED = "EXPIRED"
@@ -118,6 +119,7 @@ class SemiAsyncRoundCoordinator:
         }
         self._client_pid: Dict[int, int] = {}
         self._seen_packet_ids: Dict[str, Tuple[str, str, float]] = {}
+        self._rollback_by_client: Dict[int, str] = {}
         self._shutdown = False
         self._lock = threading.RLock()
 
@@ -130,6 +132,84 @@ class SemiAsyncRoundCoordinator:
     def client_states(self) -> Dict[int, str]:
         with self._lock:
             return dict(self._client_state)
+
+    def snapshot_state(self) -> dict:
+        """Capture task lineage for an atomic process-runtime checkpoint."""
+
+        with self._lock:
+            return {
+                "proxy_version": self.proxy_version,
+                "client_state": dict(self._client_state),
+                "client_pid": dict(self._client_pid),
+                "task_registry": {
+                    task_id: {
+                        "task": entry.task,
+                        "status": entry.status,
+                        "received_at_s": float(entry.received_at_s),
+                        "consumed_at_s": float(entry.consumed_at_s),
+                        "packet_id": entry.packet_id,
+                        "failure": entry.failure,
+                    }
+                    for task_id, entry in self.task_registry.items()
+                },
+                "pending_by_client": dict(self._pending_by_client),
+                "active_task_by_client": dict(self._active_task_by_client),
+                "seen_packet_ids": dict(self._seen_packet_ids),
+                "rollback_by_client": dict(self._rollback_by_client),
+                "shutdown": bool(self._shutdown),
+            }
+
+    def restore_state(self, state: dict) -> None:
+        with self._lock:
+            if str(state.get("proxy_version")) != self.proxy_version:
+                raise ValueError("Coordinator proxy_version mismatch.")
+            for key in (
+                "client_state",
+                "client_pid",
+                "task_registry",
+                "pending_by_client",
+                "active_task_by_client",
+                "seen_packet_ids",
+                "rollback_by_client",
+            ):
+                if key not in state:
+                    raise ValueError(f"Coordinator snapshot missing {key}.")
+            self._client_state = {
+                int(key): str(value)
+                for key, value in state["client_state"].items()
+            }
+            self._client_pid = {
+                int(key): int(value)
+                for key, value in state["client_pid"].items()
+            }
+            self.task_registry = {}
+            for task_id, raw in state["task_registry"].items():
+                if not isinstance(raw, dict) or not isinstance(
+                    raw.get("task"), ClientTask
+                ):
+                    raise ValueError("Coordinator task snapshot is invalid.")
+                self.task_registry[str(task_id)] = TaskRegistryEntry(
+                    task=raw["task"],
+                    status=str(raw["status"]),
+                    received_at_s=float(raw["received_at_s"]),
+                    consumed_at_s=float(raw["consumed_at_s"]),
+                    packet_id=str(raw["packet_id"]),
+                    failure=str(raw["failure"]),
+                )
+            self._pending_by_client = {
+                int(key): value
+                for key, value in state["pending_by_client"].items()
+            }
+            self._active_task_by_client = {
+                int(key): str(value)
+                for key, value in state["active_task_by_client"].items()
+            }
+            self._seen_packet_ids = dict(state["seen_packet_ids"])
+            self._rollback_by_client = {
+                int(key): str(value)
+                for key, value in state["rollback_by_client"].items()
+            }
+            self._shutdown = bool(state.get("shutdown", False))
 
     def register_client(self, client_id: int, pid: int) -> None:
         with self._lock:
@@ -247,6 +327,9 @@ class SemiAsyncRoundCoordinator:
             if self._shutdown:
                 self._client_state[int(client_id)] = CLIENT_STOPPED
                 return "STOP", None
+            rollback_task_id = self._rollback_by_client.get(int(client_id))
+            if rollback_task_id is not None:
+                return "ROLLBACK", self.task_registry[rollback_task_id].task
             task = self._pending_by_client.pop(int(client_id), None)
             if task is None:
                 return "NO_TASK", None
@@ -257,6 +340,39 @@ class SemiAsyncRoundCoordinator:
                 )
             entry.status = TASK_IN_FLIGHT
             return "TASK", task
+
+    def request_client_rollback(self, *, task_id: str, reason: str) -> None:
+        """Schedule an explicit model restore for the task's owning client."""
+
+        with self._lock:
+            entry = self.task_registry[str(task_id)]
+            if entry.status not in {TASK_KNOWLEDGE_RECEIVED, TASK_RESERVED}:
+                raise RuntimeError(
+                    f"Cannot roll back task in state {entry.status}."
+                )
+            client_id = int(entry.task.client_id)
+            entry.failure = str(reason)
+            self._rollback_by_client[client_id] = str(task_id)
+
+    def acknowledge_client_rollback(
+        self,
+        *,
+        client_id: int,
+        pid: int,
+        task_id: str,
+    ) -> None:
+        with self._lock:
+            self.register_client(client_id, pid)
+            expected = self._rollback_by_client.get(int(client_id))
+            if expected != str(task_id):
+                raise RuntimeError("Rollback acknowledgement does not match task.")
+            entry = self.task_registry[str(task_id)]
+            entry.status = TASK_FAILED
+            entry.failure = entry.failure or "round_transaction_rollback"
+            self._rollback_by_client.pop(int(client_id), None)
+            self._active_task_by_client.pop(int(client_id), None)
+            if self._client_state[int(client_id)] != CLIENT_FAILED:
+                self._client_state[int(client_id)] = CLIENT_IDLE
 
     def validate_and_accept(
         self,
@@ -313,6 +429,7 @@ class SemiAsyncRoundCoordinator:
             if entry.status not in {
                 TASK_IN_FLIGHT,
                 TASK_KNOWLEDGE_RECEIVED,
+                TASK_RESERVED,
             }:
                 raise ValueError(
                     f"Task status does not accept knowledge: {entry.status}."
@@ -327,7 +444,18 @@ class SemiAsyncRoundCoordinator:
             entry.packet_id = packet.packet_id
             return "accepted"
 
-    def mark_consumed(
+    def reserve_consumed(self, *, task_id: str) -> None:
+        """Reserve a packet for a round; commit happens after all work succeeds."""
+
+        with self._lock:
+            entry = self.task_registry[str(task_id)]
+            if entry.status != TASK_KNOWLEDGE_RECEIVED:
+                raise RuntimeError(
+                    f"Cannot reserve task in state {entry.status}."
+                )
+            entry.status = TASK_RESERVED
+
+    def commit_consumed(
         self,
         *,
         task_id: str,
@@ -335,9 +463,9 @@ class SemiAsyncRoundCoordinator:
     ) -> None:
         with self._lock:
             entry = self.task_registry[str(task_id)]
-            if entry.status != TASK_KNOWLEDGE_RECEIVED:
+            if entry.status != TASK_RESERVED:
                 raise RuntimeError(
-                    f"Cannot consume task in state {entry.status}."
+                    f"Cannot commit task in state {entry.status}."
                 )
             entry.status = TASK_CONSUMED
             entry.consumed_at_s = float(consumed_at_s)
@@ -345,6 +473,27 @@ class SemiAsyncRoundCoordinator:
             self._active_task_by_client.pop(client_id, None)
             if self._client_state[client_id] != CLIENT_FAILED:
                 self._client_state[client_id] = CLIENT_IDLE
+
+    def abort_consumed(self, *, task_id: str, reason: str = "") -> None:
+        with self._lock:
+            entry = self.task_registry[str(task_id)]
+            if entry.status != TASK_RESERVED:
+                raise RuntimeError(
+                    f"Cannot abort task in state {entry.status}."
+                )
+            entry.status = TASK_KNOWLEDGE_RECEIVED
+            entry.failure = str(reason)
+
+    def mark_consumed(
+        self,
+        *,
+        task_id: str,
+        consumed_at_s: float,
+    ) -> None:
+        """Backward-compatible atomic helper; production uses reserve/commit."""
+
+        self.reserve_consumed(task_id=task_id)
+        self.commit_consumed(task_id=task_id, consumed_at_s=consumed_at_s)
 
     def mark_failed(self, task_id: str, reason: str) -> None:
         with self._lock:
@@ -364,6 +513,7 @@ class SemiAsyncRoundCoordinator:
                     TASK_DISPATCHED,
                     TASK_IN_FLIGHT,
                     TASK_KNOWLEDGE_RECEIVED,
+                    TASK_RESERVED,
                 }:
                     entry.status = TASK_EXPIRED
 

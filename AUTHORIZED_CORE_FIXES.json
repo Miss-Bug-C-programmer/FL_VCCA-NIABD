@@ -1,87 +1,151 @@
 {
-  "schema_version": "fedagg-authorized-core-fixes-v1",
-  "working_tree_base_commit": "78d4a7b1afbb628fd62bdbef3f479e761c291b58",
+  "schema_version": "fedagg-authorized-core-fixes-v3",
+  "working_tree_base_commit": "91f3ffc149c7b6c45caa676771f6d7c2a199f5b4",
+  "behavior_preservation": "V3_BEHAVIOR_PRESERVATION.json",
   "authorized_files": [
     {
-      "file": "README.md",
-      "upstream_sha256": "565c809b1fa7dce1ae86e6ed594f61f6ef853f32614a139eb146de88e42c9ad7",
-      "patched_sha256": "6a7dd8cdf8068b1eba85170f934033873348892f179e68dd9246f68ed85f771e",
-      "reason": "Document proxy-conditioned NIABD v2 semantics, versioned schemas, and validation commands.",
-      "reproducer": "python experiment_runner.py --help and inspect README.md NIABD sections",
+      "file": "admission.py",
+      "upstream_sha256": "7674ee28a311e0459f594927baaf3ee337e549edae721084b30fca8cd74ac64c",
+      "patched_sha256": "70e098a9beebaa023a3982c350a4f18316b0d9a7b1522b120c103127f3c21364",
+      "reason": "Add auditable packet lineage and VCAA decision metadata without changing the Server-Client FD interface.",
+      "reproducer": "python -m pytest -q tests/test_vcaa.py tests/test_simulation.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_runner_outputs.py", "scripts/check_result_completeness.py"]
+      "tests": ["tests/test_vcaa.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "vcaa-v2.1-transactional-time-aware",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-lineage-metadata"
     },
     {
       "file": "defense.py",
       "upstream_sha256": "d764223101fc58f1cc5c468fb17940610465b1fb9cae761bd8d84bf3daa72c4e",
       "patched_sha256": "a78cdac40f16a72581ac56aaed368e0129774fedcb9873d422135c736b53d01a",
-      "reason": "Expose typed NIABD teacher metrics and non-float result schema values.",
+      "reason": "Expose typed NIABD teacher metrics and state flags for the v3 result contract.",
       "reproducer": "python -m pytest -q tests/test_niabd_v2.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"]
+      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"],
+      "algorithm_version_impact": "niabd-v2.1-proxy-conditioned-transactional-robust-memory",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-niabd-metrics"
     },
     {
       "file": "experiment_runner.py",
       "upstream_sha256": "88d3982110cc91af527f0d1a004190b9813351ffcb5469ccb3110160f1c628d4",
-      "patched_sha256": "f52c7e25af782ac8ad1b583f92d6e94084528954e6bfebd51c842e81e99ff3b5",
-      "reason": "Wire NIABD v2 CLI/configuration and versioned round, summary, defense, and backdoor schemas.",
+      "patched_sha256": "dbe5f42ee78b2e68fe9c5a0c37db9a91a8e4c5fefc3a49906664da6716b8643c",
+      "reason": "Add v3 lineage, architecture, aggregation, manifest, checkpoint, and strict attack-window fields to the sole experiment runner.",
       "reproducer": "python experiment_runner.py --help",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_runner_outputs.py", "tests/test_simulation.py"]
+      "tests": ["tests/test_runner_outputs.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v2.1-transactional-time-aware; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-runner-contract"
     },
     {
       "file": "federated_runtime.py",
       "upstream_sha256": "d07d2b1cf88ab12fcc9d5cb5b90848cd6c19153f1a43d1ecf076208066eecffc",
-      "patched_sha256": "e67a8199219fee535afdca70aa84ee683711668e01bdf2ba73e5792c320c3530",
-      "reason": "Propagate shared NIABD v2 metrics through the synchronous Server-Client FD runtime.",
-      "reproducer": "python -m pytest -q tests/test_simulation.py",
+      "patched_sha256": "c579588155b66c1889becec80f3ab81907d1e22b7ced820a8e95b1b8fbec92f8",
+      "reason": "Preserve serialized Server-Client FD while adding transactional rollback, robust probability aggregation, non-finite policy, and v3 metrics.",
+      "reproducer": "python -m pytest -q tests/test_simulation.py tests/test_backdoor_runtime.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_simulation.py", "tests/test_backdoor_runtime.py"]
+      "tests": ["tests/test_simulation.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v2.1-transactional-time-aware; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-sync-transaction"
+    },
+    {
+      "file": "federated_server.py",
+      "upstream_sha256": "b044cdd7c32b34bd39d52a05770c7e1c23770196f8f1b90ce231a54db6053900",
+      "patched_sha256": "524f860ec4cdf95a63cb2afe4c326648ac198bc8b2151a9877e2677b7505ad42",
+      "reason": "Carry packet receive/consume lineage and route admitted probabilities through explicit robust aggregators.",
+      "reproducer": "python -m pytest -q tests/test_simulation.py tests/test_process_runtime.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_simulation.py", "tests/test_process_runtime.py"],
+      "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v2.1-transactional-time-aware",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-server-lineage"
+    },
+    {
+      "file": "model_factory.py",
+      "upstream_sha256": "94eb5599b42d3ac7cad8e1b0cc1f175e9365c0e84177d2a2b964809f421187ea",
+      "patched_sha256": "a3b3fd4fda707b1b6f6dbb30036f1244452a68aff94d975b782abba1022937c4",
+      "reason": "Support explicit homogeneous and heterogeneous ResNet18/SmallCNN/MobileNetV2 assignments with provenance hashes.",
+      "reproducer": "python -m pytest -q tests/test_models.py tests/test_v3_integrity.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_models.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "none",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-heterogeneous-models"
+    },
+    {
+      "file": "models.py",
+      "upstream_sha256": "4c37a3748acb63d7d89e93446ce540c2df3ec43a06293230d90b4683c590af56",
+      "patched_sha256": "e7cfe8e8511ce27735fc3893b3693123028966f1ec70611d686f27507a442672",
+      "reason": "Add SmallCNN and small-input MobileNetV2 builders while retaining the existing ResNet18 path.",
+      "reproducer": "python -m pytest -q tests/test_models.py tests/test_v3_integrity.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_models.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "none",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-model-builders"
     },
     {
       "file": "niabd.py",
       "upstream_sha256": "f084bb3698b3277c5ead49df40963f87f13953b0a7d798d69553ea605eb5ee01",
-      "patched_sha256": "af22d37399d0bebfef0d404014ae747208216399a4e66cffa5392abed688a4cb",
-      "reason": "Replace global [C] memory and amax eligibility with proxy-conditioned robust [P,C] memory, safe consensus recovery, and eligible-only threshold updates.",
-      "reproducer": "python -m pytest -q tests/test_niabd.py tests/test_niabd_v2.py",
+      "patched_sha256": "e7a8b4ce8009e0c3efeee5a2c7b0f03d0651e4fa1302a09220acf851d4403aba",
+      "reason": "Implement v2.1 proxy-conditioned transactional robust memory, compact warmup consensus, ambiguity freeze, chunked metrics, and explicit state flags.",
+      "reproducer": "python -m pytest -q tests/test_niabd.py tests/test_niabd_v2.py tests/test_v3_integrity.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"]
+      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "niabd-v2.1-proxy-conditioned-transactional-robust-memory",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-niabd-robust-memory"
     },
     {
       "file": "process_runtime.py",
       "upstream_sha256": "2acb78cd48e70ae8ff3c1c3d56b2b7a99527307441413198bc36c2b17ce071e5",
-      "patched_sha256": "7d3e6a15cee271ee8b64756ba42c61094432757559ea00c1dc63126203402924",
-      "reason": "Propagate the same NIABD v2 teacher metrics and algorithm lineage through process-semi-async TCP/RPC consumption.",
+      "patched_sha256": "45f7a6b0fc35dc4fdf1c8aa757a592a5b464fe0cbc5917157e73ef483ecd8669",
+      "reason": "Preserve real Client process ownership while adding receive-time VCAA semantics, reserve/commit/abort, client rollback RPC, aggregation, and v3 metrics.",
       "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py"]
+      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py"],
+      "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v2.1-transactional-time-aware; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-process-transaction"
     },
     {
-      "file": "scripts/collect_main_backdoor_results.py",
-      "upstream_sha256": "ac2e5339e41c2c4acbdc39e48c2b4cbeec69b6f82e97b3968f98b6c7f292933d",
-      "patched_sha256": "9f640b0cc99a0bc0c47bdac40bf1113c88b13408e087e0245bee7a1a59f6aac9",
-      "reason": "Add version-aware formal result grouping, peak/AUC/recovery statistics, and 95% confidence intervals without modifying old CSVs.",
-      "reproducer": "python scripts/collect_main_backdoor_results.py --indir experiment_results_main_backdoor --expected-runs 240",
+      "file": "round_coordinator.py",
+      "upstream_sha256": "9307237a36e386a54285fc9b7021472e43b82d4a9eb3d7b1440ae2e2cf2c0d8d",
+      "patched_sha256": "095361f8a4721c6b2be992071cdeb74b7618b39dae7c78622b6cd72ba3d4b70c",
+      "reason": "Add reserved task lifecycle, explicit commit/abort, client rollback scheduling, and checkpointable coordinator state.",
+      "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_v3_integrity.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["scripts/check_result_completeness.py", "tests/test_runner_outputs.py"]
+      "tests": ["tests/test_process_runtime.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "none",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-coordinator-transaction"
+    },
+    {
+      "file": "vcaa.py",
+      "upstream_sha256": "710439f29731db5ce2f90aef61488589f936c613df7a086bbd6542577fa87672",
+      "patched_sha256": "08547fae084fe89932ef0cc5ff63c25a7ab634ae5700e2a47e46064df77d3a1d",
+      "reason": "Use server receive-time/source-round semantics, record all score history, snapshot state, and fail closed on unverifiable values.",
+      "reproducer": "python -m pytest -q tests/test_vcaa.py tests/test_v3_integrity.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_vcaa.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "vcaa-v2.1-transactional-time-aware",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-vcaa-time-semantics"
     },
     {
       "file": "scripts/verify_preserved_main.py",
-      "upstream_sha256": "a5b8b978e3a455ae38527714ec10aa77c0766322dad6e01c31d7538697a80a56",
-      "patched_sha256": "488ef5354d05c29755602223f7819b19bb9c169e963f8cc78ccbeda2142fa403",
-      "reason": "Make preservation fail closed with exact per-file authorization, strict schema validation, and negative-testable hash checks.",
+      "upstream_sha256": "488ef5354d05c29755602223f7819b19bb9c169e963f8cc78ccbeda2142fa403",
+      "patched_sha256": "a5d2aa8bfe05021ff027b4ea2814dd07e4bb7fd9be279c33212c830318b81637",
+      "reason": "Accept legacy negative-test manifests while validating v3 authorization metadata and the unchanged formal config hash.",
       "reproducer": "python scripts/verify_preserved_main.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_preservation_verifier.py"]
-    },
-    {
-      "file": "tests/test_niabd.py",
-      "upstream_sha256": "0f221b1680a7f4e39737a06fe0803f5cdbf649a17d8d9c02d363738d5535b669",
-      "patched_sha256": "6c898ff68b1bb6e09521cd1cf1d1c081d0999c95c8033b5dbe415362b24d26e4",
-      "reason": "Update the legacy extreme-teacher regression to assert that excluded abnormal logits cannot potentiate thresholds.",
-      "reproducer": "python -m pytest -q tests/test_niabd.py",
-      "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"]
+      "tests": ["tests/test_preservation_verifier.py"],
+      "algorithm_version_impact": "none",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-preservation-auth"
     }
   ]
 }

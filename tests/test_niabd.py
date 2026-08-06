@@ -48,6 +48,7 @@ def test_niabd_suppresses_an_extreme_target_logit_and_protects_memory():
             benign_deviation_limit=4.0,
             warmup_rounds=1,
             threshold_learning_rate=0.1,
+            minimum_consensus_teachers=2,
         )
     )
     labels = torch.tensor([0, 0, 1, 1])
@@ -121,7 +122,7 @@ def test_niabd_leaves_in_threshold_logits_unchanged():
 
 def test_niabd_warmup_updates_prototype_memory_each_round():
     controller = NeuroInspiredAdaptiveBackdoorDefense(
-        NIABDConfig(warmup_rounds=2)
+        NIABDConfig(warmup_rounds=2, minimum_consensus_teachers=2)
     )
     labels = torch.tensor([0, 0, 1, 1])
     student = torch.zeros(4, 3)

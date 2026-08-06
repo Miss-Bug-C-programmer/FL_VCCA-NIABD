@@ -1,0 +1,17 @@
+{
+  "schema_version": "fedagg-behavior-preservation-v3",
+  "legacy_formal_config": "configs/main_backdoor_experiment.json",
+  "legacy_formal_factorization": "3x4x4x5=240",
+  "knowledge_interface": "serialized-proxy-logits",
+  "forbidden_uploads": ["parameters", "gradients", "model_objects", "private_samples"],
+  "server_uses_proxy_labels_only_for": ["VCAA", "student_distillation"],
+  "niabd_input_excludes": ["attack_truth", "triggered_test_data"],
+  "legacy_results_are_read_only": true,
+  "strict_auc_requires_contiguous_attack_rounds": true,
+  "unmeasured_values": ["NaN", "None", "empty"],
+  "tests": [
+    "tests/test_server_client_topology.py",
+    "tests/test_logits_transport.py",
+    "tests/test_v3_integrity.py"
+  ]
+}

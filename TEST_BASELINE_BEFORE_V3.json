@@ -1,0 +1,87 @@
+{
+  "baseline_name": "v3-before-production-change",
+  "captured_at": "2026-08-06",
+  "repository": {
+    "head": "91f3ffc149c7b6c45caa676771f6d7c2a199f5b4",
+    "branch": "main",
+    "remote": "https://github.com/Miss-Bug-C-programmer/FL_VCCA-NIABD.git",
+    "status_short": [],
+    "diff_stat": "",
+    "diff": ""
+  },
+  "environment": {
+    "python": "3.10.20 | packaged by conda-forge | (main, Jun 11 2026, 03:28:51) [MSC v.1944 64 bit (AMD64)]",
+    "torch": "2.2.2+cpu",
+    "cuda_available": false,
+    "torch_cuda_version": null,
+    "python_executable": "D:\\conda_envs\\receiversync-viz\\python.exe"
+  },
+  "commands": {
+    "compileall": {
+      "command": "D:\\conda_envs\\receiversync-viz\\python.exe -m compileall -q .",
+      "exit_code": 1,
+      "result": "PermissionError writing existing scripts\\__pycache__ temporary .pyc files"
+    },
+    "compileall_private_cache": {
+      "command": "PYTHONPYCACHEPREFIX=.pycache_before_v3 D:\\conda_envs\\receiversync-viz\\python.exe -m compileall -q .",
+      "exit_code": 0
+    },
+    "preservation": {
+      "command": "D:\\conda_envs\\receiversync-viz\\python.exe scripts\\verify_preserved_main.py",
+      "exit_code": 1,
+      "result": "pre-existing committed authorization source hash for scripts/collect_main_backdoor_results.py does not match current HEAD"
+    },
+    "pytest": {
+      "command": "D:\\conda_envs\\receiversync-viz\\python.exe -m pytest -q --basetemp .pytest_tmp_before_v3",
+      "exit_code": 0,
+      "passed": 101,
+      "failed": 0,
+      "duration": "68.70s"
+    }
+  },
+  "reference_template": "D:\\research\\my_papers\\fedagg_rgate_icpp\\papers\\参考模板.docx",
+  "historical_results": [
+    "results/",
+    "results/cifar10_claim_validation/",
+    "results/main_backdoor/",
+    "results/main_backdoor_single_gpu_v2/",
+    "results/process_attack_gpu_smoke/"
+  ],
+  "formal_config_sha256": "7458562ac63faba21497799ea74e98cc7e0a0e21801320386b37704a40e204d9",
+  "test_file_sha256": {
+    "conftest.py": "ef7125a035b3858196a363f108c3ed611e4a9f3d85db4b9262bf3da4f4076a0f",
+    "test_attack_plan.py": "a843ce7606eaf629058cd7822aa601514f5f6503ed7e7d0617f3febc004d5a",
+    "test_attacks.py": "52b6d3aa6f3c2ae3992b755889ca63100bdaf9c742add9bd7c2b97f3168667e7",
+    "test_backdoor_attacks.py": "af06ea0e1403c42137bd72cb29ff6c2e3dd84d0a6271f06bf37a5c37ae775654",
+    "test_backdoor_data_utils.py": "ff3293c425e4ef161dbae55dfbf04471a3fea9171a20aa7ee1f7baa9340184c2",
+    "test_backdoor_diagnostics.py": "6f7a1cb0d278f5a8145ff6e846a796725b1e1c54c03ce332ff3528f719a6767d",
+    "test_backdoor_runtime.py": "b55d11af387bbd3f769f5134a7d1fc8b3bc55f6e55f954ce15e2af3e650d299c",
+    "test_data_utils.py": "23612b3ca8587ffad17d4dbaad76a2915d3ec374c8e03082de4111939a8e26fc",
+    "test_import_smoke.py": "14d648116d9692c4e6cfe8db45cf2e4842bb8b36f6dc7b84300abc51577e7c0f",
+    "test_logits_transport.py": "33f4701d5f21ae38a682913b460e562856180418ab53ad1c847f4477afa67ead",
+    "test_main_backdoor_matrix.py": "3902251f3268d72a364f3336c9f95a49d1878a4136f3e82de4cd2aaa9ad497ad",
+    "test_models.py": "1accb273af068a093d9b48b4583c21ad0e52ca9a812ad7fb203585221a23a620",
+    "test_niabd.py": "6c898ff68b1bb6e09521cd1cf1d1c081d0999c95c8033b5dbe415362b24d26e4",
+    "test_niabd_v2.py": "697eff2792033788f624235c785b4d947afd34f9d41193a292cdea314cdc76c0",
+    "test_numeric_safety.py": "a7df1d79c4e4fc73da2a1b381a23545532ba958f82d2e43a2029f47048bc019c",
+    "test_preservation_verifier.py": "a7d415c40bf74b23e936c6d483cc3d51f7f0f3f2b7771b6be16076de9ac80beb",
+    "test_process_backdoor_runtime.py": "023f8be1d6c688f9e61c55acafed3e192fa0e2abb6403cf2afc080cd2cdfd6b1",
+    "test_process_runtime.py": "2d1eab86e044d5acf79c72a0afd0b36d60bd6238a0b9de0697731cd1277c854d",
+    "test_rpc_transport.py": "fa9f4c160a0e21af790e5809288bc50c76c427ab69a2f1d12b8810418723783d",
+    "test_runner_outputs.py": "4358ea08f9983db45a9f0cc6f821ea20cd0a43c1c31cc495d5cae621c0e4c957",
+    "test_runtime_trace.py": "798265a35e2c8fe3335924d6690705fea428b367eef70ba7f3e577c8d7369cb7",
+    "test_server_client_topology.py": "1fbf237ce8c2a42e3e9c2bcf73cf9df34e9464cb17488e0671dd3cce71594973",
+    "test_simulation.py": "e8cecd6ecdfbf39a97692dd185a1d9788b24135e6a9a593aa4c1158540bc41f9",
+    "test_summarize_results.py": "ce686a84fa4b8416da8cb064977ee041b42bb1451e10a8a2e717be0eede60b80",
+    "test_vcaa.py": "680e4d8ba20fa0a6b7918911b3b5a1521d9cad0ded6d8b496b1e9a6961cc0f7b"
+  },
+  "core_file_sha256": {
+    "niabd.py": "af22d37399d0bebfef0d404014ae747208216399a4e66cffa5392abed688a4cb",
+    "vcaa.py": "710439f29731db5ce2f90aef61488589f936c613df7a086bbd6542577fa87672",
+    "defense.py": "a78cdac40f16a72581ac56aaed368e0129774fedcb9873d422135c736b53d01a",
+    "federated_runtime.py": "e67a8199219fee535afdca70aa84ee683711668e01bdf2ba73e5792c320c3530",
+    "process_runtime.py": "7d3e6a15cee271ee8b64756ba42c61094432757559ea00c1dc63126203402924",
+    "experiment_runner.py": "f52c7e25af782ac8ad1b583f92d6e94084528954e6bfebd51c842e81e99ff3b5",
+    "configs/main_backdoor_experiment.json": "7458562ac63faba21497799ea74e98cc7e0a0e21801320386b37704a40e204d9"
+  }
+}

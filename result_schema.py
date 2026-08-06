@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+from pathlib import Path
+from typing import Iterable, Mapping, Optional, Sequence
+
+import pandas as pd
+
+
+RESULT_SCHEMA_VERSION = "fedagg-results-v3"
+VCAA_ALGORITHM_VERSION = "vcaa-v2.1-transactional-time-aware"
+NIABD_ALGORITHM_VERSION = (
+    "niabd-v2.1-proxy-conditioned-transactional-robust-memory"
+)
+AGGREGATION_ALGORITHM_VERSION = "aggregation-v1-probability-space"
+
+
+@dataclass(frozen=True)
+class MetricSchemaEntry:
+    name: str
+    type: str
+    nullable: bool
+    applicable_methods: tuple[str, ...]
+    applicable_runtimes: tuple[str, ...]
+    missing_value: object
+    description: str
+    unit: str = ""
+
+
+SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
+    MetricSchemaEntry("run_uid", "string", False, ("*",), ("*",), "", "Stable run identity."),
+    MetricSchemaEntry("result_schema_version", "string", False, ("*",), ("*",), RESULT_SCHEMA_VERSION, "Typed result schema lineage."),
+    MetricSchemaEntry("vcaa_algorithm_version", "string", False, ("*",), ("*",), "none", "VCAA implementation lineage."),
+    MetricSchemaEntry("niabd_algorithm_version", "string", False, ("*",), ("*",), "none", "NIABD implementation lineage."),
+    MetricSchemaEntry("aggregation_algorithm_version", "string", False, ("*",), ("*",), AGGREGATION_ALGORITHM_VERSION, "Probability-space aggregation lineage."),
+    MetricSchemaEntry("run_class", "string", False, ("*",), ("*",), "", "formal, smoke, synthetic, or control."),
+    MetricSchemaEntry("attack_condition", "string", False, ("*",), ("*",), "none", "clean, attacked, or triggered-no-poison."),
+    MetricSchemaEntry("transaction_id", "string", False, ("*",), ("*",), "", "Round transaction identity."),
+    MetricSchemaEntry("transaction_status", "string", False, ("*",), ("*",), "committed", "prepare/commit/abort status."),
+    MetricSchemaEntry("student_snapshot_sha256", "string", True, ("*",), ("*",), None, "Pre-update student proxy logits identity."),
+    MetricSchemaEntry("received_teachers", "integer", False, ("*",), ("*",), 0, "Accepted packet count before VCAA."),
+    MetricSchemaEntry("admitted_teachers", "integer", False, ("*",), ("*",), 0, "VCAA admitted teacher count."),
+    MetricSchemaEntry("memory_candidate_teachers", "integer", True, ("niabd", "vcaa-niabd"), ("*",), None, "NIABD candidate count."),
+    MetricSchemaEntry("normal_eligible_teachers", "integer", True, ("niabd", "vcaa-niabd"), ("*",), None, "Normal memory-eligible count."),
+    MetricSchemaEntry("drift_recovery_candidates", "integer", True, ("niabd", "vcaa-niabd"), ("*",), None, "Consensus drift recovery count."),
+    MetricSchemaEntry("memory_update_teachers", "integer", True, ("niabd", "vcaa-niabd"), ("*",), None, "Raw teachers used for memory update."),
+    MetricSchemaEntry("teachers_purified", "integer", False, ("*",), ("*",), 0, "Teacher packets passed through purification."),
+    MetricSchemaEntry("niabd_defense_available", "boolean", True, ("niabd", "vcaa-niabd"), ("*",), None, "Whether trusted memory exists."),
+    MetricSchemaEntry("niabd_purification_applied", "boolean", True, ("niabd", "vcaa-niabd"), ("*",), None, "Whether purification was executed."),
+    MetricSchemaEntry("niabd_memory_updated", "boolean", True, ("niabd", "vcaa-niabd"), ("*",), None, "Whether memory changed this round."),
+    MetricSchemaEntry("niabd_memory_update_reason", "string", True, ("niabd", "vcaa-niabd"), ("*",), None, "Explicit NIABD state-machine reason."),
+    MetricSchemaEntry("niabd_observations", "number", True, ("niabd", "vcaa-niabd"), ("*",), None, "Cumulative eligible teacher-proxy observations."),
+    MetricSchemaEntry("vcaa_history_size", "integer", True, ("vcaa", "vcaa-niabd"), ("*",), None, "VCAA history size."),
+    MetricSchemaEntry("numeric_failure_count", "integer", False, ("*",), ("*",), 0, "Actual numeric failures."),
+    MetricSchemaEntry("rollback_reason", "string", True, ("*",), ("*",), None, "Round/run rollback reason."),
+    MetricSchemaEntry("checkpoint_path", "string", True, ("*",), ("*",), None, "Committed checkpoint path."),
+    MetricSchemaEntry("checkpoint_sha256", "string", True, ("*",), ("*",), None, "Committed checkpoint hash."),
+)
+
+
+def schema_dict() -> dict:
+    return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "entries": [asdict(entry) for entry in SCHEMA_ENTRIES],
+    }
+
+
+def schema_hash() -> str:
+    payload = json.dumps(schema_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def algorithm_versions(*, vcaa_enabled: bool, niabd_enabled: bool) -> dict[str, str]:
+    return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "vcaa_algorithm_version": VCAA_ALGORITHM_VERSION if vcaa_enabled else "none",
+        "niabd_algorithm_version": NIABD_ALGORITHM_VERSION if niabd_enabled else "none",
+        "aggregation_algorithm_version": AGGREGATION_ALGORITHM_VERSION,
+    }
+
+
+def required_columns() -> set[str]:
+    return {entry.name for entry in SCHEMA_ENTRIES}
+
+
+def validate_frame(
+    frame: pd.DataFrame,
+    *,
+    method: Optional[str] = None,
+    runtime: Optional[str] = None,
+    require_rounds: bool = False,
+) -> None:
+    missing = sorted(required_columns() - set(frame.columns))
+    if missing:
+        raise ValueError(f"result schema {RESULT_SCHEMA_VERSION} missing columns: {missing}")
+    if frame.empty:
+        raise ValueError("result schema rejects an empty result frame.")
+    if frame["run_uid"].isna().any() or (frame["run_uid"].astype(str).str.strip() == "").any():
+        raise ValueError("run_uid must be non-empty for every result row.")
+    for column in ("result_schema_version", "vcaa_algorithm_version", "niabd_algorithm_version", "aggregation_algorithm_version"):
+        if column not in frame.columns:
+            raise ValueError(f"missing algorithm lineage column: {column}")
+    if set(frame["result_schema_version"].astype(str)) != {RESULT_SCHEMA_VERSION}:
+        raise ValueError("mixed or invalid result_schema_version.")
+    for column in (
+        "vcaa_algorithm_version",
+        "niabd_algorithm_version",
+        "aggregation_algorithm_version",
+    ):
+        values = frame[column].astype(str).str.strip()
+        if values.eq("").any() or values.eq("nan").any():
+            raise ValueError(f"{column} cannot be empty or NaN.")
+    if "transaction_status" in frame.columns:
+        statuses = set(frame["transaction_status"].dropna().astype(str))
+        if not statuses.issubset({"committed", "aborted"}):
+            raise ValueError("invalid transaction_status in result rows.")
+    for column in (
+        "received_teachers",
+        "admitted_teachers",
+        "memory_candidate_teachers",
+        "normal_eligible_teachers",
+        "drift_recovery_candidates",
+        "memory_update_teachers",
+        "vcaa_history_size",
+    ):
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        if (values < 0).any() or (~(values % 1 == 0)).any():
+            raise ValueError(f"{column} must contain non-negative integers.")
+    for column in ("checkpoint_sha256", "student_snapshot_sha256"):
+        if column in frame.columns:
+            values = frame[column].dropna().astype(str)
+            if any(value and len(value) != 64 for value in values):
+                raise ValueError(f"{column} contains an invalid SHA-256 value.")
+    if method is not None:
+        method = str(method).lower()
+        expected_vcaa = VCAA_ALGORITHM_VERSION if method in {"vcaa", "vcaa-niabd"} else "none"
+        expected_niabd = NIABD_ALGORITHM_VERSION if method in {"niabd", "vcaa-niabd"} else "none"
+        if set(frame["vcaa_algorithm_version"].astype(str)) != {expected_vcaa}:
+            raise ValueError("VCAA algorithm lineage does not match method.")
+        if set(frame["niabd_algorithm_version"].astype(str)) != {expected_niabd}:
+            raise ValueError("NIABD algorithm lineage does not match method.")
+    if runtime is not None and "runtime" in frame.columns:
+        if set(frame["runtime"].astype(str)) != {str(runtime)}:
+            raise ValueError("result runtime lineage does not match expected runtime.")
+    if require_rounds and "round" in frame.columns:
+        grouped = frame.groupby("run_uid", dropna=False)
+        for run_uid, group in grouped:
+            rounds = pd.to_numeric(group["round"], errors="coerce").dropna().astype(int).sort_values().tolist()
+            if rounds != list(range(1, len(rounds) + 1)):
+                raise ValueError(f"rounds are missing or duplicated for run_uid={run_uid}.")
+
+
+def write_schema(path: str | Path) -> None:
+    Path(path).write_text(json.dumps(schema_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

@@ -10,7 +10,7 @@ import socket
 import statistics
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -35,9 +35,11 @@ from defense import DefenseResult, KnowledgeDefenseController
 from federated_runtime import (
     _decision_metrics,
     _defense_metrics,
+    _finite_int,
     _freeze_state_dict,
     _model_is_finite,
     _restore_model,
+    _tensor_sha256,
     _validate_decision,
     evaluate_with_loss,
 )
@@ -92,8 +94,13 @@ class ProcessRuntimeConfig:
     client_torch_threads: int = 1
     client_pin_memory: bool = False
     loader_mp_context: Optional[str] = None
+    server_architecture: str = "resnet18"
+    client_architecture: str = "resnet18"
+    client_architectures: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
+        if self.client_architectures is not None and not self.client_architectures:
+            raise ValueError("client_architectures cannot be empty.")
         if not 0.0 < float(self.participation_rate) <= 1.0:
             raise ValueError("participation_rate must be in (0, 1].")
         if not 0.0 < float(self.quorum_fraction) <= 1.0:
@@ -173,6 +180,8 @@ class _ProcessRpcService:
     def handle_rpc(self, request: RpcFrame) -> RpcResponse:
         if request.message_type == "GET_TASK":
             return self._handle_get_task(request)
+        if request.message_type == "ACK_ROLLBACK":
+            return self._handle_ack_rollback(request)
         if request.message_type == "UPLOAD_KNOWLEDGE":
             return self._handle_upload(request)
         if request.message_type == "TASK_FAILURE":
@@ -190,6 +199,16 @@ class _ProcessRpcService:
             client_id=client_id,
             pid=pid,
         )
+        if status == "ROLLBACK":
+            if task is None:
+                raise RuntimeError("ROLLBACK response is missing a task.")
+            return RpcResponse(
+                "ROLLBACK",
+                {
+                    "client_id": client_id,
+                    "task_id": str(task.task_id),
+                },
+            )
         if status != "TASK":
             return RpcResponse(status, {"client_id": client_id})
         if task is None:
@@ -305,6 +324,22 @@ class _ProcessRpcService:
             packet_id=packet.packet_id,
         )
 
+    def _handle_ack_rollback(self, request: RpcFrame) -> RpcResponse:
+        if request.payload:
+            raise RpcProtocolError("ACK_ROLLBACK cannot contain a payload.")
+        client_id = int(request.metadata["client_id"])
+        pid = int(request.metadata["pid"])
+        task_id = str(request.metadata["task_id"])
+        self.coordinator.acknowledge_client_rollback(
+            client_id=client_id,
+            pid=pid,
+            task_id=task_id,
+        )
+        return RpcResponse(
+            "ACK",
+            {"client_id": client_id, "task_id": task_id, "status": "rollback-restored"},
+        )
+
     def _handle_task_failure(self, request: RpcFrame) -> RpcResponse:
         if request.payload:
             raise RpcProtocolError("TASK_FAILURE cannot contain payload.")
@@ -411,6 +446,29 @@ def _send_task_failure(
     )
 
 
+def _send_rollback_ack(
+    host: str,
+    port: int,
+    *,
+    client_id: int,
+    task_id: str,
+    timeout_s: float,
+    max_message_bytes: int,
+) -> None:
+    rpc_call(
+        host,
+        port,
+        message_type="ACK_ROLLBACK",
+        metadata={
+            "client_id": int(client_id),
+            "pid": int(os.getpid()),
+            "task_id": str(task_id),
+        },
+        timeout_s=float(timeout_s),
+        max_message_bytes=int(max_message_bytes),
+    )
+
+
 def _client_process_main(
     *,
     client_id: int,
@@ -458,8 +516,14 @@ def _client_process_main(
             "private": private_loader,
             "proxy_input": proxy_input_loader,
         }
+        client_architecture = (
+            config.client_architectures[int(client_id)]
+            if config.client_architectures is not None
+            and int(client_id) < len(config.client_architectures)
+            else config.client_architecture
+        )
         model = build_model(
-            "resnet18",
+            str(client_architecture),
             dataset_name=dataset_name,
             device=device,
         )
@@ -470,6 +534,7 @@ def _client_process_main(
             if attack_plan is not None and attack_plan.is_malicious(client_id)
             else None
         )
+        task_snapshots: Dict[str, Dict[str, object]] = {}
 
         while True:
             response, _, _ = rpc_call(
@@ -485,6 +550,24 @@ def _client_process_main(
             )
             if response.message_type == "STOP":
                 break
+            if response.message_type == "ROLLBACK":
+                rollback_task_id = str(response.metadata["task_id"])
+                rollback_snapshot = task_snapshots.get(rollback_task_id)
+                if rollback_snapshot is None:
+                    raise RuntimeError(
+                        f"Missing client checkpoint for rollback task {rollback_task_id}."
+                    )
+                _restore_client_model(model, rollback_snapshot, device)
+                _send_rollback_ack(
+                    host,
+                    port,
+                    client_id=int(client_id),
+                    task_id=rollback_task_id,
+                    timeout_s=float(config.rpc_timeout_s),
+                    max_message_bytes=int(config.max_message_bytes),
+                )
+                task_snapshots.pop(rollback_task_id, None)
+                continue
             if response.message_type == "NO_TASK":
                 time.sleep(float(config.poll_interval_s))
                 continue
@@ -500,6 +583,7 @@ def _client_process_main(
                 else copy.deepcopy(value)
                 for key, value in model.state_dict().items()
             }
+            task_snapshots[active_task_id] = snapshot
             compute_started_at_s = time.monotonic()
             try:
                 if bool(task["enable_client_distillation"]):
@@ -711,6 +795,7 @@ def _client_process_main(
                     f"packet {packet.packet_id}."
                 )
             active_task_id = ""
+            task_snapshots.pop(str(task["task_id"]), None)
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
         if active_task_id:
@@ -1006,12 +1091,13 @@ def _initialize_metrics(
     defense_controller,
     config: ProcessRuntimeConfig,
     attack_plan: Optional[AttackPlan] = None,
+    aggregation_rule: str = "mean-soft-probabilities",
 ) -> Dict[str, object]:
     return {
         "topology": "server-client",
         "runtime": "process-semi-async",
         "knowledge_interface": "localhost-tcp-serialized-proxy-logits",
-        "aggregation_rule": "mean-soft-probabilities",
+        "aggregation_rule": str(aggregation_rule),
         "server_role": "global-student",
         "client_role": "persistent-process-local-teacher",
         "num_clients": int(num_clients),
@@ -1032,6 +1118,7 @@ def _initialize_metrics(
         ),
         "niabd_enabled": int(defense_controller is not None),
         "runtime_events": [],
+        "vcaa_history_size": [],
         "teacher_admission_records": [],
         "teacher_defense_records": [],
         "attack_type": (
@@ -1056,6 +1143,17 @@ def _initialize_metrics(
             int(attack_plan.config.attack_start_round) if attack_plan is not None else -1
         ),
         "backdoor_client_records": [],
+        "student_snapshot_sha256": [],
+        "student_snapshot_source_round": [],
+        "transaction_id": [],
+        "transaction_status": [],
+        "rollback_reason": [],
+        "received_teachers": [],
+        "drift_recovery_candidates": [],
+        "memory_update_teachers": [],
+        "niabd_defense_available": [],
+        "niabd_purification_applied": [],
+        "niabd_memory_updated": [],
     }
 
 
@@ -1073,6 +1171,9 @@ def run_fedagg_server_client_process_async(
     admission_controller: Optional[TeacherAdmissionController] = None,
     defense_controller: Optional[KnowledgeDefenseController] = None,
     enable_client_distillation: bool = True,
+    aggregation_rule: str = "mean-soft-probabilities",
+    aggregation_trim_fraction: float = 0.1,
+    checkpoint_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
     attack_plan: Optional[AttackPlan] = None,
 ) -> Dict[str, object]:
     """Run real persistent Client processes through localhost TCP RPC."""
@@ -1081,6 +1182,13 @@ def run_fedagg_server_client_process_async(
         raise ValueError("Runtime trace rounds do not match the run.")
     if data_plan.num_clients != int(trace.num_clients):
         raise ValueError("Runtime trace client count does not match data plan.")
+    if (
+        config.client_architectures is not None
+        and len(config.client_architectures) != int(data_plan.num_clients)
+    ):
+        raise ValueError(
+            "Process client_architectures must contain one value per client."
+        )
     if attack_plan is not None and int(attack_plan.num_clients) != data_plan.num_clients:
         raise ValueError("Attack plan client count does not match data plan.")
     proxy_loader = server_dataloaders.get("proxy")
@@ -1144,6 +1252,7 @@ def run_fedagg_server_client_process_async(
         defense_controller=defense_controller,
         config=config,
         attack_plan=attack_plan,
+        aggregation_rule=str(aggregation_rule),
     )
     latest_server_packet = ServerLogitsPacket.from_logits(
         model_round=0,
@@ -1174,6 +1283,21 @@ def run_fedagg_server_client_process_async(
         for server_round in range(1, int(rounds) + 1):
             service.set_server_round(server_round)
             round_started = time.monotonic()
+            round_server_snapshot = _freeze_state_dict(
+                server.model.state_dict()
+            )
+            round_admission_state = (
+                admission_controller.snapshot_state()
+                if admission_controller is not None
+                and hasattr(admission_controller, "snapshot_state")
+                else None
+            )
+            round_defense_state = (
+                defense_controller.snapshot_state()
+                if defense_controller is not None
+                and hasattr(defense_controller, "snapshot_state")
+                else None
+            )
             dispatch = coordinator.dispatch_round(
                 server_round=server_round,
                 latest_server_packet=latest_server_packet,
@@ -1243,6 +1367,11 @@ def run_fedagg_server_client_process_async(
                             client_id=int(packet.client_id),
                             model_round=int(packet.source_round),
                             generated_at_s=float(packet.generated_at_s),
+                            source_round=int(packet.source_round),
+                            base_server_round=int(packet.base_server_round),
+                            received_at_s=float(item.received_at_s),
+                            consumed_at_s=float(consumed_at_s),
+                            proxy_version=str(packet.proxy_version),
                         ),
                         logits=packet.decode_logits(),
                     )
@@ -1292,10 +1421,7 @@ def run_fedagg_server_client_process_async(
                     "attack_stats_missing": int(attack_record is None),
                 })
                 round_events.append(event)
-                coordinator.mark_consumed(
-                    task_id=packet.task_id,
-                    consumed_at_s=consumed_at_s,
-                )
+                coordinator.reserve_consumed(task_id=packet.task_id)
                 if server_round <= int(config.warmup_rounds):
                     reference_times.append(
                         float(packet.total_compute_phase_s)
@@ -1303,12 +1429,15 @@ def run_fedagg_server_client_process_async(
                     )
 
             admission_started = time.monotonic()
+            student_snapshot = server.student_proxy_logits().detach().cpu().clone()
+            student_snapshot_sha256 = _tensor_sha256(student_snapshot)
             decision: Optional[AdmissionDecision] = None
             if knowledge_by_client:
                 decision = server.apply_admission(
                     knowledge_by_client,
                     current_round=server_round,
                     controller=admission_controller,
+                    student_logits=student_snapshot,
                 )
             candidate_ids = sorted(knowledge_by_client)
             if decision is None:
@@ -1361,6 +1490,7 @@ def run_fedagg_server_client_process_async(
                     admitted_client_ids=admitted_ids,
                     current_round=server_round,
                     controller=defense_controller,
+                    student_logits=student_snapshot,
                 )
             if defense_result is not None:
                 purified = {
@@ -1430,14 +1560,13 @@ def run_fedagg_server_client_process_async(
                         defense_metrics["niabd_prototype_update_reason"]
                     )
 
-            server_snapshot = _freeze_state_dict(
-                server.model.state_dict()
-            )
             aggregation_started = time.monotonic()
             aggregate = server.aggregate_admitted_probabilities(
                 knowledge_by_client,
                 admitted_ids,
                 temperature=float(distill_temperature),
+                aggregation_rule=str(aggregation_rule),
+                trim_fraction=float(aggregation_trim_fraction),
             )
             aggregation_time = time.monotonic() - aggregation_started
             distill_started = time.monotonic()
@@ -1451,9 +1580,13 @@ def run_fedagg_server_client_process_async(
             if not _model_is_finite(server.model):
                 _restore_model(
                     server.model,
-                    server_snapshot,
+                    round_server_snapshot,
                     torch.device(config.server_device),
                 )
+                if round_admission_state is not None:
+                    admission_controller.restore_state(round_admission_state)
+                if round_defense_state is not None:
+                    defense_controller.restore_state(round_defense_state)
                 rollback = 1
                 server_updated = False
             latest_server_packet = ServerLogitsPacket.from_logits(
@@ -1467,6 +1600,7 @@ def run_fedagg_server_client_process_async(
                 test_loader,
                 device=torch.device(config.server_device),
                 amp=bool(config.amp),
+                strict_numeric_checks=bool(config.strict_numeric_checks),
             )
             if attack_plan is not None:
                 backdoor_eval = evaluate_backdoor_suite(
@@ -1588,6 +1722,9 @@ def run_fedagg_server_client_process_async(
                 ),
                 "vcaa_kl_mean": float(
                     admission_metrics["kl_mean"]
+                ),
+                "vcaa_history_size": admission_metrics.get(
+                    "vcaa_history_size"
                 ),
                 "teachers_purified": int(
                     defense_metrics["teachers_purified"]
@@ -1774,7 +1911,52 @@ def run_fedagg_server_client_process_async(
                 "quorum_reached": int(quorum_reached),
                 "soft_deadline_s": float(soft_deadline_s),
                 "hard_deadline_s": float(hard_deadline_s),
+                "student_snapshot_sha256": student_snapshot_sha256,
+                "student_snapshot_source_round": int(server_round - 1),
+                "transaction_id": f"process-{server_round}-{student_snapshot_sha256[:16]}",
+                "transaction_status": "aborted" if rollback else "committed",
+                "rollback_reason": "nonfinite_server_model" if rollback else None,
+                "received_teachers": int(len(candidates)),
+                "drift_recovery_candidates": _finite_int(
+                    defense_metrics.get("niabd_memory_candidate_teachers", 0)
+                    if defense_metrics.get("niabd_current_consensus_drift", 0.0)
+                    else 0
+                ),
+                "memory_update_teachers": _finite_int(
+                    defense_metrics.get("niabd_memory_candidate_teachers", 0)
+                    if defense_metrics.get("prototype_updated", 0.0)
+                    else 0
+                ),
+                "niabd_defense_available": defense_metrics.get(
+                    "niabd_defense_available", None
+                ),
+                "niabd_purification_applied": defense_metrics.get(
+                    "niabd_purification_applied", None
+                ),
+                "niabd_memory_updated": defense_metrics.get(
+                    "niabd_memory_updated", None
+                ),
             }
+            # Exactly-once consumption is committed only after admission,
+            # purification, aggregation, distillation and numeric checks.
+            for event in round_events:
+                if rollback:
+                    coordinator.abort_consumed(
+                        task_id=str(event["task_id"]),
+                        reason="nonfinite_server_model",
+                    )
+                    coordinator.request_client_rollback(
+                        task_id=str(event["task_id"]),
+                        reason="nonfinite_server_model",
+                    )
+                else:
+                    coordinator.commit_consumed(
+                        task_id=str(event["task_id"]),
+                        consumed_at_s=consumed_at_s,
+                    )
+            if rollback:
+                admission_records = []
+                defense_records = []
             for key, value in metric_values.items():
                 _append_metric(metrics, key, value)
             metrics["teacher_admission_records"].append(
@@ -1800,6 +1982,8 @@ def run_fedagg_server_client_process_async(
                 for event in round_events
             ])
             metrics["runtime_events"].extend(round_events)
+            if checkpoint_callback is not None:
+                checkpoint_callback(int(server_round), metrics)
             print(
                 f"[Round {server_round}] runtime=process-semi-async "
                 f"selected={len(dispatch.selected_clients)} "

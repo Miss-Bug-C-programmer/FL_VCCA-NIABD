@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -14,6 +15,7 @@ from admission import (
 from defense import DefenseResult, KnowledgeDefenseController
 from logits_transport import ClientLogitsPacket, ServerLogitsPacket
 from trainer import distill_with_logits, predict_logits
+from robust_aggregation import aggregate_probabilities
 
 
 class FederatedServer:
@@ -72,11 +74,17 @@ class FederatedServer:
                 raise ValueError(
                     f"Client {client_id} logits do not cover the proxy set."
                 )
+            received_at_s = float(time.monotonic())
             received[client_id] = TeacherKnowledge(
                 metadata=TeacherMetadata(
                     client_id=client_id,
                     model_round=int(packet.model_round),
                     generated_at_s=float(packet.generated_at_s),
+                    source_round=int(packet.source_round),
+                    base_server_round=int(packet.base_server_round),
+                    received_at_s=received_at_s,
+                    consumed_at_s=received_at_s,
+                    proxy_version=str(packet.proxy_version),
                 ),
                 logits=logits,
             )
@@ -101,6 +109,7 @@ class FederatedServer:
         *,
         current_round: int,
         controller: Optional[TeacherAdmissionController],
+        student_logits: Optional[torch.Tensor] = None,
     ) -> Optional[AdmissionDecision]:
         if controller is None:
             return None
@@ -109,7 +118,11 @@ class FederatedServer:
                 knowledge_by_client[client_id]
                 for client_id in sorted(knowledge_by_client)
             ],
-            student_logits=self.student_proxy_logits(),
+            student_logits=(
+                self.student_proxy_logits()
+                if student_logits is None
+                else student_logits
+            ),
             proxy_labels=self._proxy_labels,
             current_round=int(current_round),
         )
@@ -121,6 +134,7 @@ class FederatedServer:
         admitted_client_ids: Sequence[int],
         current_round: int,
         controller: Optional[KnowledgeDefenseController],
+        student_logits: Optional[torch.Tensor] = None,
     ) -> Optional[DefenseResult]:
         if controller is None or not admitted_client_ids:
             return None
@@ -130,7 +144,11 @@ class FederatedServer:
         ]
         return controller.purify(
             teacher_knowledge=admitted,
-            student_logits=self.student_proxy_logits(),
+            student_logits=(
+                self.student_proxy_logits()
+                if student_logits is None
+                else student_logits
+            ),
             proxy_labels=self._proxy_labels,
             current_round=int(current_round),
         )
@@ -155,6 +173,8 @@ class FederatedServer:
         admitted_client_ids: Sequence[int],
         *,
         temperature: float,
+        aggregation_rule: str = "mean-soft-probabilities",
+        trim_fraction: float = 0.1,
     ) -> Optional[torch.Tensor]:
         admitted = [int(client_id) for client_id in admitted_client_ids]
         if not admitted:
@@ -165,11 +185,12 @@ class FederatedServer:
         reference_shape = logits[0].shape
         if any(item.shape != reference_shape for item in logits):
             raise ValueError("Admitted client logits must have equal shapes.")
-        probabilities = [
-            torch.softmax(item / float(temperature), dim=1)
-            for item in logits
-        ]
-        return torch.stack(probabilities, dim=0).mean(dim=0)
+        return aggregate_probabilities(
+            logits,
+            method=str(aggregation_rule),
+            temperature=float(temperature),
+            trim_fraction=float(trim_fraction),
+        )
 
     def train_from_uploaded_logits(
         self,
@@ -221,9 +242,14 @@ class FederatedServer:
         *,
         current_round: int,
         query_id: str,
+        student_logits: Optional[torch.Tensor] = None,
     ) -> ServerLogitsPacket:
         return ServerLogitsPacket.from_logits(
             model_round=int(current_round),
             query_id=str(query_id),
-            logits=self.student_proxy_logits(),
+            logits=(
+                self.student_proxy_logits()
+                if student_logits is None
+                else student_logits
+            ),
         )

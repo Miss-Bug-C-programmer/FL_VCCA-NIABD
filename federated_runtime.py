@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import math
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -13,6 +15,7 @@ from attacks import (
     evaluate_backdoor_suite,
     split_defense_diagnostics,
 )
+from checkpointing import restore_checkpoint
 from admission import (
     AdmissionDecision,
     TeacherAdmissionController,
@@ -44,6 +47,21 @@ def _model_is_finite(model: nn.Module) -> bool:
     )
 
 
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    value = tensor.detach().cpu().contiguous()
+    return hashlib.sha256(value.numpy().tobytes()).hexdigest()
+
+
+def _finite_int(value, default: int = 0) -> int:
+    """Convert an optional metric to int without turning NaN into a crash."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return int(number) if math.isfinite(number) else int(default)
+
+
 def _forward_logits(model: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
     outputs = model(inputs)
     if isinstance(outputs, (tuple, list)):
@@ -57,6 +75,7 @@ def evaluate_with_loss(
     *,
     device="cpu",
     amp: bool = False,
+    strict_numeric_checks: bool = False,
 ) -> tuple[float, float, int]:
     model.eval()
     loss_fn = nn.CrossEntropyLoss()
@@ -78,12 +97,14 @@ def evaluate_with_loss(
 
             if not bool(torch.isfinite(logits).all().item()):
                 nonfinite_batches += 1
-            logits = torch.nan_to_num(
-                logits,
-                nan=0.0,
-                posinf=30.0,
-                neginf=-30.0,
-            ).clamp(-30.0, 30.0)
+                if strict_numeric_checks:
+                    continue
+                logits = torch.nan_to_num(
+                    logits,
+                    nan=0.0,
+                    posinf=30.0,
+                    neginf=-30.0,
+                ).clamp(-30.0, 30.0)
             loss = loss_fn(logits, labels)
             if not bool(torch.isfinite(loss).item()):
                 nonfinite_batches += 1
@@ -109,6 +130,10 @@ def _decision_metrics(
     if decision is None:
         return {
             "method": "none",
+            "vcaa_algorithm_version": "none",
+            "result_schema_version": "fedagg-results-v3",
+            "vcaa_nonfinite_policy": "none",
+            "vcaa_history_size": None,
             "threshold": 0.0,
             "admitted": int(num_clients),
             "rejected": 0,
@@ -135,6 +160,10 @@ def _decision_metrics(
     admitted = len(decision.admitted_client_ids)
     return {
         "method": str(decision.method),
+        "vcaa_algorithm_version": str(decision.algorithm_version),
+        "result_schema_version": str(decision.result_schema_version),
+        "vcaa_nonfinite_policy": str(decision.nonfinite_policy),
+        "vcaa_history_size": int(decision.history_size),
         "threshold": float(decision.threshold),
         "admitted": int(admitted),
         "rejected": int(len(decision.rejected_client_ids)),
@@ -215,6 +244,9 @@ def _defense_metrics(
             "niabd_effective_memory_weight": float("nan"),
             "niabd_eligible_teacher_observations": float("nan"),
             "niabd_memory_update_rounds": float("nan"),
+            "niabd_defense_available": None,
+            "niabd_purification_applied": None,
+            "niabd_memory_updated": None,
             "teachers_purified": 0,
             "records": [],
         }
@@ -310,6 +342,15 @@ def _defense_metrics(
         "niabd_memory_update_rounds": float(
             result.metrics.get("niabd_memory_update_rounds", float("nan"))
         ),
+        "niabd_defense_available": result.metrics.get(
+            "niabd_defense_available", True
+        ),
+        "niabd_purification_applied": result.metrics.get(
+            "niabd_purification_applied", True
+        ),
+        "niabd_memory_updated": result.metrics.get(
+            "niabd_memory_updated", False
+        ),
         "teachers_purified": len(result.purified_knowledge),
         "records": records,
     }
@@ -330,9 +371,13 @@ def run_fedagg_server_client(
     admission_controller: Optional[TeacherAdmissionController] = None,
     defense_controller: Optional[KnowledgeDefenseController] = None,
     enable_client_distillation: bool = True,
+    aggregation_rule: str = "mean-soft-probabilities",
+    aggregation_trim_fraction: float = 0.1,
     attack_plan: Optional[AttackPlan] = None,
     enable_backdoor_diagnostics: bool = False,
     backdoor_diagnostics_dataset: str = "",
+    checkpoint_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
+    resume_payload: Optional[dict] = None,
 ) -> Dict[str, object]:
     """Train real clients through serialized proxy-logits knowledge exchange.
 
@@ -400,7 +445,7 @@ def run_fedagg_server_client(
     metrics: Dict[str, object] = {
         "topology": "server-client",
         "knowledge_interface": "serialized-proxy-logits",
-        "aggregation_rule": "mean-soft-probabilities",
+        "aggregation_rule": str(aggregation_rule),
         "server_role": "global-student",
         "client_role": "local-teacher",
         "num_clients": len(clients),
@@ -448,6 +493,7 @@ def run_fedagg_server_client(
         "vcaa_proxy_accuracy_mean": [],
         "vcaa_entropy_mean": [],
         "vcaa_kl_mean": [],
+        "vcaa_history_size": [],
         "teacher_admission_records": [],
         "teachers_purified": [],
         "niabd_warmup": [],
@@ -479,6 +525,17 @@ def run_fedagg_server_client(
         "nonfinite_eval_batches": [],
         "nonfinite_distill_rollbacks": [],
         "numeric_failure_count": [],
+        "student_snapshot_sha256": [],
+        "student_snapshot_source_round": [],
+        "transaction_id": [],
+        "transaction_status": [],
+        "rollback_reason": [],
+        "received_teachers": [],
+        "drift_recovery_candidates": [],
+        "memory_update_teachers": [],
+        "niabd_defense_available": [],
+        "niabd_purification_applied": [],
+        "niabd_memory_updated": [],
         "attack_type": (
             attack_plan.config.attack_type if attack_plan is not None else "none"
         ),
@@ -520,11 +577,48 @@ def run_fedagg_server_client(
         "backdoor_diagnostics_enabled": int(enable_backdoor_diagnostics),
     }
 
-    wall_clock = 0.0
+    start_round_index = 0
+    if resume_payload is not None:
+        restore_checkpoint(
+            resume_payload,
+            server_model=server_model,
+            client_models=client_models,
+            admission_controller=admission_controller,
+            defense_controller=defense_controller,
+        )
+        saved_metrics = resume_payload.get("metrics_state")
+        if not isinstance(saved_metrics, dict):
+            raise ValueError("Checkpoint metrics_state is required for resume.")
+        metrics.update(saved_metrics)
+        start_round_index = int(resume_payload["current_round"])
+        if start_round_index >= int(rounds):
+            return metrics
+
+    wall_clock = float(
+        metrics.get("wall_clock_time_s", [0.0])[-1]
+        if metrics.get("wall_clock_time_s")
+        else 0.0
+    )
     distill_lr = max(float(learning_rate) * 0.2, 1e-4)
-    for round_idx in range(int(rounds)):
+    for round_idx in range(start_round_index, int(rounds)):
         round_number = int(round_idx + 1)
         round_start = time.perf_counter()
+        round_server_state = _freeze_state_dict(server.model.state_dict())
+        round_client_states = [
+            _freeze_state_dict(client.model.state_dict()) for client in clients
+        ]
+        round_admission_state = (
+            admission_controller.snapshot_state()
+            if admission_controller is not None
+            and hasattr(admission_controller, "snapshot_state")
+            else None
+        )
+        round_defense_state = (
+            defense_controller.snapshot_state()
+            if defense_controller is not None
+            and hasattr(defense_controller, "snapshot_state")
+            else None
+        )
 
         local_start = time.perf_counter()
         backdoor_records = []
@@ -578,11 +672,15 @@ def run_fedagg_server_client(
             expected_client_ids=[client.client_id for client in clients],
         )
         upload_time = time.perf_counter() - upload_start
+        # One immutable pre-update snapshot is shared by VCAA and NIABD.
+        student_snapshot = server.student_proxy_logits().detach().cpu().clone()
+        student_snapshot_sha256 = _tensor_sha256(student_snapshot)
         admission_start = time.perf_counter()
         decision = server.apply_admission(
             knowledge_by_client,
             current_round=round_number,
             controller=admission_controller,
+            student_logits=student_snapshot,
         )
         if decision is None:
             admitted_ids = [client.client_id for client in clients]
@@ -603,6 +701,7 @@ def run_fedagg_server_client(
             admitted_client_ids=admitted_ids,
             current_round=round_number,
             controller=defense_controller,
+            student_logits=student_snapshot,
         )
         if defense_result is not None:
             purified_by_id = {
@@ -639,17 +738,13 @@ def run_fedagg_server_client(
             ),
         )
 
-        client_states = [
-            _freeze_state_dict(client.model.state_dict())
-            for client in clients
-        ]
-        server_state = _freeze_state_dict(server.model.state_dict())
-
         distill_start = time.perf_counter()
         aggregated_probabilities = server.aggregate_admitted_probabilities(
             knowledge_by_client,
             admitted_ids,
             temperature=float(distill_temperature),
+            aggregation_rule=str(aggregation_rule),
+            trim_fraction=float(aggregation_trim_fraction),
         )
         server_updated = server.train_from_teacher_probabilities(
             aggregated_probabilities,
@@ -683,16 +778,21 @@ def run_fedagg_server_client(
 
         rollback = int(bool(nonfinite_models))
         if rollback:
-            _restore_model(server.model, server_state, device_obj)
-            for client, state in zip(clients, client_states):
+            _restore_model(server.model, round_server_state, device_obj)
+            for client, state in zip(clients, round_client_states):
                 _restore_model(client.model, state, device_obj)
+            if round_admission_state is not None:
+                admission_controller.restore_state(round_admission_state)
+            if round_defense_state is not None:
+                defense_controller.restore_state(round_defense_state)
 
         accuracy, loss, nonfinite_eval = evaluate_with_loss(
             server.model,
             test_loader,
-            device=device_obj,
-            amp=bool(amp),
-        )
+                device=device_obj,
+                amp=bool(amp),
+                strict_numeric_checks=bool(strict_numeric_checks),
+            )
         if attack_plan is not None:
             backdoor_eval = evaluate_backdoor_suite(
                 server.model,
@@ -784,6 +884,9 @@ def run_fedagg_server_client(
         metrics["vcaa_kl_mean"].append(
             float(admission_metrics["kl_mean"])
         )
+        metrics["vcaa_history_size"].append(
+            admission_metrics.get("vcaa_history_size")
+        )
         metrics["teacher_admission_records"].append(
             admission_metrics["records"]
         )
@@ -841,7 +944,42 @@ def run_fedagg_server_client(
         )
         metrics["nonfinite_eval_batches"].append(int(nonfinite_eval))
         metrics["nonfinite_distill_rollbacks"].append(int(rollback))
-        metrics["numeric_failure_count"].append(0.0)
+        metrics["numeric_failure_count"].append(
+            float(nonfinite_eval + rollback)
+        )
+        metrics["student_snapshot_sha256"].append(student_snapshot_sha256)
+        metrics["student_snapshot_source_round"].append(round_number - 1)
+        metrics["transaction_id"].append(
+            f"sync-{round_number}-{student_snapshot_sha256[:16]}"
+        )
+        metrics["transaction_status"].append("committed")
+        metrics["rollback_reason"].append(
+            "nonfinite_model" if rollback else None
+        )
+        metrics["received_teachers"].append(len(packets))
+        metrics["drift_recovery_candidates"].append(
+            _finite_int(
+                defense_metrics.get("niabd_current_consensus_drift", 0.0)
+                and defense_metrics.get("niabd_memory_candidate_teachers", 0.0)
+                or 0
+            )
+        )
+        metrics["memory_update_teachers"].append(
+            _finite_int(
+                defense_metrics.get("niabd_memory_candidate_teachers", 0)
+                if defense_metrics.get("prototype_updated", 0.0)
+                else 0
+            )
+        )
+        metrics["niabd_defense_available"].append(
+            defense_metrics.get("niabd_defense_available", None)
+        )
+        metrics["niabd_purification_applied"].append(
+            defense_metrics.get("niabd_purification_applied", None)
+        )
+        metrics["niabd_memory_updated"].append(
+            defense_metrics.get("niabd_memory_updated", None)
+        )
         metrics["attack_active"].append(
             int(attack_plan.config.active(round_number))
             if attack_plan is not None else 0
@@ -869,6 +1007,9 @@ def run_fedagg_server_client(
         for key, value in defense_split.items():
             metrics[key].append(float(value))
         metrics["backdoor_client_records"].append(backdoor_records)
+
+        if checkpoint_callback is not None:
+            checkpoint_callback(int(round_number), metrics)
 
         print(
             f"[Round {round_number}] topology=server-client "

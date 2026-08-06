@@ -1,0 +1,22 @@
+{
+  "schema_version": "fedagg-v3-config",
+  "run_class": "smoke",
+  "datasets": ["cifar10", "femnist", "tiny-imagenet-200"],
+  "attacks": ["none", "badnets", "dba", "blend", "dynamic"],
+  "methods": ["baseline", "vcaa", "niabd", "vcaa-niabd"],
+  "seeds": [0],
+  "runtime_profiles": ["sync", "process-semi-async"],
+  "architectures": {
+    "server": "resnet18",
+    "clients": ["resnet18", "small_cnn", "mobilenet_v2"]
+  },
+  "aggregation_rules": [
+    "mean-soft-probabilities",
+    "median-probabilities",
+    "trimmed-mean-probabilities",
+    "confidence-consistency-filtered-mean"
+  ],
+  "niabd_proxy_chunk_size": 2,
+  "strict_numeric_checks": true,
+  "dry_run_only": true
+}

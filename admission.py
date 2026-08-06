@@ -13,6 +13,11 @@ class TeacherMetadata:
     client_id: int
     model_round: int
     generated_at_s: float
+    source_round: int = -1
+    base_server_round: int = -1
+    received_at_s: float = float("nan")
+    consumed_at_s: float = float("nan")
+    proxy_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,10 @@ class AdmissionDecision:
     admitted_client_ids: Tuple[int, ...]
     rejected_client_ids: Tuple[int, ...]
     records: Tuple[TeacherAdmissionRecord, ...]
+    algorithm_version: str = "none"
+    result_schema_version: str = "fedagg-results-v3"
+    nonfinite_policy: str = "fail_closed"
+    history_size: int = 0
 
 
 class TeacherAdmissionController(Protocol):

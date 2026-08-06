@@ -9,12 +9,18 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from numeric_integrity import require_finite_tensor
+
 from admission import (
     AdmissionDecision,
     TeacherAdmissionRecord,
     TeacherKnowledge,
     TeacherMetadata,
 )
+
+
+VCAA_ALGORITHM_VERSION = "vcaa-v2.1-transactional-time-aware"
+RESULT_SCHEMA_VERSION = "fedagg-results-v3"
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,7 @@ class VCAAConfig:
     threshold_beta: float = 1.0
     warmup_rounds: int = 1
     epsilon: float = 1e-8
+    nonfinite_policy: str = "fail_closed"
 
     def __post_init__(self) -> None:
         if not 0.0 <= float(self.version_weight) <= 1.0:
@@ -68,12 +75,19 @@ class VCAAConfig:
             raise ValueError("warmup_rounds must be non-negative.")
         if float(self.epsilon) <= 0.0:
             raise ValueError("epsilon must be positive.")
+        if self.nonfinite_policy not in {"fail_closed", "sanitize_and_record"}:
+            raise ValueError(
+                "nonfinite_policy must be 'fail_closed' or "
+                "'sanitize_and_record'."
+            )
 
 
 class VersionContentAwareAdmission:
     """VCAA implementation following Eqs. (1)--(7) of the reference design."""
 
     name = "vcaa"
+    algorithm_version = VCAA_ALGORITHM_VERSION
+    result_schema_version = RESULT_SCHEMA_VERSION
 
     def __init__(
         self,
@@ -90,19 +104,81 @@ class VersionContentAwareAdmission:
     def reset(self) -> None:
         self._history.clear()
 
+    def snapshot_state(self) -> dict:
+        """Return explicit controller state for round transactions/checkpoints."""
+
+        return {
+            "history": [
+                (int(round_number), tuple(float(score) for score in scores))
+                for round_number, scores in self._history
+            ],
+            "algorithm_version": self.algorithm_version,
+            "result_schema_version": self.result_schema_version,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        if str(state.get("algorithm_version")) != self.algorithm_version:
+            raise ValueError("VCAA snapshot algorithm version mismatch.")
+        history = state.get("history")
+        if not isinstance(history, list):
+            raise ValueError("VCAA snapshot history is invalid.")
+        self._history.clear()
+        for item in history:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("VCAA snapshot history entry is invalid.")
+            round_number, scores = item
+            if not isinstance(scores, (list, tuple)):
+                raise ValueError("VCAA snapshot scores are invalid.")
+            self._history.append(
+                (int(round_number), tuple(float(score) for score in scores))
+            )
+
     def _version_scores(
         self,
         metadata: Sequence[TeacherMetadata],
+        *,
+        current_round: int,
     ) -> List[Dict[str, float]]:
-        versions = [int(item.model_round) for item in metadata]
+        versions = [
+            int(item.source_round)
+            if int(item.source_round) >= 0
+            else int(item.model_round)
+            for item in metadata
+        ]
         median_version = float(statistics.median(versions))
         minimum_round = median_version - int(self.config.max_version_lag)
         now = float(self._clock())
         results = []
         for item in metadata:
-            age_seconds = max(0.0, now - float(item.generated_at_s))
+            received_at_s = float(item.received_at_s)
+            if math.isfinite(received_at_s):
+                age_seconds = max(0.0, now - received_at_s)
+            else:
+                # Direct unit callers from the legacy interface may not carry
+                # server receive metadata. Production packet paths always do;
+                # retain the legacy generated timestamp only for compatibility.
+                generated_at_s = float(item.generated_at_s)
+                age_seconds = (
+                    max(0.0, now - generated_at_s)
+                    if math.isfinite(generated_at_s)
+                    else float("nan")
+                )
+            source_round = (
+                int(item.source_round)
+                if int(item.source_round) >= 0
+                else int(item.model_round)
+            )
+            version_lag = max(0, int(current_round) - source_round)
             age_units = age_seconds / float(self.config.time_unit_s)
-            version_floor = float(int(item.model_round) >= minimum_round)
+            version_floor = float(int(source_round) >= minimum_round)
+            if not math.isfinite(age_seconds):
+                if self.config.nonfinite_policy == "fail_closed":
+                    raise ValueError(
+                        "VCAA received_at_s is nonfinite; fail_closed policy "
+                        "rejects unverifiable time semantics."
+                    )
+                age_seconds = 0.0
+                age_units = 0.0
             score = (
                 float(self.config.time_decay_gamma) ** age_units
             ) * version_floor
@@ -111,6 +187,8 @@ class VersionContentAwareAdmission:
                     "version_score": float(score),
                     "age_seconds": float(age_seconds),
                     "model_round": float(item.model_round),
+                    "source_round": float(source_round),
+                    "version_lag": float(version_lag),
                     "minimum_accepted_round": float(minimum_round),
                 }
             )
@@ -124,12 +202,19 @@ class VersionContentAwareAdmission:
         proxy_labels: torch.Tensor,
     ) -> List[Dict[str, float]]:
         eps = float(self.config.epsilon)
-        student_logits = torch.nan_to_num(
-            student_logits.detach().cpu().float(),
-            nan=0.0,
-            posinf=30.0,
-            neginf=-30.0,
-        ).clamp(-30.0, 30.0)
+        student_logits = student_logits.detach().cpu().float()
+        nonfinite_student = int((~torch.isfinite(student_logits)).sum().item())
+        if nonfinite_student:
+            if self.config.nonfinite_policy == "fail_closed":
+                raise ValueError("VCAA student logits are nonfinite.")
+            student_logits = torch.nan_to_num(
+                student_logits, nan=0.0, posinf=30.0, neginf=-30.0
+            ).clamp(-30.0, 30.0)
+        require_finite_tensor(
+            student_logits,
+            phase="vcaa",
+            metric="student_logits",
+        )
         labels = proxy_labels.detach().cpu().long().view(-1)
         if student_logits.ndim != 2:
             raise ValueError(
@@ -149,12 +234,21 @@ class VersionContentAwareAdmission:
         student_prob = student_log_prob.exp()
         results = []
         for knowledge in teacher_knowledge:
-            teacher_logits = torch.nan_to_num(
-                knowledge.logits.detach().cpu().float(),
-                nan=0.0,
-                posinf=30.0,
-                neginf=-30.0,
-            ).clamp(-30.0, 30.0)
+            teacher_logits = knowledge.logits.detach().cpu().float()
+            nonfinite_teacher = int(
+                (~torch.isfinite(teacher_logits)).sum().item()
+            )
+            if nonfinite_teacher:
+                if self.config.nonfinite_policy == "fail_closed":
+                    raise ValueError("VCAA teacher logits are nonfinite.")
+                teacher_logits = torch.nan_to_num(
+                    teacher_logits, nan=0.0, posinf=30.0, neginf=-30.0
+                ).clamp(-30.0, 30.0)
+            require_finite_tensor(
+                teacher_logits,
+                phase="vcaa",
+                metric="teacher_logits",
+            )
             if teacher_logits.shape != student_logits.shape:
                 raise ValueError(
                     "Teacher and student logits must share the same proxy shape."
@@ -189,6 +283,9 @@ class VersionContentAwareAdmission:
                     "mean_entropy": float(entropy_sum) / sample_count,
                     "mean_kl": float(kl_sum) / sample_count,
                     "num_classes": float(num_classes),
+                    "sanitized_value_count": float(
+                        nonfinite_student + nonfinite_teacher
+                    ),
                 }
             )
         return results
@@ -226,7 +323,10 @@ class VersionContentAwareAdmission:
         if int(current_round) <= 0:
             raise ValueError("current_round must be positive.")
 
-        version_stats = self._version_scores(metadata)
+        version_stats = self._version_scores(
+            metadata,
+            current_round=int(current_round),
+        )
         content_stats = self._content_statistics(
             teacher_knowledge,
             student_logits,
@@ -305,7 +405,14 @@ class VersionContentAwareAdmission:
         admitted_scores = tuple(
             record.score for record in records if record.admitted
         )
-        self._history.append((int(current_round), admitted_scores))
+        # Record every finite score, not only survivors.  This prevents a
+        # low-score survivor-bias spiral in which all future teachers are
+        # rejected against an obsolete high-score history.
+        if self.config.nonfinite_policy == "fail_closed" and not all(
+            math.isfinite(float(score)) for score in scores
+        ):
+            raise ValueError("VCAA produced a nonfinite admission score.")
+        self._history.append((int(current_round), tuple(scores)))
 
         return AdmissionDecision(
             method=self.name,
@@ -313,4 +420,8 @@ class VersionContentAwareAdmission:
             admitted_client_ids=tuple(admitted_ids),
             rejected_client_ids=tuple(rejected_ids),
             records=records,
+            algorithm_version=self.algorithm_version,
+            result_schema_version=self.result_schema_version,
+            nonfinite_policy=self.config.nonfinite_policy,
+            history_size=len(self._history),
         )

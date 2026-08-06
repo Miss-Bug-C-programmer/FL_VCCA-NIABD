@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
+import json
 import os
 import random
 import uuid
+from dataclasses import asdict
+from pathlib import Path
 from typing import Iterable, List
 
 import numpy as np
@@ -12,6 +16,11 @@ import pandas as pd
 import torch
 
 from attacks import AttackConfig, AttackPlan
+from checkpointing import (
+    build_checkpoint_payload,
+    load_checkpoint,
+    save_checkpoint_atomic,
+)
 from data_utils import (
     build_federated_data_plan,
     build_server_dataloaders_from_plan,
@@ -25,6 +34,7 @@ from device_utils import (
     use_amp_for_device,
 )
 from model_factory import build_model, build_models, dataset_spec
+from model_factory import architecture_assignment_hash, model_parameter_count
 from federated_runtime import run_fedagg_server_client
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from process_runtime import (
@@ -37,6 +47,13 @@ from runtime_trace import (
     load_runtime_profile,
 )
 from vcaa import VCAAConfig, VersionContentAwareAdmission
+from result_schema import (
+    AGGREGATION_ALGORITHM_VERSION,
+    NIABD_ALGORITHM_VERSION,
+    RESULT_SCHEMA_VERSION,
+    VCAA_ALGORITHM_VERSION,
+    write_schema,
+)
 
 
 PROCESS_RUNTIME = "process-semi-async"
@@ -73,6 +90,9 @@ ADMISSION_COLUMNS = (
     "num_classes", "accuracy_term", "entropy_term", "divergence_term",
     "content_score", "task_id", "packet_id", "source_round",
     "consumed_round", "version_lag", "knowledge_age_s",
+    "vcaa_algorithm_version", "vcaa_nonfinite_policy",
+    "result_schema_version", "vcaa_history_size", "received_at_s",
+    "consumed_at_s", "proxy_version",
 )
 
 DEFENSE_COLUMNS = (
@@ -83,11 +103,17 @@ DEFENSE_COLUMNS = (
     "mean_excess", "consensus_deviation", "niabd_algorithm_version",
     "result_schema_version", "niabd_prototype_update_reason", "task_id",
     "packet_id", "source_round", "consumed_round", "version_lag",
+    "niabd_defense_available", "niabd_purification_applied",
+    "niabd_memory_updated", "memory_candidate_teachers",
+    "normal_eligible_teachers", "memory_update_teachers",
+    "niabd_observations",
 )
 
 RUNTIME_EVENT_COLUMNS = (
     "run_uid", "dataset", "seed", "runtime", "strategy", "topology",
     "num_clients", "partition_scheme", "server_device", "client_device",
+    "result_schema_version", "vcaa_algorithm_version",
+    "aggregation_algorithm_version", "run_class", "attack_condition",
     "client_id", "client_pid", "task_id", "packet_id", "payload_sha256",
     "inference_sha256", "source_round", "base_server_round",
     "receive_server_round", "consumed_round", "local_model_version",
@@ -108,7 +134,7 @@ RUNTIME_EVENT_COLUMNS = (
     "niabd_mean_suppression", "niabd_teacher_memory_score",
     "niabd_high_quantile_deviation", "niabd_mean_excess",
     "niabd_consensus_deviation", "niabd_memory_eligible",
-    "niabd_algorithm_version", "result_schema_version",
+    "niabd_algorithm_version",
     "niabd_prototype_update_reason", "is_malicious", "attack_active",
     "poisoned_samples", "eligible_poison_samples", "poisoned_batches",
     "dba_trigger_part", "attack_stats_missing",
@@ -168,6 +194,26 @@ def _process_metric(metrics, key: str, round_idx: int):
     return _metric(metrics, key, round_idx, np.nan)
 
 
+def _lineage_versions(metrics: dict) -> dict[str, str]:
+    """Return one immutable algorithm lineage for the exported run rows."""
+
+    strategy = str(metrics.get("strategy", "baseline")).lower()
+    return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "vcaa_algorithm_version": (
+            VCAA_ALGORITHM_VERSION
+            if "vcaa" in strategy
+            else "none"
+        ),
+        "niabd_algorithm_version": (
+            NIABD_ALGORITHM_VERSION
+            if "niabd" in strategy
+            else "none"
+        ),
+        "aggregation_algorithm_version": AGGREGATION_ALGORITHM_VERSION,
+    }
+
+
 def _round_rows(
     metrics,
     *,
@@ -178,7 +224,18 @@ def _round_rows(
     partition_scheme: str,
 ) -> Iterable[dict]:
     rounds = len(metrics.get("acc_list", []))
+    lineage = _lineage_versions(metrics)
     for round_idx in range(rounds):
+        row_niabd_version = _metric(
+            metrics, "niabd_algorithm_version", round_idx, None
+        )
+        if row_niabd_version in {None, "", "nan"}:
+            row_niabd_version = lineage["niabd_algorithm_version"]
+        row_schema_version = _metric(
+            metrics, "result_schema_version", round_idx, None
+        )
+        if row_schema_version in {None, "", "nan"}:
+            row_schema_version = lineage["result_schema_version"]
         yield {
             "run_uid": run_uid,
             "dataset": dataset_name,
@@ -186,11 +243,35 @@ def _round_rows(
             "round": int(round_idx + 1),
             "runtime": str(metrics.get("runtime", "sync")),
             "strategy": str(metrics.get("strategy", "baseline")),
+            "result_schema_version": lineage["result_schema_version"],
+            "vcaa_algorithm_version": lineage["vcaa_algorithm_version"],
+            "niabd_algorithm_version": lineage["niabd_algorithm_version"],
+            "aggregation_algorithm_version": lineage[
+                "aggregation_algorithm_version"
+            ],
+            "run_class": str(metrics.get("run_class", "smoke")),
+            "attack_condition": str(
+                metrics.get(
+                    "attack_condition",
+                    "clean"
+                    if str(metrics.get("attack_type", "none")) == "none"
+                    else "attacked",
+                )
+            ),
             "topology": "server-client",
             "server_role": "global-student",
             "client_role": "local-teacher",
-            "server_model": "resnet18",
-            "client_model": "resnet18",
+            "server_model": str(metrics.get("server_model", "resnet18")),
+            "client_model": str(metrics.get("client_model", "resnet18")),
+            "architecture_assignment_hash": str(
+                metrics.get("architecture_assignment_hash", "")
+            ),
+            "server_parameter_count": int(
+                metrics.get("server_parameter_count", 0)
+            ),
+            "client_parameter_count": int(
+                metrics.get("client_parameter_count", 0)
+            ),
             "server_device": str(metrics.get("server_device", "")),
             "client_device": str(metrics.get("client_device", "")),
             "num_clients": int(num_clients),
@@ -341,6 +422,9 @@ def _round_rows(
             "teachers_admitted": int(
                 _metric(metrics, "teachers_admitted", round_idx)
             ),
+            "admitted_teachers": int(
+                _metric(metrics, "teachers_admitted", round_idx)
+            ),
             "teachers_rejected": int(
                 _metric(metrics, "teachers_rejected", round_idx)
             ),
@@ -367,6 +451,9 @@ def _round_rows(
             ),
             "vcaa_kl_mean": float(
                 _metric(metrics, "vcaa_kl_mean", round_idx)
+            ),
+            "vcaa_history_size": _metric(
+                metrics, "vcaa_history_size", round_idx, None
             ),
             "teachers_purified": int(
                 _metric(metrics, "teachers_purified", round_idx)
@@ -408,10 +495,10 @@ def _round_rows(
                 )
             ),
             "niabd_algorithm_version": str(
-                _metric(metrics, "niabd_algorithm_version", round_idx, "")
+                row_niabd_version
             ),
             "result_schema_version": str(
-                _metric(metrics, "result_schema_version", round_idx, "")
+                row_schema_version
             ),
             "niabd_prototype_update_reason": str(
                 _metric(
@@ -428,6 +515,36 @@ def _round_rows(
                     round_idx,
                     np.nan,
                 )
+            ),
+            "memory_candidate_teachers": _metric(
+                metrics, "niabd_memory_candidate_teachers", round_idx, None
+            ),
+            "normal_eligible_teachers": _metric(
+                metrics, "niabd_memory_eligible_teachers", round_idx, None
+            ),
+            "drift_recovery_candidates": _metric(
+                metrics, "drift_recovery_candidates", round_idx, None
+            ),
+            "memory_update_teachers": _metric(
+                metrics, "memory_update_teachers", round_idx, None
+            ),
+            "niabd_memory_update_reason": _metric(
+                metrics,
+                "niabd_prototype_update_reason",
+                round_idx,
+                None,
+            ),
+            "niabd_observations": _metric(
+                metrics, "niabd_eligible_teacher_observations", round_idx, None
+            ),
+            "niabd_defense_available": _metric(
+                metrics, "niabd_defense_available", round_idx, None
+            ),
+            "niabd_purification_applied": _metric(
+                metrics, "niabd_purification_applied", round_idx, None
+            ),
+            "niabd_memory_updated": _metric(
+                metrics, "niabd_memory_updated", round_idx, None
             ),
             "niabd_teacher_score_mean": float(
                 _metric(metrics, "niabd_teacher_score_mean", round_idx, np.nan)
@@ -519,6 +636,30 @@ def _round_rows(
             "numeric_failure_count": float(
                 _metric(metrics, "numeric_failure_count", round_idx)
             ),
+            "transaction_id": _metric(
+                metrics, "transaction_id", round_idx, None
+            ),
+            "transaction_status": _metric(
+                metrics, "transaction_status", round_idx, "committed"
+            ),
+            "rollback_reason": _metric(
+                metrics, "rollback_reason", round_idx, None
+            ),
+            "student_snapshot_sha256": _metric(
+                metrics, "student_snapshot_sha256", round_idx, None
+            ),
+            "received_teachers": _metric(
+                metrics,
+                "received_teachers",
+                round_idx,
+                _metric(metrics, "clients_trained", round_idx, 0),
+            ),
+            "checkpoint_path": _metric(
+                metrics, "checkpoint_path", round_idx, None
+            ),
+            "checkpoint_sha256": _metric(
+                metrics, "checkpoint_sha256", round_idx, None
+            ),
             **{
                 key: _process_metric(metrics, key, round_idx)
                 for key in PROCESS_ONLY_ROUND_FIELDS
@@ -554,9 +695,28 @@ def _summary_row(
         "seed": last["seed"],
         "runtime": last["runtime"],
         "strategy": last["strategy"],
+        "result_schema_version": last.get(
+            "result_schema_version", RESULT_SCHEMA_VERSION
+        ),
+        "vcaa_algorithm_version": last.get(
+            "vcaa_algorithm_version", "none"
+        ),
+        "niabd_algorithm_version": last.get(
+            "niabd_algorithm_version", "none"
+        ),
+        "aggregation_algorithm_version": last.get(
+            "aggregation_algorithm_version", AGGREGATION_ALGORITHM_VERSION
+        ),
+        "run_class": last.get("run_class", "smoke"),
+        "attack_condition": last.get("attack_condition", "clean"),
         "topology": last["topology"],
         "server_model": last["server_model"],
         "client_model": last["client_model"],
+        "architecture_assignment_hash": last.get(
+            "architecture_assignment_hash", ""
+        ),
+        "server_parameter_count": last.get("server_parameter_count", 0),
+        "client_parameter_count": last.get("client_parameter_count", 0),
         "server_device": last["server_device"],
         "client_device": last["client_device"],
         "num_clients": last["num_clients"],
@@ -567,8 +727,6 @@ def _summary_row(
         "admission_method": last["admission_method"],
         "niabd_enabled": last["niabd_enabled"],
         "defense_method": last["defense_method"],
-        "niabd_algorithm_version": last.get("niabd_algorithm_version", ""),
-        "result_schema_version": last.get("result_schema_version", ""),
         "niabd_prototype_update_reason": last.get(
             "niabd_prototype_update_reason", ""
         ),
@@ -595,6 +753,7 @@ def _summary_row(
         "total_teachers_admitted": sum(
             int(row["teachers_admitted"]) for row in rows
         ),
+        "admitted_teachers": int(last.get("admitted_teachers", 0)),
         "total_teachers_rejected": sum(
             int(row["teachers_rejected"]) for row in rows
         ),
@@ -617,12 +776,45 @@ def _summary_row(
         "total_niabd_memory_update_rounds": float(
             rows[-1].get("niabd_memory_update_rounds", np.nan)
         ),
+        "memory_candidate_teachers": last.get(
+            "memory_candidate_teachers", None
+        ),
+        "normal_eligible_teachers": last.get(
+            "normal_eligible_teachers", None
+        ),
+        "drift_recovery_candidates": last.get(
+            "drift_recovery_candidates", None
+        ),
+        "memory_update_teachers": last.get("memory_update_teachers", None),
+        "niabd_memory_update_reason": last.get(
+            "niabd_memory_update_reason", None
+        ),
+        "niabd_observations": last.get("niabd_observations", None),
+        "vcaa_history_size": last.get("vcaa_history_size", None),
+        "niabd_defense_available": last.get(
+            "niabd_defense_available", None
+        ),
+        "niabd_purification_applied": last.get(
+            "niabd_purification_applied", None
+        ),
+        "niabd_memory_updated": last.get("niabd_memory_updated", None),
+        "transaction_id": last.get("transaction_id", None),
+        "transaction_status": last.get("transaction_status", "committed"),
+        "rollback_reason": last.get("rollback_reason", None),
+        "student_snapshot_sha256": last.get(
+            "student_snapshot_sha256", None
+        ),
+        "received_teachers": last.get("received_teachers", 0),
+        "checkpoint_path": last.get("checkpoint_path", None),
+        "checkpoint_sha256": last.get("checkpoint_sha256", None),
         "total_rollbacks": sum(
             int(row["nonfinite_distill_rollbacks"]) for row in rows
         ),
         "total_numeric_failures": max(
             float(row["numeric_failure_count"]) for row in rows
         ),
+        "numeric_failure_count": last.get("numeric_failure_count", 0),
+        "teachers_purified": last.get("teachers_purified", 0),
         "total_client_wire_bytes": process_total("client_wire_bytes"),
         "total_packets_consumed": process_total("packets_consumed"),
         "total_stale_packets": process_total((
@@ -677,6 +869,10 @@ def _summary_row(
             dtype=float,
         )
         peak_index = int(np.argmax(attack_values))
+        contiguous = bool(
+            len(attack_rounds) == 1
+            or np.all(np.diff(attack_rounds.astype(int)) == 1)
+        )
         summary.update({
             "peak_attack_window_basr": float(attack_values[peak_index]),
             "peak_attack_window_round": int(attack_rounds[peak_index]),
@@ -684,7 +880,9 @@ def _summary_row(
                 np.trapz(attack_values, attack_rounds)
                 if len(attack_values) > 1
                 else attack_values[0]
-            ),
+            ) if contiguous else np.nan,
+            "attack_window_auc_contiguous": int(contiguous),
+            "attack_window_round_count": int(len(attack_rounds)),
         })
         last_attack_round = int(attack_rounds[-1])
         recovery_values = [
@@ -703,6 +901,8 @@ def _summary_row(
             "peak_attack_window_basr": np.nan,
             "peak_attack_window_round": np.nan,
             "attack_window_basr_auc": np.nan,
+            "attack_window_auc_contiguous": 0,
+            "attack_window_round_count": 0,
             "post_attack_recovery_basr": np.nan,
         })
     events = [
@@ -802,6 +1002,19 @@ def _admission_rows(
                 "num_clients": int(num_clients),
                 "partition_scheme": str(partition_scheme),
                 "admission_method": method,
+                "vcaa_algorithm_version": _lineage_versions(metrics)[
+                    "vcaa_algorithm_version"
+                ],
+                "vcaa_nonfinite_policy": (
+                    "fail_closed" if method != "none" else "none"
+                ),
+                "result_schema_version": RESULT_SCHEMA_VERSION,
+                "vcaa_history_size": _metric(
+                    metrics, "vcaa_history_size", round_idx - 1, None
+                ),
+                "received_at_s": None,
+                "consumed_at_s": None,
+                "proxy_version": None,
                 **record,
             }
 
@@ -845,6 +1058,36 @@ def _defense_rows(
                     "niabd_prototype_update_reason",
                     round_idx - 1,
                     "",
+                ),
+                "niabd_defense_available": _metric(
+                    metrics, "niabd_defense_available", round_idx - 1, None
+                ),
+                "niabd_purification_applied": _metric(
+                    metrics, "niabd_purification_applied", round_idx - 1, None
+                ),
+                "niabd_memory_updated": _metric(
+                    metrics, "niabd_memory_updated", round_idx - 1, None
+                ),
+                "memory_candidate_teachers": _metric(
+                    metrics,
+                    "niabd_memory_candidate_teachers",
+                    round_idx - 1,
+                    None,
+                ),
+                "normal_eligible_teachers": _metric(
+                    metrics,
+                    "niabd_memory_eligible_teachers",
+                    round_idx - 1,
+                    None,
+                ),
+                "memory_update_teachers": _metric(
+                    metrics, "memory_update_teachers", round_idx - 1, None
+                ),
+                "niabd_observations": _metric(
+                    metrics,
+                    "niabd_eligible_teacher_observations",
+                    round_idx - 1,
+                    None,
                 ),
                 **record,
             }
@@ -965,6 +1208,15 @@ def _runtime_event_rows(
             "partition_scheme": str(partition_scheme),
             "server_device": str(metrics.get("server_device", "")),
             "client_device": str(metrics.get("client_device", "")),
+            "result_schema_version": RESULT_SCHEMA_VERSION,
+            "vcaa_algorithm_version": _lineage_versions(metrics)[
+                "vcaa_algorithm_version"
+            ],
+            "aggregation_algorithm_version": AGGREGATION_ALGORITHM_VERSION,
+            "run_class": str(metrics.get("run_class", "smoke")),
+            "attack_condition": str(
+                metrics.get("attack_condition", "clean")
+            ),
             **event,
         }
 
@@ -1030,6 +1282,89 @@ def _trace_output_path(
     )
 
 
+def _make_checkpoint_callback(
+    *,
+    checkpoint_every_rounds: int,
+    checkpoint_root: str,
+    config_hash: str,
+    rounds: int,
+    runtime: str,
+    run_uid: str,
+    server_model,
+    client_models,
+    admission_controller,
+    defense_controller,
+    attack_plan,
+    data_plan,
+    dataset_name: str,
+    seed: int,
+    server_architecture: str,
+    client_architectures: List[str],
+):
+    if int(checkpoint_every_rounds) <= 0:
+        return None
+
+    def _callback(checkpoint_round: int, current_metrics: dict) -> None:
+        if checkpoint_round % int(checkpoint_every_rounds):
+            current_metrics.setdefault("checkpoint_path", []).append(None)
+            current_metrics.setdefault("checkpoint_sha256", []).append(None)
+            return
+        checkpoint_path = os.path.join(
+            checkpoint_root,
+            f"{run_uid}_round_{checkpoint_round}.pt",
+        )
+        payload = build_checkpoint_payload(
+            current_round=int(checkpoint_round),
+            expected_rounds=int(rounds),
+            run_uid=str(run_uid),
+            config_sha256=str(config_hash),
+            runtime=str(runtime),
+            server_model=server_model,
+            client_models=client_models,
+            admission_controller=admission_controller,
+            defense_controller=defense_controller,
+            attack_plan_state=(
+                {"identity": attack_plan.identity}
+                if attack_plan is not None
+                else None
+            ),
+            data_identity={
+                "dataset": str(dataset_name),
+                "seed": int(seed),
+                "proxy_version": (
+                    str(data_plan.proxy_version)
+                    if data_plan is not None
+                    else ""
+                ),
+                "proxy_size": (
+                    len(data_plan.proxy_indices)
+                    if data_plan is not None
+                    else 0
+                ),
+            },
+            proxy_identity=(
+                {"version": str(data_plan.proxy_version)}
+                if data_plan is not None
+                else None
+            ),
+            architecture_assignment={
+                "server": str(server_architecture),
+                "clients": list(client_architectures),
+            },
+            manifest_identity={"manifest_sha256": str(config_hash)},
+            metrics_state=current_metrics,
+        )
+        checkpoint_sha256 = save_checkpoint_atomic(payload, checkpoint_path)
+        current_metrics.setdefault("checkpoint_path", []).append(
+            checkpoint_path
+        )
+        current_metrics.setdefault("checkpoint_sha256", []).append(
+            checkpoint_sha256
+        )
+
+    return _callback
+
+
 def run_experiment(
     *,
     dataset_path: str,
@@ -1070,8 +1405,19 @@ def run_experiment(
     attack_config: AttackConfig | None = None,
     attack_plan_path: str = "",
     enable_backdoor_diagnostics: bool = False,
+    run_class: str = "smoke",
+    aggregation_rule: str = "mean-soft-probabilities",
+    aggregation_trim_fraction: float = 0.1,
+    server_architecture: str = "resnet18",
+    client_architectures: List[str] | None = None,
+    attack_condition: str = "",
+    checkpoint_every_rounds: int = 0,
+    checkpoint_dir: str = "",
+    resume_from_checkpoint: str = "",
 ) -> None:
     os.makedirs(outdir, exist_ok=True)
+    schema_path = os.path.join(outdir, "result_schema_v3.json")
+    write_schema(schema_path)
     round_csv = os.path.join(
         outdir,
         f"fedagg_experiment_results_{dataset_name}.csv",
@@ -1096,11 +1442,49 @@ def run_experiment(
         outdir,
         f"fedagg_backdoor_defense_{dataset_name}.csv",
     )
+    manifest = {
+        "manifest_version": "fedagg-manifest-v3",
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "run_class": str(run_class),
+        "attack_condition": str(attack_condition or "auto"),
+        "dataset": str(dataset_name),
+        "runtime": str(runtime),
+        "rounds": int(rounds),
+        "seeds": [int(value) for value in seeds],
+        "num_clients_list": [int(value) for value in num_clients_list],
+        "partition_schemes": [str(value) for value in partition_schemes],
+        "aggregation_rule": str(aggregation_rule),
+        "aggregation_trim_fraction": float(aggregation_trim_fraction),
+        "server_architecture": str(server_architecture),
+        "client_architectures": list(client_architectures or []),
+        "formal_config_unchanged": True,
+    }
+    manifest_bytes = json.dumps(
+        manifest, sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    manifest["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    Path(outdir, "run_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     runtime = str(runtime).lower()
     if runtime not in {"sync", "process-semi-async"}:
         raise ValueError(f"Unsupported runtime={runtime!r}.")
     if runtime == "process-semi-async" and process_config is None:
         raise ValueError("process_config is required for process runtime.")
+    if resume_from_checkpoint and runtime != "sync":
+        raise ValueError(
+            "Process-runtime resume is refused until all live client task and "
+            "coordinator state can be restored atomically."
+        )
+    resume_payload = None
+    if resume_from_checkpoint:
+        resume_payload = load_checkpoint(
+            resume_from_checkpoint,
+            expected_config_sha256=str(manifest["manifest_sha256"]),
+            expected_runtime=runtime,
+            expected_rounds=int(rounds),
+        )
     if enable_backdoor_diagnostics and runtime != "sync":
         raise ValueError(
             "Experiment-only backdoor diagnostics currently support only "
@@ -1153,7 +1537,11 @@ def run_experiment(
                 raise ValueError("Every client count must be positive.")
             for partition_scheme in partition_schemes:
                 set_global_seed(seed)
-                run_uid = uuid.uuid4().hex[:12]
+                run_uid = (
+                    str(resume_payload["run_uid"])
+                    if resume_payload is not None
+                    else uuid.uuid4().hex[:12]
+                )
                 print(
                     "\n===== FedAgg server-client run =====\n"
                     f"dataset={dataset_name} seed={seed} clients={num_clients} "
@@ -1273,11 +1661,17 @@ def run_experiment(
                             dataset_name=dataset_name,
                             num_clients=int(num_clients),
                             device=device,
+                            server_architecture=str(server_architecture),
+                            client_architectures=(
+                                client_architectures
+                                if client_architectures is not None
+                                else None
+                            ),
                         )
                     else:
                         assert process_config is not None
                         server_model = build_model(
-                            "resnet18",
+                            str(server_architecture),
                             dataset_name=dataset_name,
                             device=process_config.server_device,
                         )
@@ -1291,6 +1685,43 @@ def run_experiment(
                                 niabd_config
                             )
                         )
+                    effective_client_architectures = (
+                        list(client_architectures)
+                        if client_architectures is not None
+                        else list(process_config.client_architectures)
+                        if runtime == "process-semi-async"
+                        and process_config is not None
+                        and process_config.client_architectures is not None
+                        else [
+                            str(
+                                process_config.client_architecture
+                                if runtime == "process-semi-async"
+                                and process_config is not None
+                                else server_architecture
+                            )
+                        ] * int(num_clients)
+                    )
+                    checkpoint_callback = _make_checkpoint_callback(
+                        checkpoint_every_rounds=int(checkpoint_every_rounds),
+                        checkpoint_root=os.path.abspath(
+                            checkpoint_dir
+                            or os.path.join(outdir, "checkpoints")
+                        ),
+                        config_hash=str(manifest["manifest_sha256"]),
+                        rounds=int(rounds),
+                        runtime=str(runtime),
+                        run_uid=str(run_uid),
+                        server_model=server_model,
+                        client_models=client_models,
+                        admission_controller=admission_controller,
+                        defense_controller=defense_controller,
+                        attack_plan=attack_plan,
+                        data_plan=data_plan,
+                        dataset_name=dataset_name,
+                        seed=int(seed),
+                        server_architecture=str(server_architecture),
+                        client_architectures=effective_client_architectures,
+                    )
                     if runtime == "sync":
                         metrics = run_fedagg_server_client(
                             client_models,
@@ -1312,6 +1743,12 @@ def run_experiment(
                             enable_client_distillation=bool(
                                 enable_client_distillation
                             ),
+                            aggregation_rule=str(aggregation_rule),
+                            aggregation_trim_fraction=float(
+                                aggregation_trim_fraction
+                            ),
+                            checkpoint_callback=checkpoint_callback,
+                            resume_payload=resume_payload,
                             attack_plan=attack_plan,
                             enable_backdoor_diagnostics=bool(
                                 enable_backdoor_diagnostics
@@ -1348,6 +1785,11 @@ def run_experiment(
                                 enable_client_distillation=bool(
                                     enable_client_distillation
                                 ),
+                                aggregation_rule=str(aggregation_rule),
+                                aggregation_trim_fraction=float(
+                                    aggregation_trim_fraction
+                                ),
+                                checkpoint_callback=checkpoint_callback,
                                 attack_plan=attack_plan,
                             )
                         )
@@ -1356,6 +1798,62 @@ def run_experiment(
                         enable_niabd,
                     )
                     metrics["strategy"] = strategy
+                    metrics["run_class"] = str(run_class)
+                    metrics["attack_condition"] = (
+                        str(attack_condition)
+                        if attack_condition
+                        else (
+                            "clean"
+                            if attack_config.attack_type == "none"
+                            else "attacked"
+                        )
+                    )
+                    effective_client_architectures = (
+                        list(client_architectures)
+                        if client_architectures is not None
+                        else list(process_config.client_architectures)
+                        if runtime == "process-semi-async"
+                        and process_config is not None
+                        and process_config.client_architectures is not None
+                        else [
+                            str(
+                                process_config.client_architecture
+                                if runtime == "process-semi-async"
+                                and process_config is not None
+                                else server_architecture
+                            )
+                        ] * int(num_clients)
+                    )
+                    metrics["server_model"] = str(server_architecture)
+                    metrics["client_model"] = ",".join(
+                        effective_client_architectures
+                    )
+                    metrics["architecture_assignment_hash"] = (
+                        architecture_assignment_hash(
+                            server_architecture=str(server_architecture),
+                            client_architectures=effective_client_architectures,
+                        )
+                    )
+                    metrics["server_parameter_count"] = model_parameter_count(
+                        server_model
+                    )
+                    metrics["client_parameter_count"] = (
+                        model_parameter_count(client_models[0])
+                        if client_models is not None
+                        else model_parameter_count(
+                            build_model(
+                                str(
+                                    process_config.client_architecture
+                                    if process_config is not None
+                                    else server_architecture
+                                ),
+                                dataset_name=dataset_name,
+                                device="cpu",
+                            )
+                        )
+                    )
+                    metrics.setdefault("checkpoint_path", [])
+                    metrics.setdefault("checkpoint_sha256", [])
                     metrics["attack_plan_path"] = attack_plan_file
                     metrics["dirichlet_alpha"] = float(dirichlet_alpha)
                     if runtime == "process-semi-async" and runtime_trace_out:
@@ -1529,6 +2027,37 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--proxy-dataset-size", type=int, default=0)
     parser.add_argument("--distill-temperature", type=float, default=2.0)
+    parser.add_argument(
+        "--aggregation-rule",
+        choices=[
+            "mean-soft-probabilities",
+            "median-probabilities",
+            "trimmed-mean-probabilities",
+            "confidence-consistency-filtered-mean",
+        ],
+        default="mean-soft-probabilities",
+    )
+    parser.add_argument("--aggregation-trim-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--server-architecture",
+        choices=["resnet18", "small_cnn", "mobilenet_v2"],
+        default="resnet18",
+    )
+    parser.add_argument(
+        "--client-architectures",
+        default="",
+        help="Optional comma-separated per-client architectures.",
+    )
+    parser.add_argument(
+        "--run-class",
+        choices=["formal", "smoke", "synthetic", "control"],
+        default="smoke",
+    )
+    parser.add_argument(
+        "--attack-condition",
+        choices=["clean", "attacked", "triggered-no-poison"],
+        default="",
+    )
     parser.add_argument(
         "--runtime",
         choices=["sync", "process-semi-async"],
@@ -1766,6 +2295,7 @@ def main() -> None:
         type=float,
         default=0.75,
     )
+    parser.add_argument("--niabd-proxy-chunk-size", type=int, default=0)
     parser.add_argument("--device", default=default_main_device())
     parser.add_argument(
         "--server-device",
@@ -1795,6 +2325,9 @@ def main() -> None:
     parser.add_argument("--strict-numeric-checks", action="store_true")
     parser.add_argument("--outdir", default="experiment_results")
     parser.add_argument("--append", action="store_true")
+    parser.add_argument("--checkpoint-every-rounds", type=int, default=0)
+    parser.add_argument("--checkpoint-dir", default="")
+    parser.add_argument("--resume-from-checkpoint", default="")
     args = parser.parse_args()
 
     enable_vcaa = bool(args.enable_vcaa)
@@ -1871,6 +2404,17 @@ def main() -> None:
         shutdown_timeout_s=args.runtime_shutdown_timeout_s,
         server_device=str(server_device),
         client_device=str(client_device),
+        server_architecture=str(args.server_architecture),
+        client_architecture=(
+            _parse_str_list(args.client_architectures)[0]
+            if _parse_str_list(args.client_architectures)
+            else str(args.server_architecture)
+        ),
+        client_architectures=(
+            tuple(_parse_str_list(args.client_architectures))
+            if args.client_architectures
+            else None
+        ),
         amp=bool(args.amp),
         strict_numeric_checks=args.strict_numeric_checks,
         client_num_workers=args.num_workers,
@@ -1927,6 +2471,7 @@ def main() -> None:
         minimum_consensus_teachers=args.niabd_minimum_consensus_teachers,
         consensus_recovery_fraction=args.niabd_consensus_recovery_fraction,
         threshold_exposure_quantile=args.niabd_threshold_exposure_quantile,
+        proxy_chunk_size=args.niabd_proxy_chunk_size,
     )
 
     run_experiment(
@@ -1972,6 +2517,19 @@ def main() -> None:
         attack_config=attack_config,
         attack_plan_path=args.attack_plan,
         enable_backdoor_diagnostics=args.enable_backdoor_diagnostics,
+        run_class=args.run_class,
+        aggregation_rule=args.aggregation_rule,
+        aggregation_trim_fraction=args.aggregation_trim_fraction,
+        server_architecture=args.server_architecture,
+        client_architectures=(
+            _parse_str_list(args.client_architectures)
+            if args.client_architectures
+            else None
+        ),
+        attack_condition=args.attack_condition,
+        checkpoint_every_rounds=args.checkpoint_every_rounds,
+        checkpoint_dir=args.checkpoint_dir,
+        resume_from_checkpoint=args.resume_from_checkpoint,
     )
 
 

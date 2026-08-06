@@ -17,6 +17,14 @@ _AUTH_REQUIRED_KEYS = {
     "fix_report",
     "tests",
 }
+_AUTH_V3_EXTRA_KEYS = {
+    "algorithm_version_impact",
+    "schema_version_impact",
+    "behavior_change_id",
+}
+_FORMAL_CONFIG_SHA256 = (
+    "7458562ac63faba21497799ea74e98cc7e0a0e21801320386b37704a40e204d9"
+)
 
 
 def sha256(path: Path) -> str:
@@ -55,7 +63,11 @@ def _load_authorizations(
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise SystemExit("FAIL: authorization manifest must be a JSON object.")
-    if document.get("schema_version") != "fedagg-authorized-core-fixes-v1":
+    schema_version = document.get("schema_version")
+    if schema_version not in {
+        "fedagg-authorized-core-fixes-v1",
+        "fedagg-authorized-core-fixes-v3",
+    }:
         raise SystemExit("FAIL: invalid authorization schema_version.")
     entries = document.get("authorized_files")
     if not isinstance(entries, list):
@@ -64,7 +76,10 @@ def _load_authorizations(
     originals = manifest["original_files_sha256"]
     result: Dict[str, dict] = {}
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != _AUTH_REQUIRED_KEYS:
+        required_keys = _AUTH_REQUIRED_KEYS | (
+            _AUTH_V3_EXTRA_KEYS if schema_version.endswith("-v3") else set()
+        )
+        if not isinstance(entry, dict) or set(entry) != required_keys:
             raise SystemExit(
                 "FAIL: every authorization entry must contain exactly "
                 f"{sorted(_AUTH_REQUIRED_KEYS)}."
@@ -155,6 +170,11 @@ def main() -> None:
     if not manifest_path.is_absolute():
         manifest_path = root / manifest_path
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    formal_config = root / "configs" / "main_backdoor_experiment.json"
+    if not formal_config.is_file() or sha256(formal_config) != _FORMAL_CONFIG_SHA256:
+        raise SystemExit(
+            "FAIL: configs/main_backdoor_experiment.json is not byte-identical."
+        )
     originals = manifest["original_files_sha256"]
     missing = [rel for rel in originals if not (root / rel).is_file()]
     if missing:
@@ -174,6 +194,14 @@ def main() -> None:
     critical = manifest[
         "critical_mechanism_files_must_remain_byte_identical"
     ]
+    for rel, authorization in authorizations.items():
+        current = sha256(root / rel)
+        if current != authorization["patched_sha256"]:
+            raise SystemExit(
+                "FAIL: authorized patched hashes do not match:\n"
+                f"{rel}: authorized={authorization['patched_sha256']} "
+                f"current={current}"
+            )
     unauthorized = []
     mismatched_authorizations = []
     for rel in critical:
@@ -202,15 +230,6 @@ def main() -> None:
         raise SystemExit(
             "FAIL: authorized patched hashes do not match:\n" + text
         )
-
-    for rel, authorization in authorizations.items():
-        current = sha256(root / rel)
-        if current != authorization["patched_sha256"]:
-            raise SystemExit(
-                "FAIL: authorized patched hashes do not match:\n"
-                f"{rel}: authorized={authorization['patched_sha256']} "
-                f"current={current}"
-            )
 
     print(
         "PASS: all "
