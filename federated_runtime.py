@@ -199,6 +199,22 @@ def _defense_metrics(
             "anomaly_fraction": float("nan"),
             "mean_suppression": float("nan"),
             "memory_eligible_teachers": float("nan"),
+            "niabd_algorithm_version": "",
+            "result_schema_version": "",
+            "niabd_prototype_update_reason": "",
+            "niabd_memory_candidate_teachers": float("nan"),
+            "niabd_teacher_score_mean": float("nan"),
+            "niabd_teacher_score_median": float("nan"),
+            "niabd_teacher_score_mad": float("nan"),
+            "niabd_high_quantile_deviation": float("nan"),
+            "niabd_mean_excess": float("nan"),
+            "niabd_consensus_deviation": float("nan"),
+            "niabd_current_consensus_drift": float("nan"),
+            "niabd_all_ineligible_round": float("nan"),
+            "niabd_consecutive_frozen_rounds": float("nan"),
+            "niabd_effective_memory_weight": float("nan"),
+            "niabd_eligible_teacher_observations": float("nan"),
+            "niabd_memory_update_rounds": float("nan"),
             "teachers_purified": 0,
             "records": [],
         }
@@ -210,6 +226,12 @@ def _defense_metrics(
             "max_abs_deviation": float(record.max_abs_deviation),
             "mean_suppression": float(record.mean_suppression),
             "memory_eligible": bool(record.memory_eligible),
+            "teacher_memory_score": float(record.teacher_memory_score),
+            "high_quantile_deviation": float(
+                record.high_quantile_deviation
+            ),
+            "mean_excess": float(record.mean_excess),
+            "consensus_deviation": float(record.consensus_deviation),
         }
         for record in result.records
     ]
@@ -239,6 +261,54 @@ def _defense_metrics(
         ),
         "memory_eligible_teachers": int(
             result.metrics.get("memory_eligible_teachers", 0.0)
+        ),
+        "niabd_algorithm_version": str(
+            result.metrics.get("niabd_algorithm_version", "")
+        ),
+        "result_schema_version": str(
+            result.metrics.get("result_schema_version", "")
+        ),
+        "niabd_prototype_update_reason": str(
+            result.metrics.get("niabd_prototype_update_reason", "")
+        ),
+        "niabd_memory_candidate_teachers": float(
+            result.metrics.get("niabd_memory_candidate_teachers", float("nan"))
+        ),
+        "niabd_teacher_score_mean": float(
+            result.metrics.get("niabd_teacher_score_mean", float("nan"))
+        ),
+        "niabd_teacher_score_median": float(
+            result.metrics.get("niabd_teacher_score_median", float("nan"))
+        ),
+        "niabd_teacher_score_mad": float(
+            result.metrics.get("niabd_teacher_score_mad", float("nan"))
+        ),
+        "niabd_high_quantile_deviation": float(
+            result.metrics.get("niabd_high_quantile_deviation", float("nan"))
+        ),
+        "niabd_mean_excess": float(
+            result.metrics.get("niabd_mean_excess", float("nan"))
+        ),
+        "niabd_consensus_deviation": float(
+            result.metrics.get("niabd_consensus_deviation", float("nan"))
+        ),
+        "niabd_current_consensus_drift": float(
+            result.metrics.get("niabd_current_consensus_drift", float("nan"))
+        ),
+        "niabd_all_ineligible_round": float(
+            result.metrics.get("niabd_all_ineligible_round", float("nan"))
+        ),
+        "niabd_consecutive_frozen_rounds": float(
+            result.metrics.get("niabd_consecutive_frozen_rounds", float("nan"))
+        ),
+        "niabd_effective_memory_weight": float(
+            result.metrics.get("niabd_effective_memory_weight", float("nan"))
+        ),
+        "niabd_eligible_teacher_observations": float(
+            result.metrics.get("niabd_eligible_teacher_observations", float("nan"))
+        ),
+        "niabd_memory_update_rounds": float(
+            result.metrics.get("niabd_memory_update_rounds", float("nan"))
         ),
         "teachers_purified": len(result.purified_knowledge),
         "records": records,
@@ -389,6 +459,22 @@ def run_fedagg_server_client(
         "niabd_prototype_updated": [],
         "niabd_prototype_observations": [],
         "niabd_memory_eligible_teachers": [],
+        "niabd_algorithm_version": [],
+        "result_schema_version": [],
+        "niabd_prototype_update_reason": [],
+        "niabd_memory_candidate_teachers": [],
+        "niabd_teacher_score_mean": [],
+        "niabd_teacher_score_median": [],
+        "niabd_teacher_score_mad": [],
+        "niabd_high_quantile_deviation": [],
+        "niabd_mean_excess": [],
+        "niabd_consensus_deviation": [],
+        "niabd_current_consensus_drift": [],
+        "niabd_all_ineligible_round": [],
+        "niabd_consecutive_frozen_rounds": [],
+        "niabd_effective_memory_weight": [],
+        "niabd_eligible_teacher_observations": [],
+        "niabd_memory_update_rounds": [],
         "teacher_defense_records": [],
         "nonfinite_eval_batches": [],
         "nonfinite_distill_rollbacks": [],
@@ -731,6 +817,25 @@ def run_fedagg_server_client(
         metrics["niabd_memory_eligible_teachers"].append(
             float(defense_metrics["memory_eligible_teachers"])
         )
+        for key in (
+            "niabd_algorithm_version",
+            "result_schema_version",
+            "niabd_prototype_update_reason",
+            "niabd_memory_candidate_teachers",
+            "niabd_teacher_score_mean",
+            "niabd_teacher_score_median",
+            "niabd_teacher_score_mad",
+            "niabd_high_quantile_deviation",
+            "niabd_mean_excess",
+            "niabd_consensus_deviation",
+            "niabd_current_consensus_drift",
+            "niabd_all_ineligible_round",
+            "niabd_consecutive_frozen_rounds",
+            "niabd_effective_memory_weight",
+            "niabd_eligible_teacher_observations",
+            "niabd_memory_update_rounds",
+        ):
+            metrics[key].append(defense_metrics[key])
         metrics["teacher_defense_records"].append(
             defense_metrics["records"]
         )

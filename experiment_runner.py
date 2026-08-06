@@ -79,8 +79,10 @@ DEFENSE_COLUMNS = (
     "run_uid", "dataset", "seed", "round", "topology", "num_clients",
     "partition_scheme", "defense_method", "client_id", "anomaly_fraction",
     "mean_abs_deviation", "max_abs_deviation", "mean_suppression",
-    "memory_eligible", "task_id", "packet_id", "source_round",
-    "consumed_round", "version_lag",
+    "memory_eligible", "teacher_memory_score", "high_quantile_deviation",
+    "mean_excess", "consensus_deviation", "niabd_algorithm_version",
+    "result_schema_version", "niabd_prototype_update_reason", "task_id",
+    "packet_id", "source_round", "consumed_round", "version_lag",
 )
 
 RUNTIME_EVENT_COLUMNS = (
@@ -103,7 +105,11 @@ RUNTIME_EVENT_COLUMNS = (
     "rpc_accept_status", "vcaa_version_score", "vcaa_content_score",
     "vcaa_final_score", "vcaa_threshold", "proxy_accuracy",
     "mean_entropy", "mean_kl", "admitted", "niabd_anomaly_fraction",
-    "niabd_mean_suppression", "is_malicious", "attack_active",
+    "niabd_mean_suppression", "niabd_teacher_memory_score",
+    "niabd_high_quantile_deviation", "niabd_mean_excess",
+    "niabd_consensus_deviation", "niabd_memory_eligible",
+    "niabd_algorithm_version", "result_schema_version",
+    "niabd_prototype_update_reason", "is_malicious", "attack_active",
     "poisoned_samples", "eligible_poison_samples", "poisoned_batches",
     "dba_trigger_part", "attack_stats_missing",
 )
@@ -117,7 +123,10 @@ BACKDOOR_COLUMNS = (
     "poisoned_batches", "dba_trigger_part", "attack_stats_missing",
     "admitted", "admission_score", "niabd_anomaly_fraction",
     "niabd_mean_abs_deviation", "niabd_max_abs_deviation",
-    "niabd_mean_suppression", "niabd_memory_eligible", "diagnostic_scope",
+    "niabd_mean_suppression", "niabd_teacher_memory_score",
+    "niabd_high_quantile_deviation", "niabd_mean_excess",
+    "niabd_consensus_deviation", "niabd_memory_eligible",
+    "diagnostic_scope",
     "diagnostic_usage", "diagnostic_reporter_trust", "diagnostic_seed",
     "diagnostic_proxy_samples", "clean_proxy_target_probability",
     "triggered_proxy_target_probability",
@@ -398,6 +407,109 @@ def _round_rows(
                     np.nan,
                 )
             ),
+            "niabd_algorithm_version": str(
+                _metric(metrics, "niabd_algorithm_version", round_idx, "")
+            ),
+            "result_schema_version": str(
+                _metric(metrics, "result_schema_version", round_idx, "")
+            ),
+            "niabd_prototype_update_reason": str(
+                _metric(
+                    metrics,
+                    "niabd_prototype_update_reason",
+                    round_idx,
+                    "",
+                )
+            ),
+            "niabd_memory_candidate_teachers": float(
+                _metric(
+                    metrics,
+                    "niabd_memory_candidate_teachers",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_teacher_score_mean": float(
+                _metric(metrics, "niabd_teacher_score_mean", round_idx, np.nan)
+            ),
+            "niabd_teacher_score_median": float(
+                _metric(
+                    metrics,
+                    "niabd_teacher_score_median",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_teacher_score_mad": float(
+                _metric(metrics, "niabd_teacher_score_mad", round_idx, np.nan)
+            ),
+            "niabd_high_quantile_deviation": float(
+                _metric(
+                    metrics,
+                    "niabd_high_quantile_deviation",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_mean_excess": float(
+                _metric(metrics, "niabd_mean_excess", round_idx, np.nan)
+            ),
+            "niabd_consensus_deviation": float(
+                _metric(
+                    metrics,
+                    "niabd_consensus_deviation",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_current_consensus_drift": float(
+                _metric(
+                    metrics,
+                    "niabd_current_consensus_drift",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_all_ineligible_round": float(
+                _metric(
+                    metrics,
+                    "niabd_all_ineligible_round",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_consecutive_frozen_rounds": float(
+                _metric(
+                    metrics,
+                    "niabd_consecutive_frozen_rounds",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_effective_memory_weight": float(
+                _metric(
+                    metrics,
+                    "niabd_effective_memory_weight",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_eligible_teacher_observations": float(
+                _metric(
+                    metrics,
+                    "niabd_eligible_teacher_observations",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "niabd_memory_update_rounds": float(
+                _metric(
+                    metrics,
+                    "niabd_memory_update_rounds",
+                    round_idx,
+                    np.nan,
+                )
+            ),
             "nonfinite_eval_batches": int(
                 _metric(metrics, "nonfinite_eval_batches", round_idx)
             ),
@@ -455,6 +567,11 @@ def _summary_row(
         "admission_method": last["admission_method"],
         "niabd_enabled": last["niabd_enabled"],
         "defense_method": last["defense_method"],
+        "niabd_algorithm_version": last.get("niabd_algorithm_version", ""),
+        "result_schema_version": last.get("result_schema_version", ""),
+        "niabd_prototype_update_reason": last.get(
+            "niabd_prototype_update_reason", ""
+        ),
         "attack_type": last.get("attack_type", "none"),
         "attack_plan_id": last.get("attack_plan_id", ""),
         "target_label": last.get("target_label", -1),
@@ -493,6 +610,12 @@ def _summary_row(
         "final_niabd_threshold_mean": last["niabd_threshold_mean"],
         "total_niabd_prototype_updates": sum(
             float(row["niabd_prototype_updated"]) for row in rows
+        ),
+        "total_niabd_eligible_teacher_observations": float(
+            rows[-1].get("niabd_eligible_teacher_observations", np.nan)
+        ),
+        "total_niabd_memory_update_rounds": float(
+            rows[-1].get("niabd_memory_update_rounds", np.nan)
         ),
         "total_rollbacks": sum(
             int(row["nonfinite_distill_rollbacks"]) for row in rows
@@ -538,6 +661,50 @@ def _summary_row(
             else np.nan
         ),
     }
+    attack_rows = [
+        row
+        for row in rows
+        if int(row.get("attack_active", 0)) == 1
+        and not pd.isna(row.get("basr_global", np.nan))
+    ]
+    if attack_rows:
+        attack_rounds = np.asarray(
+            [int(row["round"]) for row in attack_rows],
+            dtype=float,
+        )
+        attack_values = np.asarray(
+            [float(row["basr_global"]) for row in attack_rows],
+            dtype=float,
+        )
+        peak_index = int(np.argmax(attack_values))
+        summary.update({
+            "peak_attack_window_basr": float(attack_values[peak_index]),
+            "peak_attack_window_round": int(attack_rounds[peak_index]),
+            "attack_window_basr_auc": float(
+                np.trapz(attack_values, attack_rounds)
+                if len(attack_values) > 1
+                else attack_values[0]
+            ),
+        })
+        last_attack_round = int(attack_rounds[-1])
+        recovery_values = [
+            float(row["basr_global"])
+            for row in rows
+            if int(row["round"]) > last_attack_round
+            and not pd.isna(row.get("basr_global", np.nan))
+        ]
+        summary["post_attack_recovery_basr"] = (
+            float(np.mean(recovery_values))
+            if recovery_values
+            else np.nan
+        )
+    else:
+        summary.update({
+            "peak_attack_window_basr": np.nan,
+            "peak_attack_window_round": np.nan,
+            "attack_window_basr_auc": np.nan,
+            "post_attack_recovery_basr": np.nan,
+        })
     events = [
         event for event in (runtime_events or [])
         if not pd.isna(event.get("version_lag", np.nan))
@@ -661,6 +828,24 @@ def _defense_rows(
                 "num_clients": int(num_clients),
                 "partition_scheme": str(partition_scheme),
                 "defense_method": method,
+                "niabd_algorithm_version": _metric(
+                    metrics,
+                    "niabd_algorithm_version",
+                    round_idx - 1,
+                    "",
+                ),
+                "result_schema_version": _metric(
+                    metrics,
+                    "result_schema_version",
+                    round_idx - 1,
+                    "",
+                ),
+                "niabd_prototype_update_reason": _metric(
+                    metrics,
+                    "niabd_prototype_update_reason",
+                    round_idx - 1,
+                    "",
+                ),
                 **record,
             }
 
@@ -734,6 +919,22 @@ def _backdoor_rows(
                 ),
                 "niabd_mean_suppression": (
                     float(defense["mean_suppression"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_teacher_memory_score": (
+                    float(defense["teacher_memory_score"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_high_quantile_deviation": (
+                    float(defense["high_quantile_deviation"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_mean_excess": (
+                    float(defense["mean_excess"])
+                    if defense is not None else np.nan
+                ),
+                "niabd_consensus_deviation": (
+                    float(defense["consensus_deviation"])
                     if defense is not None else np.nan
                 ),
                 "niabd_memory_eligible": (
@@ -1509,6 +1710,10 @@ def main() -> None:
         "--niabd-benign-deviation-limit",
         type=float,
         default=4.0,
+        help=(
+            "High-quantile history/consensus deviation limit; it is not "
+            "an all-proxy maximum."
+        ),
     )
     parser.add_argument(
         "--niabd-warmup-rounds",
@@ -1524,6 +1729,42 @@ def main() -> None:
         "--niabd-reference-source",
         choices=["prototype", "student"],
         default="prototype",
+    )
+    parser.add_argument(
+        "--niabd-memory-quantile",
+        type=float,
+        default=0.95,
+        help="Teacher-level history/consensus deviation quantile.",
+    )
+    parser.add_argument(
+        "--niabd-maximum-memory-anomaly-fraction",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--niabd-teacher-score-beta",
+        type=float,
+        default=3.0,
+    )
+    parser.add_argument(
+        "--niabd-teacher-score-scale-floor",
+        type=float,
+        default=1e-3,
+    )
+    parser.add_argument(
+        "--niabd-minimum-consensus-teachers",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--niabd-consensus-recovery-fraction",
+        type=float,
+        default=0.75,
+    )
+    parser.add_argument(
+        "--niabd-threshold-exposure-quantile",
+        type=float,
+        default=0.75,
     )
     parser.add_argument("--device", default=default_main_device())
     parser.add_argument(
@@ -1677,6 +1918,15 @@ def main() -> None:
             args.niabd_min_standard_deviation
         ),
         reference_source=args.niabd_reference_source,
+        memory_quantile=args.niabd_memory_quantile,
+        maximum_memory_anomaly_fraction=(
+            args.niabd_maximum_memory_anomaly_fraction
+        ),
+        teacher_score_beta=args.niabd_teacher_score_beta,
+        teacher_score_scale_floor=args.niabd_teacher_score_scale_floor,
+        minimum_consensus_teachers=args.niabd_minimum_consensus_teachers,
+        consensus_recovery_fraction=args.niabd_consensus_recovery_fraction,
+        threshold_exposure_quantile=args.niabd_threshold_exposure_quantile,
     )
 
     run_experiment(

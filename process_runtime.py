@@ -1405,6 +1405,30 @@ def run_fedagg_server_client_process_async(
                     event["niabd_mean_suppression"] = float(
                         record.mean_suppression
                     )
+                    event["niabd_teacher_memory_score"] = float(
+                        record.teacher_memory_score
+                    )
+                    event["niabd_high_quantile_deviation"] = float(
+                        record.high_quantile_deviation
+                    )
+                    event["niabd_mean_excess"] = float(
+                        record.mean_excess
+                    )
+                    event["niabd_consensus_deviation"] = float(
+                        record.consensus_deviation
+                    )
+                    event["niabd_memory_eligible"] = bool(
+                        record.memory_eligible
+                    )
+                    event["niabd_algorithm_version"] = str(
+                        defense_metrics["niabd_algorithm_version"]
+                    )
+                    event["result_schema_version"] = str(
+                        defense_metrics["result_schema_version"]
+                    )
+                    event["niabd_prototype_update_reason"] = str(
+                        defense_metrics["niabd_prototype_update_reason"]
+                    )
 
             server_snapshot = _freeze_state_dict(
                 server.model.state_dict()
@@ -1592,6 +1616,54 @@ def run_fedagg_server_client_process_async(
                 ),
                 "niabd_memory_eligible_teachers": float(
                     defense_metrics["memory_eligible_teachers"]
+                ),
+                "niabd_algorithm_version": str(
+                    defense_metrics["niabd_algorithm_version"]
+                ),
+                "result_schema_version": str(
+                    defense_metrics["result_schema_version"]
+                ),
+                "niabd_prototype_update_reason": str(
+                    defense_metrics["niabd_prototype_update_reason"]
+                ),
+                "niabd_memory_candidate_teachers": float(
+                    defense_metrics["niabd_memory_candidate_teachers"]
+                ),
+                "niabd_teacher_score_mean": float(
+                    defense_metrics["niabd_teacher_score_mean"]
+                ),
+                "niabd_teacher_score_median": float(
+                    defense_metrics["niabd_teacher_score_median"]
+                ),
+                "niabd_teacher_score_mad": float(
+                    defense_metrics["niabd_teacher_score_mad"]
+                ),
+                "niabd_high_quantile_deviation": float(
+                    defense_metrics["niabd_high_quantile_deviation"]
+                ),
+                "niabd_mean_excess": float(
+                    defense_metrics["niabd_mean_excess"]
+                ),
+                "niabd_consensus_deviation": float(
+                    defense_metrics["niabd_consensus_deviation"]
+                ),
+                "niabd_current_consensus_drift": float(
+                    defense_metrics["niabd_current_consensus_drift"]
+                ),
+                "niabd_all_ineligible_round": float(
+                    defense_metrics["niabd_all_ineligible_round"]
+                ),
+                "niabd_consecutive_frozen_rounds": float(
+                    defense_metrics["niabd_consecutive_frozen_rounds"]
+                ),
+                "niabd_effective_memory_weight": float(
+                    defense_metrics["niabd_effective_memory_weight"]
+                ),
+                "niabd_eligible_teacher_observations": float(
+                    defense_metrics["niabd_eligible_teacher_observations"]
+                ),
+                "niabd_memory_update_rounds": float(
+                    defense_metrics["niabd_memory_update_rounds"]
                 ),
                 "nonfinite_eval_batches": int(nonfinite_eval),
                 "nonfinite_distill_rollbacks": int(rollback),

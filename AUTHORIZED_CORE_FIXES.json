@@ -1,0 +1,87 @@
+{
+  "schema_version": "fedagg-authorized-core-fixes-v1",
+  "working_tree_base_commit": "78d4a7b1afbb628fd62bdbef3f479e761c291b58",
+  "authorized_files": [
+    {
+      "file": "README.md",
+      "upstream_sha256": "565c809b1fa7dce1ae86e6ed594f61f6ef853f32614a139eb146de88e42c9ad7",
+      "patched_sha256": "6a7dd8cdf8068b1eba85170f934033873348892f179e68dd9246f68ed85f771e",
+      "reason": "Document proxy-conditioned NIABD v2 semantics, versioned schemas, and validation commands.",
+      "reproducer": "python experiment_runner.py --help and inspect README.md NIABD sections",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_runner_outputs.py", "scripts/check_result_completeness.py"]
+    },
+    {
+      "file": "defense.py",
+      "upstream_sha256": "d764223101fc58f1cc5c468fb17940610465b1fb9cae761bd8d84bf3daa72c4e",
+      "patched_sha256": "a78cdac40f16a72581ac56aaed368e0129774fedcb9873d422135c736b53d01a",
+      "reason": "Expose typed NIABD teacher metrics and non-float result schema values.",
+      "reproducer": "python -m pytest -q tests/test_niabd_v2.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"]
+    },
+    {
+      "file": "experiment_runner.py",
+      "upstream_sha256": "88d3982110cc91af527f0d1a004190b9813351ffcb5469ccb3110160f1c628d4",
+      "patched_sha256": "f52c7e25af782ac8ad1b583f92d6e94084528954e6bfebd51c842e81e99ff3b5",
+      "reason": "Wire NIABD v2 CLI/configuration and versioned round, summary, defense, and backdoor schemas.",
+      "reproducer": "python experiment_runner.py --help",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_runner_outputs.py", "tests/test_simulation.py"]
+    },
+    {
+      "file": "federated_runtime.py",
+      "upstream_sha256": "d07d2b1cf88ab12fcc9d5cb5b90848cd6c19153f1a43d1ecf076208066eecffc",
+      "patched_sha256": "e67a8199219fee535afdca70aa84ee683711668e01bdf2ba73e5792c320c3530",
+      "reason": "Propagate shared NIABD v2 metrics through the synchronous Server-Client FD runtime.",
+      "reproducer": "python -m pytest -q tests/test_simulation.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_simulation.py", "tests/test_backdoor_runtime.py"]
+    },
+    {
+      "file": "niabd.py",
+      "upstream_sha256": "f084bb3698b3277c5ead49df40963f87f13953b0a7d798d69553ea605eb5ee01",
+      "patched_sha256": "af22d37399d0bebfef0d404014ae747208216399a4e66cffa5392abed688a4cb",
+      "reason": "Replace global [C] memory and amax eligibility with proxy-conditioned robust [P,C] memory, safe consensus recovery, and eligible-only threshold updates.",
+      "reproducer": "python -m pytest -q tests/test_niabd.py tests/test_niabd_v2.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"]
+    },
+    {
+      "file": "process_runtime.py",
+      "upstream_sha256": "2acb78cd48e70ae8ff3c1c3d56b2b7a99527307441413198bc36c2b17ce071e5",
+      "patched_sha256": "7d3e6a15cee271ee8b64756ba42c61094432757559ea00c1dc63126203402924",
+      "reason": "Propagate the same NIABD v2 teacher metrics and algorithm lineage through process-semi-async TCP/RPC consumption.",
+      "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py"]
+    },
+    {
+      "file": "scripts/collect_main_backdoor_results.py",
+      "upstream_sha256": "ac2e5339e41c2c4acbdc39e48c2b4cbeec69b6f82e97b3968f98b6c7f292933d",
+      "patched_sha256": "9f640b0cc99a0bc0c47bdac40bf1113c88b13408e087e0245bee7a1a59f6aac9",
+      "reason": "Add version-aware formal result grouping, peak/AUC/recovery statistics, and 95% confidence intervals without modifying old CSVs.",
+      "reproducer": "python scripts/collect_main_backdoor_results.py --indir experiment_results_main_backdoor --expected-runs 240",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["scripts/check_result_completeness.py", "tests/test_runner_outputs.py"]
+    },
+    {
+      "file": "scripts/verify_preserved_main.py",
+      "upstream_sha256": "a5b8b978e3a455ae38527714ec10aa77c0766322dad6e01c31d7538697a80a56",
+      "patched_sha256": "488ef5354d05c29755602223f7819b19bb9c169e963f8cc78ccbeda2142fa403",
+      "reason": "Make preservation fail closed with exact per-file authorization, strict schema validation, and negative-testable hash checks.",
+      "reproducer": "python scripts/verify_preserved_main.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_preservation_verifier.py"]
+    },
+    {
+      "file": "tests/test_niabd.py",
+      "upstream_sha256": "0f221b1680a7f4e39737a06fe0803f5cdbf649a17d8d9c02d363738d5535b669",
+      "patched_sha256": "6c898ff68b1bb6e09521cd1cf1d1c081d0999c95c8033b5dbe415362b24d26e4",
+      "reason": "Update the legacy extreme-teacher regression to assert that excluded abnormal logits cannot potentiate thresholds.",
+      "reproducer": "python -m pytest -q tests/test_niabd.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_niabd.py", "tests/test_niabd_v2.py"]
+    }
+  ]
+}

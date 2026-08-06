@@ -1,5 +1,56 @@
 # FedAgg Server-Client with VCAA and NIABD
 
+## NIABD v2 production semantics
+
+The production implementation uses a proxy-conditioned class-response
+prototype. For teacher logits `Z[k,p,c]`, the persistent memory is
+`prototype_mean[p,c]` and `prototype_variance[p,c]`, both `[P,C]`; adaptive
+`thresholds[c]` remains `[C]`. Proxy samples are never flattened together, so
+the historical response for a fixed proxy query is preserved. `proxy_labels`
+remains in the controller interface for compatibility, but NIABD does not read
+its values; only Server-side VCAA may use the labels.
+
+Eligibility is teacher-level and robust: anomaly fraction, the configured
+`memory_quantile` deviation, mean excess, and current-consensus deviation are
+robust-standardized and combined by their maximum. The legacy
+`benign_deviation_limit` is a high-quantile history/consensus bound, not an
+`amax(P,C)` bound. A single finite outlier therefore receives continuous
+suppression without freezing every teacher. Memory and threshold updates use
+the pre-purification state and only safe memory-eligible raw logits; freeze
+rounds never absorb all teachers or potentiate thresholds.
+
+New CLI controls are:
+
+```text
+--niabd-memory-quantile
+--niabd-maximum-memory-anomaly-fraction
+--niabd-teacher-score-beta
+--niabd-teacher-score-scale-floor
+--niabd-minimum-consensus-teachers
+--niabd-consensus-recovery-fraction
+--niabd-threshold-exposure-quantile
+```
+
+Results identify `niabd-v2-proxy-conditioned-robust-memory` and
+`fedagg-results-v2`. Round and teacher-defense CSVs include the update reason,
+robust teacher metrics, freeze streak, effective memory weight, eligible
+observations, and memory-update rounds. Formal result collection is fail-closed
+and keeps runtime, algorithm version, and result schema in its grouping key:
+
+```powershell
+python scripts\check_result_completeness.py `
+  --indir experiment_results_main_backdoor `
+  --config configs\main_backdoor_experiment.json
+python scripts\collect_main_backdoor_results.py `
+  --indir experiment_results_main_backdoor `
+  --expected-runs 240
+```
+
+The complete CUDA/CoreX procedure is documented in
+`GPU_VALIDATION_RUNBOOK.md`. CPU tests, synthetic logits tests, preservation
+checks, and the 240-job dry-run are validation evidence only; formal CUDA
+training remains unverified until executed on the target device.
+
 当前分支采用服务器—客户端联邦蒸馏结构：
 
 - 中心服务器维护 ResNet-18 全局学生模型。

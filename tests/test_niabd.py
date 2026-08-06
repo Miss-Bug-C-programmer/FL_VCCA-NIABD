@@ -84,9 +84,11 @@ def test_niabd_suppresses_an_extreme_target_logit_and_protects_memory():
     assert float(purified_malicious[:, 2].max()) < 20.0
     assert threshold_before is not None
     assert threshold_after is not None
-    assert float(threshold_after[2]) > float(threshold_before[2])
+    # The abnormal teacher is excluded from threshold exposure.  A malicious
+    # outlier must not potentiate the threshold (threshold poisoning).
+    assert float(threshold_after[2]) <= float(threshold_before[2])
     assert controller.prototype_mean is not None
-    assert float(controller.prototype_mean[2]) < 1.0
+    assert float(controller.prototype_mean[:, 2].mean()) < 1.0
 
 
 def test_niabd_leaves_in_threshold_logits_unchanged():
