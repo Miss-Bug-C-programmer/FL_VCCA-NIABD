@@ -161,6 +161,7 @@ def process_result(tmp_path_factory):
             admission_controller=VersionContentAwareAdmission(
                 VCAAConfig(
                     warmup_rounds=1,
+                    max_version_lag=0,
                     time_unit_s=1.0,
                 )
             ),
@@ -278,6 +279,10 @@ def test_real_slow_client_becomes_stale_and_reaches_vcaa(process_result):
     assert late["received_at_s"] >= late["generated_at_s"]
     assert late["injected_compute_delay_s"] > 0.0
     assert late["transport_status"] in {"accepted", "duplicate"}
+    assert all(event["admitted"] is False for event in stale)
+    assert late["knowledge_age_s"] == pytest.approx(
+        late["consumed_at_s"] - late["generated_at_s"]
+    )
     assert not torch.isnan(torch.tensor(late["vcaa_version_score"]))
     assert not torch.isnan(torch.tensor(late["vcaa_content_score"]))
     assert not torch.isnan(torch.tensor(late["vcaa_final_score"]))

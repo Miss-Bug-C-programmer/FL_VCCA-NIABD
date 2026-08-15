@@ -175,6 +175,7 @@ class FederatedServer:
         temperature: float,
         aggregation_rule: str = "mean-soft-probabilities",
         trim_fraction: float = 0.1,
+        weights: Optional[Sequence[float]] = None,
     ) -> Optional[torch.Tensor]:
         admitted = [int(client_id) for client_id in admitted_client_ids]
         if not admitted:
@@ -190,6 +191,7 @@ class FederatedServer:
             method=str(aggregation_rule),
             temperature=float(temperature),
             trim_fraction=float(trim_fraction),
+            weights=weights,
         )
 
     def train_from_uploaded_logits(
@@ -220,6 +222,7 @@ class FederatedServer:
         *,
         learning_rate: float,
         temperature: float,
+        clean_ce_weight: float = 0.0,
     ) -> bool:
         if target_probabilities is None:
             return False
@@ -234,6 +237,7 @@ class FederatedServer:
             amp=self.amp,
             strict_numeric_checks=self.strict_numeric_checks,
             targets_are_probabilities=True,
+            clean_ce_weight=float(clean_ce_weight),
         )
         return True
 

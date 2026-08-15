@@ -25,6 +25,16 @@ class TeacherDefenseRecord:
     high_quantile_deviation: float = float("nan")
     mean_excess: float = float("nan")
     consensus_deviation: float = float("nan")
+    phase: str = ""
+    round_risk: float = float("nan")
+    risk_ema: float = float("nan")
+    consensus_shift: float = float("nan")
+    eligible_ratio: float = float("nan")
+    trusted_memory_frozen: bool = False
+    trusted_memory_updated: bool = False
+    threshold_update_mode: str = ""
+    reference_trusted_weight: float = float("nan")
+    recovery_stable_rounds: int = 0
 
 
 @dataclass(frozen=True)

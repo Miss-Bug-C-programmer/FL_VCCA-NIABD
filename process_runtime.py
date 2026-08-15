@@ -1173,6 +1173,7 @@ def run_fedagg_server_client_process_async(
     enable_client_distillation: bool = True,
     aggregation_rule: str = "mean-soft-probabilities",
     aggregation_trim_fraction: float = 0.1,
+    clean_ce_weight: float = 0.05,
     checkpoint_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
     attack_plan: Optional[AttackPlan] = None,
 ) -> Dict[str, object]:
@@ -1442,9 +1443,14 @@ def run_fedagg_server_client_process_async(
             candidate_ids = sorted(knowledge_by_client)
             if decision is None:
                 admitted_ids = candidate_ids
+                freshness_valid_ids = list(admitted_ids)
             else:
                 _validate_decision(decision, candidate_ids)
                 admitted_ids = list(decision.admitted_client_ids)
+                freshness_valid_ids = list(
+                    decision.freshness_valid_client_ids
+                    or decision.admitted_client_ids
+                )
             admission_time = time.monotonic() - admission_started
             admission_metrics = _decision_metrics(
                 decision,
@@ -1480,6 +1486,29 @@ def run_fedagg_server_client_process_async(
                     event["mean_kl"] = float(
                         record.components["mean_kl"]
                     )
+                    event["vcaa_hard_valid"] = bool(record.hard_valid)
+                    event["vcaa_hard_rejection_reason"] = str(
+                        record.hard_rejection_reason
+                    )
+                    event["vcaa_absolute_version_valid"] = bool(
+                        record.absolute_version_valid
+                    )
+                    event["vcaa_age_valid"] = bool(record.age_valid)
+                    event["vcaa_freshness_score"] = float(
+                        record.freshness_score
+                    )
+                    event["vcaa_content_reliability"] = float(
+                        record.content_reliability
+                    )
+                    event["vcaa_aggregation_weight"] = float(
+                        record.aggregation_weight
+                    )
+                    event["vcaa_consensus_divergence"] = float(
+                        record.components.get("consensus_divergence", float("nan"))
+                    )
+                    event["vcaa_entropy_deviation"] = float(
+                        record.components.get("entropy_deviation", float("nan"))
+                    )
                     event["admitted"] = bool(record.admitted)
 
             defense_started = time.monotonic()
@@ -1487,7 +1516,11 @@ def run_fedagg_server_client_process_async(
             if knowledge_by_client:
                 defense_result = server.apply_defense(
                     knowledge_by_client,
-                    admitted_client_ids=admitted_ids,
+                    admitted_client_ids=(
+                        freshness_valid_ids
+                        if defense_controller is not None
+                        else admitted_ids
+                    ),
                     current_round=server_round,
                     controller=defense_controller,
                     student_logits=student_snapshot,
@@ -1497,7 +1530,12 @@ def run_fedagg_server_client_process_async(
                     int(item.metadata.client_id): item
                     for item in defense_result.purified_knowledge
                 }
-                if set(purified) != set(admitted_ids):
+                expected_defense_ids = (
+                    freshness_valid_ids
+                    if defense_controller is not None
+                    else admitted_ids
+                )
+                if set(purified) != set(expected_defense_ids):
                     raise RuntimeError(
                         "Defense did not return every admitted teacher."
                     )
@@ -1563,10 +1601,22 @@ def run_fedagg_server_client_process_async(
             aggregation_started = time.monotonic()
             aggregate = server.aggregate_admitted_probabilities(
                 knowledge_by_client,
-                admitted_ids,
+                freshness_valid_ids if defense_result is not None else admitted_ids,
                 temperature=float(distill_temperature),
                 aggregation_rule=str(aggregation_rule),
                 trim_fraction=float(aggregation_trim_fraction),
+                weights=(
+                    [
+                        float(decision.aggregation_weights.get(int(client_id), 1.0))
+                        for client_id in (
+                            freshness_valid_ids
+                            if defense_result is not None
+                            else admitted_ids
+                        )
+                    ]
+                    if decision is not None and decision.aggregation_weights
+                    else None
+                ),
             )
             aggregation_time = time.monotonic() - aggregation_started
             distill_started = time.monotonic()
@@ -1574,6 +1624,12 @@ def run_fedagg_server_client_process_async(
                 aggregate,
                 learning_rate=max(float(learning_rate) * 0.2, 1e-4),
                 temperature=float(distill_temperature),
+                clean_ce_weight=float(
+                    defense_controller.clean_ce_weight()
+                    if defense_controller is not None
+                    and hasattr(defense_controller, "clean_ce_weight")
+                    else clean_ce_weight
+                ),
             )
             distill_time = time.monotonic() - distill_started
             rollback = 0
@@ -1685,8 +1741,12 @@ def run_fedagg_server_client_process_async(
                     latest_server_packet.payload_bytes
                     * len(dispatch.dispatched_clients)
                 ),
-                "server_client_distillations": len(admitted_ids),
-                "server_updates_from_clients": len(admitted_ids),
+                "server_client_distillations": len(
+                    freshness_valid_ids if defense_result is not None else admitted_ids
+                ),
+                "server_updates_from_clients": len(
+                    freshness_valid_ids if defense_result is not None else admitted_ids
+                ),
                 "client_reverse_distillations": sum(
                     1 for event in round_events
                     if int(event["base_server_round"]) >= 0
@@ -1723,6 +1783,12 @@ def run_fedagg_server_client_process_async(
                 "vcaa_kl_mean": float(
                     admission_metrics["kl_mean"]
                 ),
+                "vcaa_hard_rejected": int(admission_metrics.get("hard_rejected", 0)),
+                "vcaa_version_rejected": int(admission_metrics.get("version_rejected", 0)),
+                "vcaa_age_rejected": int(admission_metrics.get("age_rejected", 0)),
+                "vcaa_freshness_score_mean": float(admission_metrics.get("freshness_score_mean", 0.0)),
+                "vcaa_content_reliability_mean": float(admission_metrics.get("content_reliability_mean", 0.0)),
+                "vcaa_aggregation_weight_mean": float(admission_metrics.get("aggregation_weight_mean", 0.0)),
                 "vcaa_history_size": admission_metrics.get(
                     "vcaa_history_size"
                 ),
@@ -1802,6 +1868,16 @@ def run_fedagg_server_client_process_async(
                 "niabd_memory_update_rounds": float(
                     defense_metrics["niabd_memory_update_rounds"]
                 ),
+                "niabd_phase": defense_metrics.get("niabd_phase", ""),
+                "niabd_round_risk": float(defense_metrics.get("niabd_round_risk", _nan())),
+                "niabd_risk_ema": float(defense_metrics.get("niabd_risk_ema", _nan())),
+                "niabd_consensus_shift": float(defense_metrics.get("niabd_consensus_shift", _nan())),
+                "niabd_eligible_ratio": float(defense_metrics.get("niabd_eligible_ratio", _nan())),
+                "niabd_trusted_memory_frozen": defense_metrics.get("niabd_trusted_memory_frozen"),
+                "niabd_trusted_memory_updated": defense_metrics.get("niabd_trusted_memory_updated"),
+                "niabd_threshold_update_mode": defense_metrics.get("niabd_threshold_update_mode", ""),
+                "niabd_reference_trusted_weight": float(defense_metrics.get("niabd_reference_trusted_weight", _nan())),
+                "niabd_recovery_stable_rounds": float(defense_metrics.get("niabd_recovery_stable_rounds", _nan())),
                 "nonfinite_eval_batches": int(nonfinite_eval),
                 "nonfinite_distill_rollbacks": int(rollback),
                 "numeric_failure_count": float(

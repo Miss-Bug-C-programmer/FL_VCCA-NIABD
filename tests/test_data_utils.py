@@ -71,3 +71,41 @@ def test_client_partitions_cover_the_private_training_split(tmp_path):
         )
     finally:
         cleanup_dataloaders(dataloaders)
+
+
+def test_private_dataset_size_uses_a_deterministic_real_split(tmp_path):
+    _write_fake_femnist(tmp_path)
+    first = get_dataloaders(
+        dataset_path=str(tmp_path),
+        dataset_name="femnist",
+        num_clients=2,
+        batch_size=4,
+        seed=7,
+        partition_scheme="iid",
+        proxy_dataset_size=4,
+        val_ratio=0.1,
+        private_dataset_size=20,
+        num_workers=0,
+        auxiliary_num_workers=0,
+    )
+    second = get_dataloaders(
+        dataset_path=str(tmp_path),
+        dataset_name="femnist",
+        num_clients=2,
+        batch_size=4,
+        seed=7,
+        partition_scheme="iid",
+        proxy_dataset_size=4,
+        val_ratio=0.1,
+        private_dataset_size=20,
+        num_workers=0,
+        auxiliary_num_workers=0,
+    )
+    try:
+        assert first["split_sizes"] == second["split_sizes"]
+        assert first["split_sizes"]["proxy"] == 4
+        assert first["split_sizes"]["train"] == 14
+        assert first["split_sizes"]["val"] == 2
+    finally:
+        cleanup_dataloaders(first)
+        cleanup_dataloaders(second)

@@ -154,3 +154,78 @@ def test_niabd_configuration_rejects_invalid_threshold_bounds():
         assert "initial_threshold" in str(exc)
     else:
         raise AssertionError("Expected invalid NIABD thresholds to fail.")
+
+
+def _teachers_from_tensor(values, round_number):
+    return [
+        _knowledge(index, values[index].tolist(), round_number)
+        for index in range(int(values.shape[0]))
+    ]
+
+
+def _run_controller(controller, values, round_number):
+    return controller.purify(
+        teacher_knowledge=_teachers_from_tensor(values, round_number),
+        student_logits=torch.zeros_like(values[0]),
+        proxy_labels=torch.zeros(values.shape[1], dtype=torch.long),
+        current_round=round_number,
+    )
+
+
+def test_niabd_automatically_protects_memory_and_recovers_without_oracle():
+    base = torch.zeros(6, 4, 3)
+    config = NIABDConfig(
+        warmup_rounds=1,
+        minimum_consensus_teachers=4,
+        risk_ema_beta=1.0,
+        risk_on=0.5,
+        risk_off=0.2,
+        onset_patience=1,
+        recovery_patience=1,
+        stable_patience=1,
+        prototype_learning_rate=0.01,
+        recovery_memory_lr=0.5,
+    )
+    controller = NeuroInspiredAdaptiveBackdoorDefense(config)
+    _run_controller(controller, base, 1)
+    trusted_before = controller.trusted_mean
+    assert trusted_before is not None
+    suspicious = _run_controller(controller, base + 0.5, 2)
+    assert controller.phase == "SUSPICIOUS"
+    assert suspicious.metrics["niabd_trusted_memory_frozen"] is True
+    assert torch.allclose(controller.trusted_mean, trusted_before)
+    recovery = _run_controller(controller, base, 3)
+    assert controller.phase == "RECOVERY"
+    assert recovery.metrics["niabd_threshold_update_mode"] == "recovery_clipped_recalibration"
+    normal = _run_controller(controller, base, 4)
+    assert controller.phase == "NORMAL"
+    assert normal.metrics["niabd_recovery_stable_rounds"] == 0
+
+
+def test_niabd_checkpoint_restores_controller_state_and_next_output():
+    base = torch.zeros(6, 4, 3)
+    controller = NeuroInspiredAdaptiveBackdoorDefense(
+        NIABDConfig(
+            warmup_rounds=1,
+            minimum_consensus_teachers=4,
+            risk_ema_beta=1.0,
+            risk_on=0.5,
+            risk_off=0.2,
+            onset_patience=1,
+            recovery_patience=1,
+            stable_patience=1,
+        )
+    )
+    _run_controller(controller, base, 1)
+    _run_controller(controller, base + 0.5, 2)
+    for values, round_number in ((base, 3), (base, 4), (base + 0.5, 5)):
+        snapshot = controller.snapshot_state()
+        restored = NeuroInspiredAdaptiveBackdoorDefense(controller.config)
+        restored.restore_state(snapshot)
+        left = _run_controller(controller, values, round_number)
+        right = _run_controller(restored, values, round_number)
+        assert controller.phase == restored.phase
+        assert controller.risk_ema == restored.risk_ema
+        assert left.metrics == right.metrics
+        for left_item, right_item in zip(left.purified_knowledge, right.purified_knowledge):
+            assert torch.equal(left_item.logits, right_item.logits)

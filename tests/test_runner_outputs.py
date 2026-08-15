@@ -327,3 +327,9 @@ def test_baseline_sync_standard_tables_can_be_header_only(tmp_path: Path):
         assert path.is_file()
         assert tuple(frame.columns) == schemas[schema_name]
         assert frame.empty
+
+    assert "hard_valid" in schemas["admission"]
+    assert "knowledge_age_s" in schemas["admission"]
+    assert "phase" in schemas["defense"]
+    assert "trusted_memory_frozen" in schemas["defense"]
+    assert "vcaa_hard_rejection_reason" in schemas["runtime"]

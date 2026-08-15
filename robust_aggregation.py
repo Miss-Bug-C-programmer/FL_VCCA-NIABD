@@ -41,6 +41,24 @@ def mean_probabilities(logits: Sequence[torch.Tensor], *, temperature: float) ->
     return _validate_simplex(_stack_probabilities(logits, temperature).mean(dim=0))
 
 
+def weighted_mean_probabilities(
+    logits: Sequence[torch.Tensor],
+    *,
+    temperature: float,
+    weights: Sequence[float],
+) -> torch.Tensor:
+    probabilities = _stack_probabilities(logits, temperature)
+    if len(weights) != int(probabilities.shape[0]):
+        raise ValueError("Aggregation weights must match teacher count.")
+    weight_tensor = torch.as_tensor(weights, dtype=probabilities.dtype)
+    if not torch.isfinite(weight_tensor).all() or (weight_tensor < 0).any():
+        raise ValueError("Aggregation weights must be finite and non-negative.")
+    if float(weight_tensor.sum().item()) <= 0.0:
+        raise ValueError("At least one teacher must have positive aggregation weight.")
+    weight_tensor = weight_tensor / weight_tensor.sum()
+    return _validate_simplex((probabilities * weight_tensor.view(-1, 1, 1)).sum(dim=0))
+
+
 def coordinate_median_probabilities(logits: Sequence[torch.Tensor], *, temperature: float) -> torch.Tensor:
     return _validate_simplex(torch.median(_stack_probabilities(logits, temperature), dim=0).values)
 
@@ -98,6 +116,7 @@ def aggregate_probabilities(
     method: str = "mean-soft-probabilities",
     temperature: float = 2.0,
     trim_fraction: float = 0.1,
+    weights: Sequence[float] | None = None,
 ) -> torch.Tensor:
     key = str(method).lower()
     try:
@@ -105,6 +124,10 @@ def aggregate_probabilities(
     except KeyError as exc:
         raise ValueError(f"Unknown probability-space aggregator: {method!r}") from exc
     kwargs = {"temperature": float(temperature)}
+    if weights is not None:
+        if key not in {"mean-soft-probabilities", "mean-probabilities"}:
+            raise ValueError("Soft teacher weights require mean probability aggregation.")
+        return weighted_mean_probabilities(logits, weights=weights, **kwargs)
     if key == "trimmed-mean-probabilities":
         kwargs["trim_fraction"] = float(trim_fraction)
     return aggregator(logits, **kwargs)

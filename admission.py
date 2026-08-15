@@ -35,7 +35,19 @@ class TeacherAdmissionRecord:
     client_id: int
     admitted: bool
     score: float
-    components: Dict[str, float] = field(default_factory=dict)
+    components: Dict[str, float | bool | str | None] = field(
+        default_factory=dict
+    )
+    # ``admitted`` is the compatibility name used by the existing result
+    # tables.  The fields below make the two VCAA stages explicit: freshness
+    # is a hard gate while content is a soft reliability signal.
+    hard_valid: bool = True
+    hard_rejection_reason: str = ""
+    absolute_version_valid: bool = True
+    age_valid: bool = True
+    freshness_score: float = float("nan")
+    content_reliability: float = float("nan")
+    aggregation_weight: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -51,6 +63,8 @@ class AdmissionDecision:
     result_schema_version: str = "fedagg-results-v3"
     nonfinite_policy: str = "fail_closed"
     history_size: int = 0
+    freshness_valid_client_ids: Tuple[int, ...] = ()
+    aggregation_weights: Dict[int, float] = field(default_factory=dict)
 
 
 class TeacherAdmissionController(Protocol):

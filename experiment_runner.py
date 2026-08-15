@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import random
+import subprocess
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -93,6 +94,11 @@ ADMISSION_COLUMNS = (
     "vcaa_algorithm_version", "vcaa_nonfinite_policy",
     "result_schema_version", "vcaa_history_size", "received_at_s",
     "consumed_at_s", "proxy_version",
+    "hard_valid", "hard_rejection_reason", "absolute_version_valid",
+    "age_valid", "freshness_score", "content_reliability",
+    "aggregation_weight", "transport_age_s",
+    "queue_age_s", "consensus_divergence", "entropy_deviation",
+    "strategy", "attack_type",
 )
 
 DEFENSE_COLUMNS = (
@@ -106,7 +112,11 @@ DEFENSE_COLUMNS = (
     "niabd_defense_available", "niabd_purification_applied",
     "niabd_memory_updated", "memory_candidate_teachers",
     "normal_eligible_teachers", "memory_update_teachers",
-    "niabd_observations",
+    "niabd_observations", "phase", "round_risk", "risk_ema",
+    "consensus_shift", "eligible_ratio", "trusted_memory_frozen",
+    "trusted_memory_updated", "threshold_update_mode",
+    "reference_trusted_weight", "recovery_stable_rounds",
+    "strategy", "attack_type",
 )
 
 RUNTIME_EVENT_COLUMNS = (
@@ -137,7 +147,15 @@ RUNTIME_EVENT_COLUMNS = (
     "niabd_algorithm_version",
     "niabd_prototype_update_reason", "is_malicious", "attack_active",
     "poisoned_samples", "eligible_poison_samples", "poisoned_batches",
-    "dba_trigger_part", "attack_stats_missing",
+    "dba_trigger_part", "attack_stats_missing", "phase", "round_risk",
+    "risk_ema", "consensus_shift", "eligible_ratio",
+    "trusted_memory_frozen", "trusted_memory_updated",
+    "threshold_update_mode", "reference_trusted_weight",
+    "recovery_stable_rounds", "vcaa_hard_valid",
+    "vcaa_hard_rejection_reason", "vcaa_absolute_version_valid",
+    "vcaa_age_valid", "vcaa_freshness_score",
+    "vcaa_content_reliability", "vcaa_aggregation_weight",
+    "vcaa_consensus_divergence", "vcaa_entropy_deviation",
 )
 
 BACKDOOR_COLUMNS = (
@@ -160,6 +178,29 @@ BACKDOOR_COLUMNS = (
     "clean_trigger_logit_l2_deviation",
     "clean_trigger_prediction_flip_rate",
 )
+
+
+def _git_reproducibility_metadata() -> dict[str, str | bool]:
+    """Collect immutable run metadata without making git a runtime dependency."""
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return {"git_commit_sha": commit, "git_dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_commit_sha": "unavailable", "git_dirty": "unavailable"}
 
 
 def _parse_int_list(value: str) -> List[int]:
@@ -627,6 +668,34 @@ def _round_rows(
                     np.nan,
                 )
             ),
+            "vcaa_hard_rejected": int(
+                _metric(metrics, "vcaa_hard_rejected", round_idx, 0)
+            ),
+            "vcaa_version_rejected": int(
+                _metric(metrics, "vcaa_version_rejected", round_idx, 0)
+            ),
+            "vcaa_age_rejected": int(
+                _metric(metrics, "vcaa_age_rejected", round_idx, 0)
+            ),
+            "vcaa_freshness_score_mean": float(
+                _metric(metrics, "vcaa_freshness_score_mean", round_idx, np.nan)
+            ),
+            "vcaa_content_reliability_mean": float(
+                _metric(metrics, "vcaa_content_reliability_mean", round_idx, np.nan)
+            ),
+            "vcaa_aggregation_weight_mean": float(
+                _metric(metrics, "vcaa_aggregation_weight_mean", round_idx, np.nan)
+            ),
+            "niabd_phase": _metric(metrics, "niabd_phase", round_idx, ""),
+            "niabd_round_risk": float(_metric(metrics, "niabd_round_risk", round_idx, np.nan)),
+            "niabd_risk_ema": float(_metric(metrics, "niabd_risk_ema", round_idx, np.nan)),
+            "niabd_consensus_shift": float(_metric(metrics, "niabd_consensus_shift", round_idx, np.nan)),
+            "niabd_eligible_ratio": float(_metric(metrics, "niabd_eligible_ratio", round_idx, np.nan)),
+            "niabd_trusted_memory_frozen": _metric(metrics, "niabd_trusted_memory_frozen", round_idx, None),
+            "niabd_trusted_memory_updated": _metric(metrics, "niabd_trusted_memory_updated", round_idx, None),
+            "niabd_threshold_update_mode": _metric(metrics, "niabd_threshold_update_mode", round_idx, ""),
+            "niabd_reference_trusted_weight": float(_metric(metrics, "niabd_reference_trusted_weight", round_idx, np.nan)),
+            "niabd_recovery_stable_rounds": float(_metric(metrics, "niabd_recovery_stable_rounds", round_idx, np.nan)),
             "nonfinite_eval_batches": int(
                 _metric(metrics, "nonfinite_eval_batches", round_idx)
             ),
@@ -664,6 +733,11 @@ def _round_rows(
                 key: _process_metric(metrics, key, round_idx)
                 for key in PROCESS_ONLY_ROUND_FIELDS
             },
+            # Reproducibility metadata is appended after the v3 round schema.
+            "git_commit_sha": str(metrics.get("git_commit_sha", "unavailable")),
+            "git_dirty": metrics.get("git_dirty", "unavailable"),
+            "config_sha256": str(metrics.get("config_sha256", "")),
+            "runtime_profile_sha256": str(metrics.get("runtime_profile_sha256", "")),
         }
 
 
@@ -977,6 +1051,14 @@ def _summary_row(
             "mean_admitted_knowledge_age_s": np.nan,
             "mean_rejected_knowledge_age_s": np.nan,
         })
+    # Keep reproducibility metadata append-only after the historical summary
+    # fields so old readers and column-order-sensitive exports remain stable.
+    summary.update({
+        "git_commit_sha": last.get("git_commit_sha", "unavailable"),
+        "git_dirty": last.get("git_dirty", "unavailable"),
+        "config_sha256": last.get("config_sha256", ""),
+        "runtime_profile_sha256": last.get("runtime_profile_sha256", ""),
+    })
     return summary
 
 
@@ -1002,6 +1084,8 @@ def _admission_rows(
                 "num_clients": int(num_clients),
                 "partition_scheme": str(partition_scheme),
                 "admission_method": method,
+                "strategy": str(metrics.get("strategy", "baseline")),
+                "attack_type": str(metrics.get("attack_type", "none")),
                 "vcaa_algorithm_version": _lineage_versions(metrics)[
                     "vcaa_algorithm_version"
                 ],
@@ -1041,6 +1125,8 @@ def _defense_rows(
                 "num_clients": int(num_clients),
                 "partition_scheme": str(partition_scheme),
                 "defense_method": method,
+                "strategy": str(metrics.get("strategy", "baseline")),
+                "attack_type": str(metrics.get("attack_type", "none")),
                 "niabd_algorithm_version": _metric(
                     metrics,
                     "niabd_algorithm_version",
@@ -1184,6 +1270,46 @@ def _backdoor_rows(
                     bool(defense["memory_eligible"])
                     if defense is not None else np.nan
                 ),
+                "phase": (
+                    str(defense.get("phase", ""))
+                    if defense is not None else ""
+                ),
+                "round_risk": (
+                    float(defense.get("round_risk", np.nan))
+                    if defense is not None else np.nan
+                ),
+                "risk_ema": (
+                    float(defense.get("risk_ema", np.nan))
+                    if defense is not None else np.nan
+                ),
+                "consensus_shift": (
+                    float(defense.get("consensus_shift", np.nan))
+                    if defense is not None else np.nan
+                ),
+                "eligible_ratio": (
+                    float(defense.get("eligible_ratio", np.nan))
+                    if defense is not None else np.nan
+                ),
+                "trusted_memory_frozen": (
+                    bool(defense.get("trusted_memory_frozen", False))
+                    if defense is not None else np.nan
+                ),
+                "trusted_memory_updated": (
+                    bool(defense.get("trusted_memory_updated", False))
+                    if defense is not None else np.nan
+                ),
+                "threshold_update_mode": (
+                    str(defense.get("threshold_update_mode", ""))
+                    if defense is not None else ""
+                ),
+                "reference_trusted_weight": (
+                    float(defense.get("reference_trusted_weight", np.nan))
+                    if defense is not None else np.nan
+                ),
+                "recovery_stable_rounds": (
+                    int(defense.get("recovery_stable_rounds", 0))
+                    if defense is not None else np.nan
+                ),
             }
 
 
@@ -1211,6 +1337,9 @@ def _runtime_event_rows(
             "result_schema_version": RESULT_SCHEMA_VERSION,
             "vcaa_algorithm_version": _lineage_versions(metrics)[
                 "vcaa_algorithm_version"
+            ],
+            "niabd_algorithm_version": _lineage_versions(metrics)[
+                "niabd_algorithm_version"
             ],
             "aggregation_algorithm_version": AGGREGATION_ALGORITHM_VERSION,
             "run_class": str(metrics.get("run_class", "smoke")),
@@ -1390,6 +1519,7 @@ def run_experiment(
     proxy_ratio: float,
     val_ratio: float,
     proxy_dataset_size: int,
+    private_dataset_size: int = 0,
     distill_temperature: float,
     strict_numeric_checks: bool,
     enable_vcaa: bool,
@@ -1408,6 +1538,7 @@ def run_experiment(
     run_class: str = "smoke",
     aggregation_rule: str = "mean-soft-probabilities",
     aggregation_trim_fraction: float = 0.1,
+    clean_ce_weight: float = 0.05,
     server_architecture: str = "resnet18",
     client_architectures: List[str] | None = None,
     attack_condition: str = "",
@@ -1453,6 +1584,7 @@ def run_experiment(
         "seeds": [int(value) for value in seeds],
         "num_clients_list": [int(value) for value in num_clients_list],
         "partition_schemes": [str(value) for value in partition_schemes],
+        "private_dataset_size": int(private_dataset_size),
         "aggregation_rule": str(aggregation_rule),
         "aggregation_trim_fraction": float(aggregation_trim_fraction),
         "server_architecture": str(server_architecture),
@@ -1463,6 +1595,12 @@ def run_experiment(
         manifest, sort_keys=True, ensure_ascii=False
     ).encode("utf-8")
     manifest["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    reproducibility = _git_reproducibility_metadata()
+    runtime_profile_sha256 = ""
+    if runtime_profile and os.path.isfile(runtime_profile):
+        runtime_profile_sha256 = hashlib.sha256(
+            Path(runtime_profile).read_bytes()
+        ).hexdigest()
     Path(outdir, "run_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -1570,6 +1708,11 @@ def run_experiment(
                             if int(proxy_dataset_size) > 0
                             else None
                         ),
+                        private_dataset_size=(
+                            int(private_dataset_size)
+                            if int(private_dataset_size) > 0
+                            else None
+                        ),
                         persistent_workers=bool(persistent_workers),
                         loader_mp_context=(
                             None
@@ -1595,6 +1738,11 @@ def run_experiment(
                         proxy_dataset_size=(
                             int(proxy_dataset_size)
                             if int(proxy_dataset_size) > 0
+                            else None
+                        ),
+                        private_dataset_size=(
+                            int(private_dataset_size)
+                            if int(private_dataset_size) > 0
                             else None
                         ),
                     )
@@ -1747,6 +1895,7 @@ def run_experiment(
                             aggregation_trim_fraction=float(
                                 aggregation_trim_fraction
                             ),
+                            clean_ce_weight=float(clean_ce_weight),
                             checkpoint_callback=checkpoint_callback,
                             resume_payload=resume_payload,
                             attack_plan=attack_plan,
@@ -1789,6 +1938,7 @@ def run_experiment(
                                 aggregation_trim_fraction=float(
                                     aggregation_trim_fraction
                                 ),
+                                clean_ce_weight=float(clean_ce_weight),
                                 checkpoint_callback=checkpoint_callback,
                                 attack_plan=attack_plan,
                             )
@@ -1798,6 +1948,9 @@ def run_experiment(
                         enable_niabd,
                     )
                     metrics["strategy"] = strategy
+                    metrics.update(reproducibility)
+                    metrics["config_sha256"] = str(manifest["manifest_sha256"])
+                    metrics["runtime_profile_sha256"] = runtime_profile_sha256
                     metrics["run_class"] = str(run_class)
                     metrics["attack_condition"] = (
                         str(attack_condition)
@@ -2026,6 +2179,15 @@ def main() -> None:
     parser.add_argument("--proxy-ratio", type=float, default=0.1)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--proxy-dataset-size", type=int, default=0)
+    parser.add_argument(
+        "--private-dataset-size",
+        type=int,
+        default=0,
+        help=(
+            "Optional deterministic real-dataset subset size for smoke/control "
+            "runs; 0 uses the complete private training split."
+        ),
+    )
     parser.add_argument("--distill-temperature", type=float, default=2.0)
     parser.add_argument(
         "--aggregation-rule",
@@ -2177,6 +2339,10 @@ def main() -> None:
     parser.add_argument("--vcaa-time-decay-gamma", type=float, default=0.99)
     parser.add_argument("--vcaa-time-unit-s", type=float, default=60.0)
     parser.add_argument("--vcaa-max-version-lag", type=int, default=1)
+    parser.add_argument("--vcaa-max-knowledge-age-s", type=float, default=0.0)
+    parser.add_argument("--vcaa-age-half-life-s", type=float, default=0.0)
+    parser.add_argument("--vcaa-content-threshold-beta", type=float, default=-1.0)
+    parser.add_argument("--vcaa-consensus-divergence-scale", type=float, default=0.0)
     parser.add_argument("--vcaa-accuracy-weight", type=float, default=0.5)
     parser.add_argument("--vcaa-entropy-weight", type=float, default=0.25)
     parser.add_argument(
@@ -2296,6 +2462,22 @@ def main() -> None:
         default=0.75,
     )
     parser.add_argument("--niabd-proxy-chunk-size", type=int, default=0)
+    parser.add_argument("--niabd-risk-ema-beta", type=float, default=0.30)
+    parser.add_argument("--niabd-risk-on", type=float, default=1.25)
+    parser.add_argument("--niabd-risk-off", type=float, default=0.60)
+    parser.add_argument("--niabd-onset-patience", type=int, default=2)
+    parser.add_argument("--niabd-recovery-patience", type=int, default=2)
+    parser.add_argument("--niabd-stable-patience", type=int, default=2)
+    parser.add_argument("--niabd-memory-clip-z", type=float, default=3.0)
+    parser.add_argument("--niabd-reference-clip-z", type=float, default=2.0)
+    parser.add_argument("--niabd-normal-memory-lr", type=float, default=0.0)
+    parser.add_argument("--niabd-suspicious-memory-lr", type=float, default=0.0)
+    parser.add_argument("--niabd-recovery-memory-lr", type=float, default=0.20)
+    parser.add_argument("--niabd-clean-ce-weight-normal", type=float, default=0.05)
+    parser.add_argument("--niabd-clean-ce-weight-suspicious", type=float, default=0.10)
+    parser.add_argument("--niabd-clean-ce-weight-recovery", type=float, default=0.20)
+    parser.add_argument("--niabd-threshold-upward-step-limit", type=float, default=0.05)
+    parser.add_argument("--clean-ce-weight", type=float, default=0.05)
     parser.add_argument("--device", default=default_main_device())
     parser.add_argument(
         "--server-device",
@@ -2433,6 +2615,22 @@ def main() -> None:
         time_decay_gamma=args.vcaa_time_decay_gamma,
         time_unit_s=args.vcaa_time_unit_s,
         max_version_lag=args.vcaa_max_version_lag,
+        max_knowledge_age_s=(
+            None if float(args.vcaa_max_knowledge_age_s) <= 0.0
+            else float(args.vcaa_max_knowledge_age_s)
+        ),
+        age_half_life_s=(
+            None if float(args.vcaa_age_half_life_s) <= 0.0
+            else float(args.vcaa_age_half_life_s)
+        ),
+        content_threshold_beta=(
+            None if float(args.vcaa_content_threshold_beta) < 0.0
+            else float(args.vcaa_content_threshold_beta)
+        ),
+        consensus_divergence_scale=(
+            None if float(args.vcaa_consensus_divergence_scale) <= 0.0
+            else float(args.vcaa_consensus_divergence_scale)
+        ),
         accuracy_weight=args.vcaa_accuracy_weight,
         entropy_weight=args.vcaa_entropy_weight,
         divergence_weight=args.vcaa_divergence_weight,
@@ -2472,6 +2670,24 @@ def main() -> None:
         consensus_recovery_fraction=args.niabd_consensus_recovery_fraction,
         threshold_exposure_quantile=args.niabd_threshold_exposure_quantile,
         proxy_chunk_size=args.niabd_proxy_chunk_size,
+        risk_ema_beta=args.niabd_risk_ema_beta,
+        risk_on=args.niabd_risk_on,
+        risk_off=args.niabd_risk_off,
+        onset_patience=args.niabd_onset_patience,
+        recovery_patience=args.niabd_recovery_patience,
+        stable_patience=args.niabd_stable_patience,
+        memory_clip_z=args.niabd_memory_clip_z,
+        reference_clip_z=args.niabd_reference_clip_z,
+        normal_memory_lr=(
+            None if float(args.niabd_normal_memory_lr) <= 0.0
+            else float(args.niabd_normal_memory_lr)
+        ),
+        suspicious_memory_lr=args.niabd_suspicious_memory_lr,
+        recovery_memory_lr=args.niabd_recovery_memory_lr,
+        clean_ce_weight_normal=args.niabd_clean_ce_weight_normal,
+        clean_ce_weight_suspicious=args.niabd_clean_ce_weight_suspicious,
+        clean_ce_weight_recovery=args.niabd_clean_ce_weight_recovery,
+        threshold_upward_step_limit=args.niabd_threshold_upward_step_limit,
     )
 
     run_experiment(
@@ -2498,6 +2714,7 @@ def main() -> None:
         proxy_ratio=args.proxy_ratio,
         val_ratio=args.val_ratio,
         proxy_dataset_size=args.proxy_dataset_size,
+        private_dataset_size=args.private_dataset_size,
         distill_temperature=args.distill_temperature,
         strict_numeric_checks=args.strict_numeric_checks,
         enable_vcaa=enable_vcaa,
@@ -2520,6 +2737,7 @@ def main() -> None:
         run_class=args.run_class,
         aggregation_rule=args.aggregation_rule,
         aggregation_trim_fraction=args.aggregation_trim_fraction,
+        clean_ce_weight=args.clean_ce_weight,
         server_architecture=args.server_architecture,
         client_architectures=(
             _parse_str_list(args.client_architectures)

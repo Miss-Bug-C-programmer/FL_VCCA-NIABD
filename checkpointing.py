@@ -158,7 +158,10 @@ def load_checkpoint(
     checkpoint_path = Path(path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    # Checkpoints are produced by this trusted local runner and contain RNG
+    # objects (including NumPy state) that the PyTorch 2.6 weights-only loader
+    # intentionally rejects.
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or payload.get("checkpoint_version") != CHECKPOINT_VERSION:
         raise ValueError("Unsupported or incomplete checkpoint version.")
     if expected_config_sha256 is not None and payload.get("config_sha256") != expected_config_sha256:

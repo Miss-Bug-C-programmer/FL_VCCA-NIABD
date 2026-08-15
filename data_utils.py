@@ -115,6 +115,7 @@ class FederatedDataPlan:
     batch_size: int
     transform_identity: str
     proxy_version: str
+    private_dataset_size: Optional[int] = None
 
     @property
     def num_clients(self) -> int:
@@ -368,16 +369,26 @@ def _loader_kwargs(
     return kwargs
 
 
-def _split_indices(total_size: int, seed: int, val_ratio: float, proxy_ratio: float, proxy_dataset_size: Optional[int]) -> Tuple[List[int], List[int], List[int]]:
+def _split_indices(
+    total_size: int,
+    seed: int,
+    val_ratio: float,
+    proxy_ratio: float,
+    proxy_dataset_size: Optional[int],
+    private_dataset_size: Optional[int] = None,
+) -> Tuple[List[int], List[int], List[int]]:
     indices = list(range(total_size))
     rng = random.Random(int(seed) + 701)
     rng.shuffle(indices)
+    if private_dataset_size is not None and int(private_dataset_size) > 0:
+        indices = indices[:min(int(private_dataset_size), total_size)]
+    pool_size = len(indices)
     if proxy_dataset_size is not None and int(proxy_dataset_size) > 0:
-        proxy_n = min(int(proxy_dataset_size), total_size)
+        proxy_n = min(int(proxy_dataset_size), pool_size)
     else:
-        proxy_n = int(round(total_size * max(0.0, float(proxy_ratio))))
-    remaining = total_size - proxy_n
-    val_n = min(remaining, int(round(total_size * max(0.0, float(val_ratio)))))
+        proxy_n = int(round(pool_size * max(0.0, float(proxy_ratio))))
+    remaining = pool_size - proxy_n
+    val_n = min(remaining, int(round(pool_size * max(0.0, float(val_ratio)))))
     proxy_idx = indices[:proxy_n]
     val_idx = indices[proxy_n: proxy_n + val_n]
     train_idx = indices[proxy_n + val_n:]
@@ -562,6 +573,7 @@ def build_federated_data_plan(
     val_ratio: float = 0.1,
     proxy_ratio: float,
     proxy_dataset_size: Optional[int],
+    private_dataset_size: Optional[int] = None,
 ) -> FederatedDataPlan:
     """Partition once in the parent and return a spawn-serializable plan."""
 
@@ -574,6 +586,7 @@ def build_federated_data_plan(
         float(val_ratio),
         float(proxy_ratio),
         proxy_dataset_size,
+        private_dataset_size,
     )
     partitions = _build_partition(
         trainset=trainset,
@@ -606,6 +619,11 @@ def build_federated_data_plan(
             dataset_name=dataset_name,
             proxy_indices=proxy_idx,
             transform_identity=transform_identity,
+        ),
+        private_dataset_size=(
+            int(private_dataset_size)
+            if private_dataset_size is not None and int(private_dataset_size) > 0
+            else None
         ),
     )
 
@@ -713,6 +731,7 @@ def get_dataloaders(
     val_ratio: float = 0.1,
     proxy_ratio: float = 0.1,
     proxy_dataset_size: Optional[int] = None,
+    private_dataset_size: Optional[int] = None,
     persistent_workers: bool = False,
     loader_mp_context: Optional[str] = None,
     auxiliary_num_workers: int = 0,
@@ -725,7 +744,14 @@ def get_dataloaders(
     np.random.seed(seed_i)
     random.seed(seed_i)
 
-    train_idx, proxy_idx, val_idx = _split_indices(len(trainset), seed_i, val_ratio, proxy_ratio, proxy_dataset_size)
+    train_idx, proxy_idx, val_idx = _split_indices(
+        len(trainset),
+        seed_i,
+        val_ratio,
+        proxy_ratio,
+        proxy_dataset_size,
+        private_dataset_size,
+    )
     partitions = _build_partition(
         trainset=trainset,
         indices=train_idx,

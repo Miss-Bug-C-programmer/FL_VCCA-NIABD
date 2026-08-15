@@ -144,6 +144,12 @@ def _decision_metrics(
             "proxy_accuracy_mean": 0.0,
             "entropy_mean": 0.0,
             "kl_mean": 0.0,
+            "hard_rejected": 0,
+            "version_rejected": 0,
+            "age_rejected": 0,
+            "freshness_score_mean": 0.0,
+            "content_reliability_mean": 0.0,
+            "aggregation_weight_mean": 0.0,
             "records": [],
         }
 
@@ -178,13 +184,38 @@ def _decision_metrics(
         "proxy_accuracy_mean": component_mean("proxy_accuracy"),
         "entropy_mean": component_mean("mean_entropy"),
         "kl_mean": component_mean("mean_kl"),
+        "hard_rejected": sum(not record.hard_valid for record in records),
+        "version_rejected": sum(
+            not record.absolute_version_valid for record in records
+        ),
+        "age_rejected": sum(not record.age_valid for record in records),
+        "freshness_score_mean": float(
+            sum(record.freshness_score for record in records) / len(records)
+        ) if records else 0.0,
+        "content_reliability_mean": float(
+            sum(record.content_reliability for record in records) / len(records)
+        ) if records else 0.0,
+        "aggregation_weight_mean": float(
+            sum(record.aggregation_weight for record in records) / len(records)
+        ) if records else 0.0,
         "records": [
             {
                 "client_id": int(record.client_id),
                 "admitted": bool(record.admitted),
                 "score": float(record.score),
+                "hard_valid": bool(record.hard_valid),
+                "hard_rejection_reason": str(record.hard_rejection_reason),
+                "absolute_version_valid": bool(record.absolute_version_valid),
+                "age_valid": bool(record.age_valid),
+                "freshness_score": float(record.freshness_score),
+                "content_reliability": float(record.content_reliability),
+                "aggregation_weight": float(record.aggregation_weight),
                 **{
-                    str(key): float(value)
+                    str(key): (
+                        float(value)
+                        if isinstance(value, (int, float, bool))
+                        else str(value)
+                    )
                     for key, value in record.components.items()
                 },
             }
@@ -247,6 +278,16 @@ def _defense_metrics(
             "niabd_defense_available": None,
             "niabd_purification_applied": None,
             "niabd_memory_updated": None,
+            "niabd_phase": "",
+            "niabd_round_risk": float("nan"),
+            "niabd_risk_ema": float("nan"),
+            "niabd_consensus_shift": float("nan"),
+            "niabd_eligible_ratio": float("nan"),
+            "niabd_trusted_memory_frozen": None,
+            "niabd_trusted_memory_updated": None,
+            "niabd_threshold_update_mode": "",
+            "niabd_reference_trusted_weight": float("nan"),
+            "niabd_recovery_stable_rounds": float("nan"),
             "teachers_purified": 0,
             "records": [],
         }
@@ -264,6 +305,16 @@ def _defense_metrics(
             ),
             "mean_excess": float(record.mean_excess),
             "consensus_deviation": float(record.consensus_deviation),
+            "phase": str(record.phase),
+            "round_risk": float(record.round_risk),
+            "risk_ema": float(record.risk_ema),
+            "consensus_shift": float(record.consensus_shift),
+            "eligible_ratio": float(record.eligible_ratio),
+            "trusted_memory_frozen": bool(record.trusted_memory_frozen),
+            "trusted_memory_updated": bool(record.trusted_memory_updated),
+            "threshold_update_mode": str(record.threshold_update_mode),
+            "reference_trusted_weight": float(record.reference_trusted_weight),
+            "recovery_stable_rounds": int(record.recovery_stable_rounds),
         }
         for record in result.records
     ]
@@ -351,6 +402,16 @@ def _defense_metrics(
         "niabd_memory_updated": result.metrics.get(
             "niabd_memory_updated", False
         ),
+        "niabd_phase": result.metrics.get("niabd_phase", ""),
+        "niabd_round_risk": float(result.metrics.get("niabd_round_risk", float("nan"))),
+        "niabd_risk_ema": float(result.metrics.get("niabd_risk_ema", float("nan"))),
+        "niabd_consensus_shift": float(result.metrics.get("niabd_consensus_shift", float("nan"))),
+        "niabd_eligible_ratio": float(result.metrics.get("niabd_eligible_ratio", float("nan"))),
+        "niabd_trusted_memory_frozen": result.metrics.get("niabd_trusted_memory_frozen"),
+        "niabd_trusted_memory_updated": result.metrics.get("niabd_trusted_memory_updated"),
+        "niabd_threshold_update_mode": str(result.metrics.get("niabd_threshold_update_mode", "")),
+        "niabd_reference_trusted_weight": float(result.metrics.get("niabd_reference_trusted_weight", float("nan"))),
+        "niabd_recovery_stable_rounds": float(result.metrics.get("niabd_recovery_stable_rounds", float("nan"))),
         "teachers_purified": len(result.purified_knowledge),
         "records": records,
     }
@@ -373,6 +434,7 @@ def run_fedagg_server_client(
     enable_client_distillation: bool = True,
     aggregation_rule: str = "mean-soft-probabilities",
     aggregation_trim_fraction: float = 0.1,
+    clean_ce_weight: float = 0.05,
     attack_plan: Optional[AttackPlan] = None,
     enable_backdoor_diagnostics: bool = False,
     backdoor_diagnostics_dataset: str = "",
@@ -493,6 +555,12 @@ def run_fedagg_server_client(
         "vcaa_proxy_accuracy_mean": [],
         "vcaa_entropy_mean": [],
         "vcaa_kl_mean": [],
+        "vcaa_hard_rejected": [],
+        "vcaa_version_rejected": [],
+        "vcaa_age_rejected": [],
+        "vcaa_freshness_score_mean": [],
+        "vcaa_content_reliability_mean": [],
+        "vcaa_aggregation_weight_mean": [],
         "vcaa_history_size": [],
         "teacher_admission_records": [],
         "teachers_purified": [],
@@ -536,6 +604,16 @@ def run_fedagg_server_client(
         "niabd_defense_available": [],
         "niabd_purification_applied": [],
         "niabd_memory_updated": [],
+        "niabd_phase": [],
+        "niabd_round_risk": [],
+        "niabd_risk_ema": [],
+        "niabd_consensus_shift": [],
+        "niabd_eligible_ratio": [],
+        "niabd_trusted_memory_frozen": [],
+        "niabd_trusted_memory_updated": [],
+        "niabd_threshold_update_mode": [],
+        "niabd_reference_trusted_weight": [],
+        "niabd_recovery_stable_rounds": [],
         "attack_type": (
             attack_plan.config.attack_type if attack_plan is not None else "none"
         ),
@@ -684,12 +762,17 @@ def run_fedagg_server_client(
         )
         if decision is None:
             admitted_ids = [client.client_id for client in clients]
+            freshness_valid_ids = list(admitted_ids)
         else:
             _validate_decision(
                 decision,
                 [client.client_id for client in clients],
             )
             admitted_ids = list(decision.admitted_client_ids)
+            freshness_valid_ids = list(
+                decision.freshness_valid_client_ids
+                or decision.admitted_client_ids
+            )
         admission_time = time.perf_counter() - admission_start
         admission_metrics = _decision_metrics(
             decision,
@@ -698,7 +781,9 @@ def run_fedagg_server_client(
         defense_start = time.perf_counter()
         defense_result = server.apply_defense(
             knowledge_by_client,
-            admitted_client_ids=admitted_ids,
+            admitted_client_ids=(
+                freshness_valid_ids if defense_controller is not None else admitted_ids
+            ),
             current_round=round_number,
             controller=defense_controller,
             student_logits=student_snapshot,
@@ -712,7 +797,14 @@ def run_fedagg_server_client(
                 len(purified_by_id)
                 != len(defense_result.purified_knowledge)
                 or set(purified_by_id)
-                != {int(client_id) for client_id in admitted_ids}
+                != {
+                    int(client_id)
+                    for client_id in (
+                        freshness_valid_ids
+                        if defense_controller is not None
+                        else admitted_ids
+                    )
+                }
             ):
                 raise ValueError(
                     "Defense result must return one purified packet for "
@@ -739,17 +831,33 @@ def run_fedagg_server_client(
         )
 
         distill_start = time.perf_counter()
+        aggregation_ids = (
+            freshness_valid_ids if defense_result is not None else admitted_ids
+        )
+        aggregation_weights = None
+        if decision is not None and decision.aggregation_weights:
+            aggregation_weights = [
+                float(decision.aggregation_weights.get(int(client_id), 1.0))
+                for client_id in aggregation_ids
+            ]
         aggregated_probabilities = server.aggregate_admitted_probabilities(
             knowledge_by_client,
-            admitted_ids,
+            aggregation_ids,
             temperature=float(distill_temperature),
             aggregation_rule=str(aggregation_rule),
             trim_fraction=float(aggregation_trim_fraction),
+            weights=aggregation_weights,
         )
         server_updated = server.train_from_teacher_probabilities(
             aggregated_probabilities,
             learning_rate=distill_lr,
             temperature=float(distill_temperature),
+            clean_ce_weight=float(
+                defense_controller.clean_ce_weight()
+                if defense_controller is not None
+                and hasattr(defense_controller, "clean_ce_weight")
+                else clean_ce_weight
+            ),
         )
         broadcast_bytes = 0
         reverse_distillations = 0
@@ -848,8 +956,8 @@ def run_fedagg_server_client(
             int(sum(packet.payload_bytes for packet in packets))
         )
         metrics["server_broadcast_bytes"].append(int(broadcast_bytes))
-        metrics["server_client_distillations"].append(len(admitted_ids))
-        metrics["server_updates_from_clients"].append(len(admitted_ids))
+        metrics["server_client_distillations"].append(len(aggregation_ids))
+        metrics["server_updates_from_clients"].append(len(aggregation_ids))
         metrics["client_reverse_distillations"].append(
             int(reverse_distillations)
         )
@@ -883,6 +991,24 @@ def run_fedagg_server_client(
         )
         metrics["vcaa_kl_mean"].append(
             float(admission_metrics["kl_mean"])
+        )
+        metrics["vcaa_hard_rejected"].append(
+            int(admission_metrics.get("hard_rejected", 0))
+        )
+        metrics["vcaa_version_rejected"].append(
+            int(admission_metrics.get("version_rejected", 0))
+        )
+        metrics["vcaa_age_rejected"].append(
+            int(admission_metrics.get("age_rejected", 0))
+        )
+        metrics["vcaa_freshness_score_mean"].append(
+            float(admission_metrics.get("freshness_score_mean", 0.0))
+        )
+        metrics["vcaa_content_reliability_mean"].append(
+            float(admission_metrics.get("content_reliability_mean", 0.0))
+        )
+        metrics["vcaa_aggregation_weight_mean"].append(
+            float(admission_metrics.get("aggregation_weight_mean", 0.0))
         )
         metrics["vcaa_history_size"].append(
             admission_metrics.get("vcaa_history_size")
@@ -937,8 +1063,18 @@ def run_fedagg_server_client(
             "niabd_effective_memory_weight",
             "niabd_eligible_teacher_observations",
             "niabd_memory_update_rounds",
+            "niabd_phase",
+            "niabd_round_risk",
+            "niabd_risk_ema",
+            "niabd_consensus_shift",
+            "niabd_eligible_ratio",
+            "niabd_trusted_memory_frozen",
+            "niabd_trusted_memory_updated",
+            "niabd_threshold_update_mode",
+            "niabd_reference_trusted_weight",
+            "niabd_recovery_stable_rounds",
         ):
-            metrics[key].append(defense_metrics[key])
+            metrics[key].append(defense_metrics.get(key))
         metrics["teacher_defense_records"].append(
             defense_metrics["records"]
         )

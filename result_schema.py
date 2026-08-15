@@ -10,9 +10,9 @@ import pandas as pd
 
 
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
-VCAA_ALGORITHM_VERSION = "vcaa-v2.1-transactional-time-aware"
+VCAA_ALGORITHM_VERSION = "vcaa-v3-absolute-freshness-robust-content"
 NIABD_ALGORITHM_VERSION = (
-    "niabd-v2.1-proxy-conditioned-transactional-robust-memory"
+    "niabd-v3-trusted-memory-recovery-controller"
 )
 AGGREGATION_ALGORITHM_VERSION = "aggregation-v1-probability-space"
 
@@ -57,7 +57,18 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("rollback_reason", "string", True, ("*",), ("*",), None, "Round/run rollback reason."),
     MetricSchemaEntry("checkpoint_path", "string", True, ("*",), ("*",), None, "Committed checkpoint path."),
     MetricSchemaEntry("checkpoint_sha256", "string", True, ("*",), ("*",), None, "Committed checkpoint hash."),
+    MetricSchemaEntry("git_commit_sha", "string", True, ("*",), ("*",), None, "Git commit used for the run."),
+    MetricSchemaEntry("git_dirty", "boolean", True, ("*",), ("*",), None, "Whether the source tree was dirty."),
+    MetricSchemaEntry("config_sha256", "string", True, ("*",), ("*",), None, "Run configuration/manifest hash."),
+    MetricSchemaEntry("runtime_profile_sha256", "string", True, ("*",), ("*",), None, "Runtime profile hash when applicable."),
 )
+
+OPTIONAL_BACKWARD_COMPAT_COLUMNS = frozenset({
+    "git_commit_sha",
+    "git_dirty",
+    "config_sha256",
+    "runtime_profile_sha256",
+})
 
 
 def schema_dict() -> dict:
@@ -82,7 +93,13 @@ def algorithm_versions(*, vcaa_enabled: bool, niabd_enabled: bool) -> dict[str, 
 
 
 def required_columns() -> set[str]:
-    return {entry.name for entry in SCHEMA_ENTRIES}
+    # These fields are appended by new runs but are absent from immutable v3
+    # baseline CSVs.  Old frames remain valid and merge with NaN/empty values.
+    return {
+        entry.name
+        for entry in SCHEMA_ENTRIES
+        if entry.name not in OPTIONAL_BACKWARD_COMPAT_COLUMNS
+    }
 
 
 def validate_frame(

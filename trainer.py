@@ -225,6 +225,7 @@ def distill_with_logits(
     numeric_check_interval=0,
     numeric_stats=None,
     targets_are_probabilities=False,
+    clean_ce_weight=0.0,
 ):
     device = normalize_device(device)
     amp_enabled = bool(amp) and use_amp_for_device(device)
@@ -236,10 +237,13 @@ def distill_with_logits(
     for _ in range(int(max(1, epochs))):
         cursor = 0
         for batch_data in dataloader:
+            labels = None
             if isinstance(batch_data, (tuple, list)):
                 if not batch_data:
                     raise ValueError("Distillation batch cannot be empty.")
                 imgs = batch_data[0]
+                if len(batch_data) >= 2:
+                    labels = batch_data[1]
             else:
                 imgs = batch_data
             step += 1
@@ -285,6 +289,20 @@ def distill_with_logits(
                     target_probabilities,
                     reduction='batchmean',
                 ) * (T ** 2)
+                if float(clean_ce_weight) > 0.0:
+                    if labels is None:
+                        raise ValueError(
+                            "clean CE anchoring requires labels in the proxy loader."
+                        )
+                    labels = labels.to(device, non_blocking=True).long()
+                    if int(labels.shape[0]) != int(outputs.shape[0]):
+                        raise ValueError(
+                            "Proxy labels and logits must share the batch cursor."
+                        )
+                    loss = loss + float(clean_ce_weight) * F.cross_entropy(
+                        outputs,
+                        labels,
+                    )
 
             should_check = _should_run_numeric_check(step, strict_numeric_checks, numeric_check_interval)
             if should_check and (not torch.isfinite(loss).item()):

@@ -234,7 +234,7 @@ def build_command(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the formal 3x4x4x5=240 backdoor-defense matrix."
+        description="Run the configured backdoor-defense matrix (partial methods are supported)."
     )
     parser.add_argument(
         "--dataset-roots",
@@ -286,10 +286,15 @@ def main() -> None:
         config["methods"],
         config["seeds"],
     ))
-    expected = 3 * 4 * 4 * 5
+    expected = (
+        len(config["datasets"])
+        * len(config["attacks"])
+        * len(config["methods"])
+        * len(config["seeds"])
+    )
     if len(jobs) != expected:
         raise ValueError(
-            f"Formal matrix must contain exactly {expected} jobs, found {len(jobs)}."
+            f"Configured matrix must contain exactly {expected} jobs, found {len(jobs)}."
         )
     if int(args.limit) > 0:
         jobs = jobs[: int(args.limit)]

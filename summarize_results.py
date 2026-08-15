@@ -54,7 +54,7 @@ METRIC_COLUMNS = [
 
 def summarize(indir: str) -> pd.DataFrame:
     paths = sorted(
-        glob.glob(os.path.join(indir, "fedagg_run_summary_*.csv"))
+        glob.glob(os.path.join(indir, "**", "fedagg_run_summary_*.csv"), recursive=True)
     )
     if not paths:
         raise FileNotFoundError(

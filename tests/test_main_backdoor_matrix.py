@@ -47,6 +47,22 @@ def test_formal_main_matrix_is_exactly_240_jobs():
     assert config["dirichlet_alpha"] == 0.5
 
 
+def test_supplement_matrix_supports_only_updated_strategies():
+    config = json.loads(
+        Path("configs/main_backdoor_supplement_vcaa_niabd.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    jobs = list(product(
+        config["datasets"],
+        config["attacks"],
+        config["methods"],
+        config["seeds"],
+    ))
+    assert config["methods"] == ["vcaa", "niabd", "vcaa-niabd"]
+    assert len(jobs) == 60
+
+
 @pytest.mark.parametrize(
     "loader",
     [load_control_roots, load_matrix_roots],
