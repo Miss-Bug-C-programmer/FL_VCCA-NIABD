@@ -252,7 +252,7 @@ def test_proxy_task_and_client_view_do_not_expose_admission_labels(
     assert all(
         not torch.isnan(torch.tensor(event["proxy_accuracy"]))
         for event in metrics["runtime_events"]
-        if _consumed(event)
+        if _consumed(event) and event.get("vcaa_hard_valid", True)
     )
 
 
@@ -284,8 +284,21 @@ def test_real_slow_client_becomes_stale_and_reaches_vcaa(process_result):
         late["consumed_at_s"] - late["generated_at_s"]
     )
     assert not torch.isnan(torch.tensor(late["vcaa_version_score"]))
-    assert not torch.isnan(torch.tensor(late["vcaa_content_score"]))
+    # VCAA v4 excludes hard-invalid packets before Stage-B consensus, so
+    # content fields for this stale packet are intentionally NaN.
+    assert torch.isnan(torch.tensor(late["vcaa_content_score"]))
+    assert torch.isnan(torch.tensor(late["vcaa_normalized_aggregation_weight"]))
+    assert late["vcaa_final_score_used_for_weighting"] is False
     assert not torch.isnan(torch.tensor(late["vcaa_final_score"]))
+    fresh_event = next(event for event in fresh if event["admitted"] is True)
+    assert not torch.isnan(
+        torch.tensor(fresh_event["vcaa_normalized_aggregation_weight"])
+    )
+    assert fresh_event["vcaa_weighting_mode"] in {
+        "warmup_uniform",
+        "robust_relative_sigmoid",
+        "small_cohort_uniform",
+    }
     assert any(
         event["vcaa_version_score"] != late["vcaa_version_score"]
         for event in fresh

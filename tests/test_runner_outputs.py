@@ -333,3 +333,30 @@ def test_baseline_sync_standard_tables_can_be_header_only(tmp_path: Path):
     assert "phase" in schemas["defense"]
     assert "trusted_memory_frozen" in schemas["defense"]
     assert "vcaa_hard_rejection_reason" in schemas["runtime"]
+    assert schemas["round"][-13:-9] == (
+        "git_commit_sha",
+        "git_dirty",
+        "config_sha256",
+        "runtime_profile_sha256",
+    )
+    assert schemas["round"][-9:] == (
+        "vcaa_freshness_valid_teachers",
+        "vcaa_effective_teacher_count",
+        "vcaa_weight_cv",
+        "vcaa_weight_total_variation_from_uniform",
+        "vcaa_content_reliability_saturation_fraction",
+        "vcaa_content_score_center",
+        "vcaa_content_score_scale",
+        "vcaa_content_threshold_role",
+        "vcaa_threshold_used_for_weighting",
+    )[-9:]
+    assert schemas["admission"][-8:] == (
+        "content_score_center",
+        "content_score_scale",
+        "content_score_z",
+        "normalized_aggregation_weight",
+        "effective_weight_ratio_to_uniform",
+        "weighting_mode",
+        "vcaa_threshold_used_for_weighting",
+        "vcaa_final_score_used_for_weighting",
+    )

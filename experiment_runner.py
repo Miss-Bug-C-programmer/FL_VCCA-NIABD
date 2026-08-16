@@ -98,7 +98,11 @@ ADMISSION_COLUMNS = (
     "age_valid", "freshness_score", "content_reliability",
     "aggregation_weight", "transport_age_s",
     "queue_age_s", "consensus_divergence", "entropy_deviation",
-    "strategy", "attack_type",
+    "strategy", "attack_type", "content_score_center",
+    "content_score_scale", "content_score_z",
+    "normalized_aggregation_weight", "effective_weight_ratio_to_uniform",
+    "weighting_mode", "vcaa_threshold_used_for_weighting",
+    "vcaa_final_score_used_for_weighting",
 )
 
 DEFENSE_COLUMNS = (
@@ -156,6 +160,11 @@ RUNTIME_EVENT_COLUMNS = (
     "vcaa_age_valid", "vcaa_freshness_score",
     "vcaa_content_reliability", "vcaa_aggregation_weight",
     "vcaa_consensus_divergence", "vcaa_entropy_deviation",
+    "vcaa_content_score_center", "vcaa_content_score_scale",
+    "vcaa_content_score_z", "vcaa_normalized_aggregation_weight",
+    "vcaa_effective_weight_ratio_to_uniform", "vcaa_weighting_mode",
+    "vcaa_threshold_used_for_weighting",
+    "vcaa_final_score_used_for_weighting",
 )
 
 BACKDOOR_COLUMNS = (
@@ -738,6 +747,54 @@ def _round_rows(
             "git_dirty": metrics.get("git_dirty", "unavailable"),
             "config_sha256": str(metrics.get("config_sha256", "")),
             "runtime_profile_sha256": str(metrics.get("runtime_profile_sha256", "")),
+            # VCAA v4 fields are appended after the historical round schema.
+            "vcaa_freshness_valid_teachers": int(
+                _metric(metrics, "vcaa_freshness_valid_teachers", round_idx, 0)
+            ),
+            "vcaa_effective_teacher_count": float(
+                _metric(metrics, "vcaa_effective_teacher_count", round_idx, np.nan)
+            ),
+            "vcaa_weight_cv": float(
+                _metric(metrics, "vcaa_weight_cv", round_idx, np.nan)
+            ),
+            "vcaa_weight_total_variation_from_uniform": float(
+                _metric(
+                    metrics,
+                    "vcaa_weight_total_variation_from_uniform",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "vcaa_content_reliability_saturation_fraction": float(
+                _metric(
+                    metrics,
+                    "vcaa_content_reliability_saturation_fraction",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "vcaa_content_score_center": float(
+                _metric(metrics, "vcaa_content_score_center", round_idx, np.nan)
+            ),
+            "vcaa_content_score_scale": float(
+                _metric(metrics, "vcaa_content_score_scale", round_idx, np.nan)
+            ),
+            "vcaa_content_threshold_role": str(
+                _metric(
+                    metrics,
+                    "vcaa_content_threshold_role",
+                    round_idx,
+                    "diagnostic_only",
+                )
+            ),
+            "vcaa_threshold_used_for_weighting": bool(
+                _metric(
+                    metrics,
+                    "vcaa_threshold_used_for_weighting",
+                    round_idx,
+                    False,
+                )
+            ),
         }
 
 
@@ -2343,6 +2400,14 @@ def main() -> None:
     parser.add_argument("--vcaa-age-half-life-s", type=float, default=0.0)
     parser.add_argument("--vcaa-content-threshold-beta", type=float, default=-1.0)
     parser.add_argument("--vcaa-consensus-divergence-scale", type=float, default=0.0)
+    parser.add_argument("--vcaa-content-scale-floor", type=float, default=0.05)
+    parser.add_argument("--vcaa-reliability-temperature", type=float, default=1.0)
+    parser.add_argument("--vcaa-reliability-z-cap", type=float, default=6.0)
+    parser.add_argument(
+        "--vcaa-minimum-content-cohort-size",
+        type=int,
+        default=3,
+    )
     parser.add_argument("--vcaa-accuracy-weight", type=float, default=0.5)
     parser.add_argument("--vcaa-entropy-weight", type=float, default=0.25)
     parser.add_argument(
@@ -2631,6 +2696,10 @@ def main() -> None:
             None if float(args.vcaa_consensus_divergence_scale) <= 0.0
             else float(args.vcaa_consensus_divergence_scale)
         ),
+        content_scale_floor=args.vcaa_content_scale_floor,
+        reliability_temperature=args.vcaa_reliability_temperature,
+        reliability_z_cap=args.vcaa_reliability_z_cap,
+        minimum_content_cohort_size=args.vcaa_minimum_content_cohort_size,
         accuracy_weight=args.vcaa_accuracy_weight,
         entropy_weight=args.vcaa_entropy_weight,
         divergence_weight=args.vcaa_divergence_weight,

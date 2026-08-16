@@ -64,6 +64,34 @@ def test_probability_aggregators_are_simplex_and_fail_closed():
         aggregate_probabilities(bad)
 
 
+def test_weighted_probability_aggregation_uses_relative_weights_only():
+    teachers = [
+        torch.tensor([[4.0, -4.0]]),
+        torch.tensor([[-4.0, 4.0]]),
+        torch.tensor([[1.0, -1.0]]),
+    ]
+    equal_one = aggregate_probabilities(
+        teachers,
+        method="mean-soft-probabilities",
+        temperature=1.0,
+        weights=[1.0, 1.0, 1.0],
+    )
+    equal_small = aggregate_probabilities(
+        teachers,
+        method="mean-soft-probabilities",
+        temperature=1.0,
+        weights=[0.2, 0.2, 0.2],
+    )
+    skewed = aggregate_probabilities(
+        teachers,
+        method="mean-soft-probabilities",
+        temperature=1.0,
+        weights=[1.0, 1.0, 0.1],
+    )
+    assert torch.allclose(equal_one, equal_small)
+    assert not torch.allclose(equal_one, skewed)
+
+
 def test_niabd_chunking_is_equivalent_and_memory_state_is_proxy_bound():
     knowledge = _knowledge()
     config = NIABDConfig(

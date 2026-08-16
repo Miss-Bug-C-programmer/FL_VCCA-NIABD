@@ -5,13 +5,20 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from result_schema import RESULT_SCHEMA_VERSION, validate_frame
+from result_schema import (
+    RESULT_SCHEMA_VERSION,
+    VCAA_ALGORITHM_VERSION,
+    VCAA_V4_ADMISSION_COLUMNS,
+    VCAA_V4_RUNTIME_COLUMNS,
+    validate_frame,
+)
 
 
 _TABLE_PREFIXES = {
@@ -122,6 +129,107 @@ def _validate_auxiliary_frame(
         values = frame[column].astype(str).str.strip()
         if values.eq("").any() or values.eq("nan").any():
             raise ValueError(f"{path.name} contains empty {column} values.")
+    v4 = frame[
+        frame.get("vcaa_algorithm_version", pd.Series(index=frame.index))
+        .astype(str)
+        .eq(VCAA_ALGORITHM_VERSION)
+    ]
+    if v4.empty:
+        return
+    if kind == "admission":
+        missing = sorted(VCAA_V4_ADMISSION_COLUMNS - set(frame.columns))
+        if missing:
+            raise ValueError(
+                f"{path.name} is missing VCAA v4 admission columns: {missing}"
+            )
+        _validate_v4_admission_frame(v4, path=path)
+    elif kind == "runtime":
+        missing = sorted(VCAA_V4_RUNTIME_COLUMNS - set(frame.columns))
+        if missing:
+            raise ValueError(
+                f"{path.name} is missing VCAA v4 runtime columns: {missing}"
+            )
+
+
+def _as_bool(series: pd.Series) -> pd.Series:
+    values = series.astype(str).str.strip().str.lower()
+    return values.isin({"true", "1", "1.0"})
+
+
+def _validate_v4_admission_frame(
+    frame: pd.DataFrame,
+    *,
+    path: Path,
+) -> None:
+    hard_valid = _as_bool(frame["hard_valid"])
+    raw = pd.to_numeric(frame["aggregation_weight"], errors="coerce")
+    normalized = pd.to_numeric(
+        frame["normalized_aggregation_weight"],
+        errors="coerce",
+    )
+    ratio = pd.to_numeric(
+        frame["effective_weight_ratio_to_uniform"],
+        errors="coerce",
+    )
+    final_score_used = _as_bool(frame["vcaa_final_score_used_for_weighting"])
+    reliability = pd.to_numeric(
+        frame["content_reliability"],
+        errors="coerce",
+    )
+    if raw[hard_valid].isna().any() or (raw[hard_valid] <= 0.0).any():
+        raise ValueError(f"{path.name} has invalid VCAA v4 raw valid weights.")
+    if normalized[hard_valid].isna().any() or (normalized[hard_valid] <= 0.0).any():
+        raise ValueError(
+            f"{path.name} has invalid VCAA v4 normalized valid weights."
+        )
+    if ratio[hard_valid].isna().any() or (ratio[hard_valid] <= 0.0).any():
+        raise ValueError(
+            f"{path.name} has invalid VCAA v4 uniform contribution ratios."
+        )
+    if reliability[hard_valid].isna().any():
+        raise ValueError(
+            f"{path.name} has missing VCAA v4 content reliability for valid teachers."
+        )
+    if (reliability[hard_valid] <= 0.0).any() or (reliability[hard_valid] > 1.0).any():
+        raise ValueError(
+            f"{path.name} has out-of-range VCAA v4 content reliability."
+        )
+    if final_score_used.any():
+        raise ValueError(
+            f"{path.name} incorrectly uses the legacy final_score for weighting."
+        )
+    if raw[~hard_valid].notna().any() and (raw[~hard_valid].fillna(0.0) != 0.0).any():
+        raise ValueError(f"{path.name} assigns raw weight to a hard-invalid teacher.")
+    if normalized[~hard_valid].notna().any() and (
+        normalized[~hard_valid].fillna(0.0) != 0.0
+    ).any():
+        raise ValueError(
+            f"{path.name} assigns normalized weight to a hard-invalid teacher."
+        )
+    for (run_uid, round_id), group in frame.groupby(
+        ["run_uid", "round"], dropna=False
+    ):
+        valid = _as_bool(group["hard_valid"])
+        if not valid.any():
+            continue
+        normalized_sum = pd.to_numeric(
+            group.loc[valid, "normalized_aggregation_weight"],
+            errors="coerce",
+        ).sum()
+        if not math.isclose(float(normalized_sum), 1.0, rel_tol=1e-5, abs_tol=1e-5):
+            raise ValueError(
+                f"{path.name} normalized VCAA weights do not sum to one "
+                f"for run={run_uid}, round={round_id}."
+            )
+        ratio_mean = pd.to_numeric(
+            group.loc[valid, "effective_weight_ratio_to_uniform"],
+            errors="coerce",
+        ).mean()
+        if not math.isclose(float(ratio_mean), 1.0, rel_tol=1e-5, abs_tol=1e-5):
+            raise ValueError(
+                f"{path.name} VCAA uniform contribution ratios are not centered "
+                f"at one for run={run_uid}, round={round_id}."
+            )
 
 
 def main() -> None:

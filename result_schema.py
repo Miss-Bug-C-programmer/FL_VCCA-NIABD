@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
@@ -10,11 +11,45 @@ import pandas as pd
 
 
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
-VCAA_ALGORITHM_VERSION = "vcaa-v3-absolute-freshness-robust-content"
+VCAA_ALGORITHM_VERSION = "vcaa-v4-fresh-first-robust-relative-weighting"
 NIABD_ALGORITHM_VERSION = (
     "niabd-v3-trusted-memory-recovery-controller"
 )
 AGGREGATION_ALGORITHM_VERSION = "aggregation-v1-probability-space"
+
+VCAA_V4_ROUND_COLUMNS = frozenset({
+    "vcaa_freshness_valid_teachers",
+    "vcaa_effective_teacher_count",
+    "vcaa_weight_cv",
+    "vcaa_weight_total_variation_from_uniform",
+    "vcaa_content_reliability_saturation_fraction",
+    "vcaa_content_score_center",
+    "vcaa_content_score_scale",
+    "vcaa_content_threshold_role",
+    "vcaa_threshold_used_for_weighting",
+})
+
+VCAA_V4_ADMISSION_COLUMNS = frozenset({
+    "content_score_center",
+    "content_score_scale",
+    "content_score_z",
+    "normalized_aggregation_weight",
+    "effective_weight_ratio_to_uniform",
+    "weighting_mode",
+    "vcaa_threshold_used_for_weighting",
+    "vcaa_final_score_used_for_weighting",
+})
+
+VCAA_V4_RUNTIME_COLUMNS = frozenset({
+    "vcaa_content_score_center",
+    "vcaa_content_score_scale",
+    "vcaa_content_score_z",
+    "vcaa_normalized_aggregation_weight",
+    "vcaa_effective_weight_ratio_to_uniform",
+    "vcaa_weighting_mode",
+    "vcaa_threshold_used_for_weighting",
+    "vcaa_final_score_used_for_weighting",
+})
 
 
 @dataclass(frozen=True)
@@ -152,6 +187,61 @@ def validate_frame(
             values = frame[column].dropna().astype(str)
             if any(value and len(value) != 64 for value in values):
                 raise ValueError(f"{column} contains an invalid SHA-256 value.")
+    vcaa_v4_rows = frame[
+        frame["vcaa_algorithm_version"].astype(str)
+        == VCAA_ALGORITHM_VERSION
+    ]
+    # The v4 diagnostics below are round-level fields.  Summary rows carry
+    # the same algorithm lineage but intentionally retain their compact,
+    # historical summary schema.
+    if not vcaa_v4_rows.empty and "round" in frame.columns:
+        missing_v4 = sorted(VCAA_V4_ROUND_COLUMNS - set(frame.columns))
+        if missing_v4:
+            raise ValueError(
+                "VCAA v4 round result is missing columns: "
+                f"{missing_v4}"
+            )
+        valid_counts = pd.to_numeric(
+            vcaa_v4_rows["vcaa_freshness_valid_teachers"],
+            errors="coerce",
+        )
+        if valid_counts.isna().any() or (valid_counts < 0).any():
+            raise ValueError("VCAA v4 freshness-valid teacher counts are invalid.")
+        ess = pd.to_numeric(
+            vcaa_v4_rows["vcaa_effective_teacher_count"],
+            errors="coerce",
+        )
+        cv = pd.to_numeric(vcaa_v4_rows["vcaa_weight_cv"], errors="coerce")
+        tv = pd.to_numeric(
+            vcaa_v4_rows["vcaa_weight_total_variation_from_uniform"],
+            errors="coerce",
+        )
+        saturation = pd.to_numeric(
+            vcaa_v4_rows["vcaa_content_reliability_saturation_fraction"],
+            errors="coerce",
+        )
+        observed = valid_counts > 0
+        for name, values in (
+            ("ESS", ess),
+            ("weight CV", cv),
+            ("weight TV", tv),
+            ("saturation", saturation),
+        ):
+            observed_values = values[observed]
+            if observed_values.isna().any() or not observed_values.map(
+                lambda value: math.isfinite(float(value))
+            ).all():
+                raise ValueError(
+                    f"VCAA v4 {name} diagnostics must be finite."
+                )
+        if (ess[observed] < 1.0).any():
+            raise ValueError("VCAA v4 ESS must be at least one.")
+        if (ess[observed] > valid_counts[observed] + 1e-5).any():
+            raise ValueError("VCAA v4 ESS exceeds freshness-valid teacher count.")
+        if (cv[observed] < 0.0).any() or (tv[observed] < 0.0).any():
+            raise ValueError("VCAA v4 weight dispersion diagnostics are negative.")
+        if (saturation[observed] < 0.0).any() or (saturation[observed] > 1.0).any():
+            raise ValueError("VCAA v4 saturation fraction is outside [0, 1].")
     if method is not None:
         method = str(method).lower()
         expected_vcaa = VCAA_ALGORITHM_VERSION if method in {"vcaa", "vcaa-niabd"} else "none"

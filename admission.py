@@ -48,6 +48,12 @@ class TeacherAdmissionRecord:
     freshness_score: float = float("nan")
     content_reliability: float = float("nan")
     aggregation_weight: float = float("nan")
+    content_score_center: float = float("nan")
+    content_score_scale: float = float("nan")
+    content_score_z: float = float("nan")
+    normalized_aggregation_weight: float = float("nan")
+    effective_weight_ratio_to_uniform: float = float("nan")
+    weighting_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,17 @@ class AdmissionDecision:
     history_size: int = 0
     freshness_valid_client_ids: Tuple[int, ...] = ()
     aggregation_weights: Dict[int, float] = field(default_factory=dict)
+    normalized_aggregation_weights: Dict[int, float] = field(
+        default_factory=dict
+    )
+    effective_teacher_count: float = float("nan")
+    weight_cv: float = float("nan")
+    weight_total_variation_from_uniform: float = float("nan")
+    content_reliability_saturation_fraction: float = float("nan")
+    content_score_center: float = float("nan")
+    content_score_scale: float = float("nan")
+    content_threshold_role: str = "diagnostic_only"
+    vcaa_threshold_used_for_weighting: bool = False
 
 
 class TeacherAdmissionController(Protocol):

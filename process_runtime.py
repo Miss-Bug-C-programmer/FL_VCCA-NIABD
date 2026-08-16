@@ -59,6 +59,7 @@ from rpc_transport import (
     RpcServer,
     rpc_call,
 )
+from result_schema import VCAA_ALGORITHM_VERSION
 from runtime_trace import RuntimeTrace
 from trainer import distill_with_logits, local_train, predict_logits
 
@@ -1503,6 +1504,26 @@ def run_fedagg_server_client_process_async(
                     event["vcaa_aggregation_weight"] = float(
                         record.aggregation_weight
                     )
+                    event["vcaa_content_score_center"] = float(
+                        record.content_score_center
+                    )
+                    event["vcaa_content_score_scale"] = float(
+                        record.content_score_scale
+                    )
+                    event["vcaa_content_score_z"] = float(
+                        record.content_score_z
+                    )
+                    event["vcaa_normalized_aggregation_weight"] = float(
+                        record.normalized_aggregation_weight
+                    )
+                    event["vcaa_effective_weight_ratio_to_uniform"] = float(
+                        record.effective_weight_ratio_to_uniform
+                    )
+                    event["vcaa_weighting_mode"] = str(record.weighting_mode)
+                    event["vcaa_threshold_used_for_weighting"] = bool(
+                        decision.vcaa_threshold_used_for_weighting
+                    )
+                    event["vcaa_final_score_used_for_weighting"] = False
                     event["vcaa_consensus_divergence"] = float(
                         record.components.get("consensus_divergence", float("nan"))
                     )
@@ -1599,24 +1620,33 @@ def run_fedagg_server_client_process_async(
                     )
 
             aggregation_started = time.monotonic()
-            aggregate = server.aggregate_admitted_probabilities(
-                knowledge_by_client,
-                freshness_valid_ids if defense_result is not None else admitted_ids,
-                temperature=float(distill_temperature),
-                aggregation_rule=str(aggregation_rule),
-                trim_fraction=float(aggregation_trim_fraction),
-                weights=(
-                    [
-                        float(decision.aggregation_weights.get(int(client_id), 1.0))
+            aggregation_weights = None
+            if (
+                decision is not None
+                and str(decision.method).lower() == "vcaa"
+                and str(decision.algorithm_version)
+                == VCAA_ALGORITHM_VERSION
+            ):
+                try:
+                    aggregation_weights = [
+                        float(decision.aggregation_weights[int(client_id)])
                         for client_id in (
                             freshness_valid_ids
                             if defense_result is not None
                             else admitted_ids
                         )
                     ]
-                    if decision is not None and decision.aggregation_weights
-                    else None
-                ),
+                except KeyError as exc:
+                    raise ValueError(
+                        "VCAA aggregation weight is missing for an aggregation ID."
+                    ) from exc
+            aggregate = server.aggregate_admitted_probabilities(
+                knowledge_by_client,
+                freshness_valid_ids if defense_result is not None else admitted_ids,
+                temperature=float(distill_temperature),
+                aggregation_rule=str(aggregation_rule),
+                trim_fraction=float(aggregation_trim_fraction),
+                weights=aggregation_weights,
             )
             aggregation_time = time.monotonic() - aggregation_started
             distill_started = time.monotonic()
@@ -1789,6 +1819,37 @@ def run_fedagg_server_client_process_async(
                 "vcaa_freshness_score_mean": float(admission_metrics.get("freshness_score_mean", 0.0)),
                 "vcaa_content_reliability_mean": float(admission_metrics.get("content_reliability_mean", 0.0)),
                 "vcaa_aggregation_weight_mean": float(admission_metrics.get("aggregation_weight_mean", 0.0)),
+                "vcaa_freshness_valid_teachers": int(
+                    admission_metrics.get("freshness_valid_teachers", 0)
+                ),
+                "vcaa_effective_teacher_count": float(
+                    admission_metrics.get("effective_teacher_count", float("nan"))
+                ),
+                "vcaa_weight_cv": float(
+                    admission_metrics.get("weight_cv", float("nan"))
+                ),
+                "vcaa_weight_total_variation_from_uniform": float(
+                    admission_metrics.get(
+                        "weight_total_variation_from_uniform", float("nan")
+                    )
+                ),
+                "vcaa_content_reliability_saturation_fraction": float(
+                    admission_metrics.get(
+                        "content_reliability_saturation_fraction", float("nan")
+                    )
+                ),
+                "vcaa_content_score_center": float(
+                    admission_metrics.get("content_score_center", float("nan"))
+                ),
+                "vcaa_content_score_scale": float(
+                    admission_metrics.get("content_score_scale", float("nan"))
+                ),
+                "vcaa_content_threshold_role": str(
+                    admission_metrics.get("content_threshold_role", "diagnostic_only")
+                ),
+                "vcaa_threshold_used_for_weighting": bool(
+                    admission_metrics.get("vcaa_threshold_used_for_weighting", False)
+                ),
                 "vcaa_history_size": admission_metrics.get(
                     "vcaa_history_size"
                 ),

@@ -14,6 +14,8 @@ from scripts.validate_v3_results import (
     _validate_auxiliary_frame,
 )
 
+LEGACY_VCAA_ALGORITHM_VERSION = "vcaa-v3-absolute-freshness-robust-content"
+
 
 def test_v3_validator_classifies_all_exported_tables():
     assert _table_kind(Path("fedagg_experiment_results_cifar10.csv")) == "round"
@@ -36,7 +38,7 @@ def test_v3_validator_classifies_all_exported_tables():
                 "admission_method": "vcaa",
                 "client_id": 0,
                 "admitted": True,
-                "vcaa_algorithm_version": VCAA_ALGORITHM_VERSION,
+                    "vcaa_algorithm_version": LEGACY_VCAA_ALGORITHM_VERSION,
                 "result_schema_version": RESULT_SCHEMA_VERSION,
             },
         ),
@@ -60,7 +62,7 @@ def test_v3_validator_classifies_all_exported_tables():
                 "task_id": "task-1",
                 "packet_id": "packet-1",
                 "result_schema_version": RESULT_SCHEMA_VERSION,
-                "vcaa_algorithm_version": VCAA_ALGORITHM_VERSION,
+                    "vcaa_algorithm_version": LEGACY_VCAA_ALGORITHM_VERSION,
                 "aggregation_algorithm_version": AGGREGATION_ALGORITHM_VERSION,
                 "run_class": "formal",
                 "attack_condition": "attacked",
@@ -96,3 +98,32 @@ def test_v3_validator_accepts_narrow_auxiliary_tables(kind, filename, extra):
         kind=kind,
     )
 
+
+def test_v4_admission_validator_checks_normalized_contribution_fields():
+    row = {
+        "run_uid": "run-v4",
+        "dataset": "cifar10",
+        "seed": 0,
+        "round": 1,
+        "admission_method": "vcaa",
+        "client_id": 0,
+        "admitted": True,
+        "hard_valid": True,
+        "aggregation_weight": 1.0,
+        "content_reliability": 0.5,
+        "normalized_aggregation_weight": 1.0,
+        "effective_weight_ratio_to_uniform": 1.0,
+        "content_score_center": 0.5,
+        "content_score_scale": 0.05,
+        "content_score_z": 0.0,
+        "weighting_mode": "robust_relative_sigmoid",
+        "vcaa_threshold_used_for_weighting": False,
+        "vcaa_final_score_used_for_weighting": False,
+        "vcaa_algorithm_version": VCAA_ALGORITHM_VERSION,
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+    }
+    _validate_auxiliary_frame(
+        pd.DataFrame([row]),
+        path=Path("fedagg_teacher_admission_cifar10.csv"),
+        kind="admission",
+    )

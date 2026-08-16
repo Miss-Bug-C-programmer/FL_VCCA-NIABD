@@ -23,6 +23,7 @@ from admission import (
 from defense import DefenseResult, KnowledgeDefenseController
 from federated_client import FederatedClient
 from federated_server import FederatedServer
+from result_schema import VCAA_ALGORITHM_VERSION
 
 
 def _freeze_state_dict(state_dict: dict) -> dict:
@@ -150,6 +151,15 @@ def _decision_metrics(
             "freshness_score_mean": 0.0,
             "content_reliability_mean": 0.0,
             "aggregation_weight_mean": 0.0,
+            "freshness_valid_teachers": 0,
+            "effective_teacher_count": float("nan"),
+            "weight_cv": float("nan"),
+            "weight_total_variation_from_uniform": float("nan"),
+            "content_reliability_saturation_fraction": float("nan"),
+            "content_score_center": float("nan"),
+            "content_score_scale": float("nan"),
+            "content_threshold_role": "diagnostic_only",
+            "vcaa_threshold_used_for_weighting": False,
             "records": [],
         }
 
@@ -160,8 +170,18 @@ def _decision_metrics(
             float(record.components[key])
             for record in records
             if key in record.components
+            and isinstance(record.components[key], (int, float, bool))
+            and math.isfinite(float(record.components[key]))
         ]
-        return float(sum(values) / len(values)) if values else 0.0
+        return float(sum(values) / len(values)) if values else float("nan")
+
+    def record_mean(attribute: str) -> float:
+        values = [
+            float(getattr(record, attribute))
+            for record in records
+            if math.isfinite(float(getattr(record, attribute)))
+        ]
+        return float(sum(values) / len(values)) if values else float("nan")
 
     admitted = len(decision.admitted_client_ids)
     return {
@@ -177,7 +197,7 @@ def _decision_metrics(
         "score_mean": (
             float(sum(record.score for record in records) / len(records))
             if records
-            else 0.0
+            else float("nan")
         ),
         "version_score_mean": component_mean("version_score"),
         "content_score_mean": component_mean("content_score"),
@@ -189,15 +209,24 @@ def _decision_metrics(
             not record.absolute_version_valid for record in records
         ),
         "age_rejected": sum(not record.age_valid for record in records),
-        "freshness_score_mean": float(
-            sum(record.freshness_score for record in records) / len(records)
-        ) if records else 0.0,
-        "content_reliability_mean": float(
-            sum(record.content_reliability for record in records) / len(records)
-        ) if records else 0.0,
-        "aggregation_weight_mean": float(
-            sum(record.aggregation_weight for record in records) / len(records)
-        ) if records else 0.0,
+        "freshness_score_mean": record_mean("freshness_score"),
+        "content_reliability_mean": record_mean("content_reliability"),
+        "aggregation_weight_mean": record_mean("aggregation_weight"),
+        "freshness_valid_teachers": len(decision.freshness_valid_client_ids),
+        "effective_teacher_count": float(decision.effective_teacher_count),
+        "weight_cv": float(decision.weight_cv),
+        "weight_total_variation_from_uniform": float(
+            decision.weight_total_variation_from_uniform
+        ),
+        "content_reliability_saturation_fraction": float(
+            decision.content_reliability_saturation_fraction
+        ),
+        "content_score_center": float(decision.content_score_center),
+        "content_score_scale": float(decision.content_score_scale),
+        "content_threshold_role": str(decision.content_threshold_role),
+        "vcaa_threshold_used_for_weighting": bool(
+            decision.vcaa_threshold_used_for_weighting
+        ),
         "records": [
             {
                 "client_id": int(record.client_id),
@@ -210,6 +239,16 @@ def _decision_metrics(
                 "freshness_score": float(record.freshness_score),
                 "content_reliability": float(record.content_reliability),
                 "aggregation_weight": float(record.aggregation_weight),
+                "content_score_center": float(record.content_score_center),
+                "content_score_scale": float(record.content_score_scale),
+                "content_score_z": float(record.content_score_z),
+                "normalized_aggregation_weight": float(
+                    record.normalized_aggregation_weight
+                ),
+                "effective_weight_ratio_to_uniform": float(
+                    record.effective_weight_ratio_to_uniform
+                ),
+                "weighting_mode": str(record.weighting_mode),
                 **{
                     str(key): (
                         float(value)
@@ -240,6 +279,48 @@ def _validate_decision(
         raise ValueError(
             "Admission decision must classify every client exactly once."
         )
+    freshness_valid = set(decision.freshness_valid_client_ids)
+    if not freshness_valid.issubset(expected):
+        raise ValueError(
+            "Admission decision contains an unknown freshness-valid client."
+        )
+    if (
+        str(decision.method).lower() == "vcaa"
+        and str(decision.algorithm_version)
+        == VCAA_ALGORITHM_VERSION
+    ):
+        if admitted != freshness_valid:
+            raise ValueError(
+                "VCAA admitted IDs must equal the freshness-valid IDs."
+            )
+        raw_ids = set(decision.aggregation_weights)
+        normalized_ids = set(decision.normalized_aggregation_weights)
+        if raw_ids != freshness_valid or normalized_ids != freshness_valid:
+            raise ValueError(
+                "VCAA aggregation weights must exactly cover freshness-valid IDs."
+            )
+        raw_weights = list(decision.aggregation_weights.values())
+        normalized_weights = list(
+            decision.normalized_aggregation_weights.values()
+        )
+        if any(
+            not math.isfinite(float(weight)) or float(weight) <= 0.0
+            for weight in raw_weights
+        ):
+            raise ValueError("VCAA raw aggregation weights must be finite and positive.")
+        if any(
+            not math.isfinite(float(weight)) or float(weight) < 0.0
+            for weight in normalized_weights
+        ):
+            raise ValueError(
+                "VCAA normalized aggregation weights must be finite and non-negative."
+            )
+        if raw_weights and not math.isclose(
+            sum(normalized_weights), 1.0, rel_tol=1e-5, abs_tol=1e-5
+        ):
+            raise ValueError(
+                "VCAA normalized aggregation weights must sum to one."
+            )
 
 
 def _defense_metrics(
@@ -561,6 +642,15 @@ def run_fedagg_server_client(
         "vcaa_freshness_score_mean": [],
         "vcaa_content_reliability_mean": [],
         "vcaa_aggregation_weight_mean": [],
+        "vcaa_freshness_valid_teachers": [],
+        "vcaa_effective_teacher_count": [],
+        "vcaa_weight_cv": [],
+        "vcaa_weight_total_variation_from_uniform": [],
+        "vcaa_content_reliability_saturation_fraction": [],
+        "vcaa_content_score_center": [],
+        "vcaa_content_score_scale": [],
+        "vcaa_content_threshold_role": [],
+        "vcaa_threshold_used_for_weighting": [],
         "vcaa_history_size": [],
         "teacher_admission_records": [],
         "teachers_purified": [],
@@ -835,11 +925,20 @@ def run_fedagg_server_client(
             freshness_valid_ids if defense_result is not None else admitted_ids
         )
         aggregation_weights = None
-        if decision is not None and decision.aggregation_weights:
-            aggregation_weights = [
-                float(decision.aggregation_weights.get(int(client_id), 1.0))
-                for client_id in aggregation_ids
-            ]
+        if (
+            decision is not None
+            and str(decision.method).lower() == "vcaa"
+            and str(decision.algorithm_version) == VCAA_ALGORITHM_VERSION
+        ):
+            try:
+                aggregation_weights = [
+                    float(decision.aggregation_weights[int(client_id)])
+                    for client_id in aggregation_ids
+                ]
+            except KeyError as exc:
+                raise ValueError(
+                    "VCAA aggregation weight is missing for an aggregation ID."
+                ) from exc
         aggregated_probabilities = server.aggregate_admitted_probabilities(
             knowledge_by_client,
             aggregation_ids,
@@ -1009,6 +1108,41 @@ def run_fedagg_server_client(
         )
         metrics["vcaa_aggregation_weight_mean"].append(
             float(admission_metrics.get("aggregation_weight_mean", 0.0))
+        )
+        metrics["vcaa_freshness_valid_teachers"].append(
+            int(admission_metrics.get("freshness_valid_teachers", 0))
+        )
+        metrics["vcaa_effective_teacher_count"].append(
+            float(admission_metrics.get("effective_teacher_count", float("nan")))
+        )
+        metrics["vcaa_weight_cv"].append(
+            float(admission_metrics.get("weight_cv", float("nan")))
+        )
+        metrics["vcaa_weight_total_variation_from_uniform"].append(
+            float(
+                admission_metrics.get(
+                    "weight_total_variation_from_uniform", float("nan")
+                )
+            )
+        )
+        metrics["vcaa_content_reliability_saturation_fraction"].append(
+            float(
+                admission_metrics.get(
+                    "content_reliability_saturation_fraction", float("nan")
+                )
+            )
+        )
+        metrics["vcaa_content_score_center"].append(
+            float(admission_metrics.get("content_score_center", float("nan")))
+        )
+        metrics["vcaa_content_score_scale"].append(
+            float(admission_metrics.get("content_score_scale", float("nan")))
+        )
+        metrics["vcaa_content_threshold_role"].append(
+            str(admission_metrics.get("content_threshold_role", "diagnostic_only"))
+        )
+        metrics["vcaa_threshold_used_for_weighting"].append(
+            bool(admission_metrics.get("vcaa_threshold_used_for_weighting", False))
         )
         metrics["vcaa_history_size"].append(
             admission_metrics.get("vcaa_history_size")

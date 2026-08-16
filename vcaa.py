@@ -4,7 +4,7 @@ import math
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -18,7 +18,7 @@ from admission import (
 from numeric_integrity import require_finite_tensor
 
 
-VCAA_ALGORITHM_VERSION = "vcaa-v3-absolute-freshness-robust-content"
+VCAA_ALGORITHM_VERSION = "vcaa-v4-fresh-first-robust-relative-weighting"
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
 _ROBUST_MAD_SCALE = 1.4826
 
@@ -53,6 +53,10 @@ class VCAAConfig:
     age_half_life_s: Optional[float] = None
     content_threshold_beta: Optional[float] = None
     consensus_divergence_scale: Optional[float] = None
+    content_scale_floor: float = 0.05
+    reliability_temperature: float = 1.0
+    reliability_z_cap: float = 6.0
+    minimum_content_cohort_size: int = 3
 
     def __post_init__(self) -> None:
         if not 0.0 <= float(self.version_weight) <= 1.0:
@@ -92,6 +96,15 @@ class VCAAConfig:
             raise ValueError("content_threshold_beta must be non-negative.")
         if int(self.warmup_rounds) < 0:
             raise ValueError("warmup_rounds must be non-negative.")
+        for name, value in (
+            ("content_scale_floor", self.content_scale_floor),
+            ("reliability_temperature", self.reliability_temperature),
+            ("reliability_z_cap", self.reliability_z_cap),
+        ):
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if int(self.minimum_content_cohort_size) < 1:
+            raise ValueError("minimum_content_cohort_size must be at least 1.")
         if float(self.epsilon) <= 0.0:
             raise ValueError("epsilon must be positive.")
         if self.nonfinite_policy not in {"fail_closed", "sanitize_and_record"}:
@@ -177,6 +190,11 @@ class VersionContentAwareAdmission:
             round_number, scores = item
             if not isinstance(scores, (list, tuple)):
                 raise ValueError("VCAA snapshot scores are invalid.")
+            if any(
+                not math.isfinite(float(score))
+                for score in scores
+            ):
+                raise ValueError("VCAA snapshot scores must be finite.")
             self._history.append(
                 (int(round_number), tuple(float(score) for score in scores))
             )
@@ -238,9 +256,12 @@ class VersionContentAwareAdmission:
                 ):
                     age_valid = False
                     timestamp_reason = "invalid_timestamp_order"
-            elif math.isfinite(received):
-                # Required fallback when a consumer timestamp is unavailable.
-                transport_age = received - generated
+            else:
+                # Required fallback when a consumer timestamp is unavailable:
+                # evaluate the packet's lineage against the controller clock,
+                # never against receipt time alone.
+                if math.isfinite(received):
+                    transport_age = received - generated
                 knowledge_age = now - generated
                 if (
                     transport_age < -float(self.config.epsilon)
@@ -378,6 +399,83 @@ class VersionContentAwareAdmission:
             )
         return results
 
+    @staticmethod
+    def _content_score(content_stats: Dict[str, float], config: VCAAConfig) -> float:
+        score = (
+            float(config.accuracy_weight) * content_stats["accuracy_term"]
+            + float(config.entropy_weight) * content_stats["entropy_term"]
+            + float(config.divergence_weight) * content_stats["divergence_term"]
+        )
+        if not math.isfinite(float(score)):
+            raise ValueError("VCAA content score must be finite.")
+        return max(0.0, min(1.0, float(score)))
+
+    @staticmethod
+    def _robust_scale(values: Sequence[float]) -> float:
+        finite = [float(value) for value in values if math.isfinite(float(value))]
+        if not finite:
+            return 0.0
+        center = float(statistics.median(finite))
+        mad = float(statistics.median(abs(value - center) for value in finite))
+        return float(_ROBUST_MAD_SCALE * mad)
+
+    def _calibration_statistics(
+        self,
+        content_scores: Sequence[float],
+    ) -> Tuple[float, float]:
+        if not content_scores:
+            return float("nan"), float("nan")
+        center = float(statistics.median(content_scores))
+        current_scale = self._robust_scale(content_scores)
+        historical_scales = [
+            self._robust_scale(round_scores)
+            for _, round_scores in self._history
+        ]
+        candidates = [current_scale, *historical_scales]
+        finite_candidates = [
+            value for value in candidates if math.isfinite(float(value))
+        ]
+        scale = max(
+            float(self.config.content_scale_floor),
+            float(statistics.median(finite_candidates))
+            if finite_candidates
+            else 0.0,
+        )
+        return center, scale
+
+    def _content_reliability(
+        self,
+        *,
+        score: float,
+        center: float,
+        scale: float,
+        warmup: bool,
+        cohort_size: int,
+    ) -> Tuple[float, float, str]:
+        if not math.isfinite(float(score)):
+            raise ValueError("VCAA content score must be finite.")
+        if not math.isfinite(float(center)) or not math.isfinite(float(scale)):
+            raise ValueError("VCAA content calibration must be finite.")
+        z = (float(score) - float(center)) / float(scale)
+        z = max(
+            -float(self.config.reliability_z_cap),
+            min(float(self.config.reliability_z_cap), z),
+        )
+        if warmup:
+            return 1.0, z, "warmup_uniform"
+        if cohort_size < int(self.config.minimum_content_cohort_size):
+            return 1.0, z, "small_cohort_uniform"
+        reliability = 1.0 / (
+            1.0
+            + math.exp(
+                -z / float(self.config.reliability_temperature)
+            )
+        )
+        # The sigmoid is strictly inside (0, 1) for finite z.
+        if not 0.0 < reliability < 1.0:
+            raise ValueError("VCAA content reliability must lie in (0, 1).")
+        return float(reliability), float(z), "robust_relative_sigmoid"
+
     def _historical_threshold(self, current_round: int) -> float:
         if int(current_round) <= int(self.config.warmup_rounds):
             return 0.0
@@ -416,48 +514,114 @@ class VersionContentAwareAdmission:
             [item.metadata for item in teacher_knowledge],
             current_round=int(current_round),
         )
-        content = self._content_statistics(
-            teacher_knowledge,
-            student_logits,
-            proxy_labels,
+        hard_valid_indices = [
+            index
+            for index, item in enumerate(lineage)
+            if bool(item["hard_valid"])
+        ]
+        valid_knowledge = [
+            teacher_knowledge[index] for index in hard_valid_indices
+        ]
+        valid_content = (
+            self._content_statistics(
+                valid_knowledge,
+                student_logits,
+                proxy_labels,
+            )
+            if valid_knowledge
+            else []
+        )
+        content_by_index = {
+            index: content_stats
+            for index, content_stats in zip(
+                hard_valid_indices,
+                valid_content,
+            )
+        }
+        content_scores = [
+            self._content_score(content_stats, self.config)
+            for content_stats in valid_content
+        ]
+        content_center, content_scale = self._calibration_statistics(
+            content_scores
         )
         threshold = self._historical_threshold(int(current_round))
         warmup = int(current_round) <= int(self.config.warmup_rounds)
         records = []
-        valid_content_scores = []
-        aggregation_weights: Dict[int, float] = {}
-        for client_id, version, content_stats in zip(client_ids, lineage, content):
+        valid_content_scores = list(content_scores)
+        normalized_aggregation_weights: Dict[int, float] = {}
+        valid_raw_weights: Dict[int, float] = {}
+        record_calibration: Dict[int, Tuple[float, float, float, str]] = {}
+        empty_content = {
+            "proxy_accuracy": float("nan"),
+            "mean_entropy": float("nan"),
+            "entropy_deviation": float("nan"),
+            "mean_kl": float("nan"),
+            "consensus_divergence": float("nan"),
+            "num_classes": float("nan"),
+            "accuracy_term": float("nan"),
+            "entropy_term": float("nan"),
+            "divergence_term": float("nan"),
+            "sanitized_value_count": float("nan"),
+        }
+        for index, (client_id, version) in enumerate(zip(client_ids, lineage)):
+            content_stats = content_by_index.get(index, empty_content)
+            hard_valid = bool(version["hard_valid"])
             content_score = (
-                float(self.config.accuracy_weight) * content_stats["accuracy_term"]
-                + float(self.config.entropy_weight) * content_stats["entropy_term"]
-                + float(self.config.divergence_weight) * content_stats["divergence_term"]
+                self._content_score(content_stats, self.config)
+                if hard_valid
+                else float("nan")
             )
             freshness = float(version["freshness_score"])
             final_score = (
                 float(self.config.version_weight) * freshness
                 + (1.0 - float(self.config.version_weight)) * content_score
-            )
-            # The historical threshold is retained as a diagnostic and as a
-            # soft reliability calibration.  It is intentionally not a hard
-            # deletion rule: a fresh non-IID teacher still reaches NIABD.
-            reliability = content_score
-            if threshold > float(self.config.epsilon):
-                reliability = min(1.0, content_score / threshold)
-            reliability = max(0.0, min(1.0, reliability))
-            hard_valid = bool(version["hard_valid"])
-            admitted = bool(hard_valid and (warmup or reliability > float(self.config.epsilon)))
-            reason = str(version["hard_rejection_reason"])
-            if hard_valid and not admitted:
-                reason = "zero_content_reliability"
+            ) if hard_valid else 0.0
             if hard_valid:
-                valid_content_scores.append(float(content_score))
-                aggregation_weights[client_id] = float(reliability)
+                reliability, score_z, weighting_mode = self._content_reliability(
+                    score=content_score,
+                    center=content_center,
+                    scale=content_scale,
+                    warmup=warmup,
+                    cohort_size=len(valid_content),
+                )
+                raw_weight = max(
+                    float(self.config.epsilon),
+                    freshness * reliability,
+                )
+                valid_raw_weights[client_id] = float(raw_weight)
+                record_calibration[client_id] = (
+                    float(content_score),
+                    float(score_z),
+                    float(reliability),
+                    str(weighting_mode),
+                )
+            else:
+                score_z = float("nan")
+                reliability = float("nan")
+                raw_weight = 0.0
+                weighting_mode = "hard_invalid"
+            record_center = float(content_center) if hard_valid else float("nan")
+            record_scale = float(content_scale) if hard_valid else float("nan")
+            # Admission is Stage-A only. Stage-B can reduce contribution but
+            # can never hard-delete a freshness-valid teacher.
+            admitted = hard_valid
+            reason = str(version["hard_rejection_reason"])
             components = {
                 **version,
                 **content_stats,
                 "content_score": float(content_score),
                 "vcaa_content_reliability": float(reliability),
-                "vcaa_aggregation_weight": float(reliability),
+                "vcaa_aggregation_weight": float(raw_weight),
+                "normalized_aggregation_weight": float("nan"),
+                "effective_weight_ratio_to_uniform": float("nan"),
+                "content_score_center": record_center,
+                "content_score_scale": record_scale,
+                "content_score_z": float(score_z),
+                "weighting_mode": str(weighting_mode),
+                "content_threshold_role": "diagnostic_only",
+                "vcaa_threshold_used_for_weighting": False,
+                "vcaa_final_score_used_for_weighting": False,
                 "vcaa_hard_valid": float(hard_valid),
                 "vcaa_absolute_version_valid": float(version["absolute_version_valid"]),
                 "vcaa_age_valid": float(version["age_valid"]),
@@ -474,11 +638,87 @@ class VersionContentAwareAdmission:
                     age_valid=bool(version["age_valid"]),
                     freshness_score=freshness,
                     content_reliability=float(reliability),
-                    aggregation_weight=float(reliability),
+                    aggregation_weight=float(raw_weight),
+                    content_score_center=record_center,
+                    content_score_scale=record_scale,
+                    content_score_z=float(score_z),
+                    weighting_mode=str(weighting_mode),
                 )
             )
 
-        self._history.append((int(current_round), tuple(valid_content_scores)))
+        if valid_content_scores:
+            self._history.append((int(current_round), tuple(valid_content_scores)))
+        total_weight = sum(valid_raw_weights.values())
+        if valid_raw_weights and total_weight <= float(self.config.epsilon):
+            raise ValueError("VCAA valid teacher weights must have positive sum.")
+        if valid_raw_weights:
+            normalized_aggregation_weights = {
+                client_id: float(weight / total_weight)
+                for client_id, weight in valid_raw_weights.items()
+            }
+            uniform_share = 1.0 / float(len(valid_raw_weights))
+            for record in records:
+                if record.client_id in normalized_aggregation_weights:
+                    normalized = normalized_aggregation_weights[record.client_id]
+                    record.components["normalized_aggregation_weight"] = normalized
+                    record.components["effective_weight_ratio_to_uniform"] = (
+                        normalized / uniform_share
+                    )
+                    # Dataclasses are frozen, so the CSV-facing values are
+                    # represented in components; the decision maps remain the
+                    # authoritative aggregation interface.
+        effective_teacher_count = (
+            float(total_weight * total_weight)
+            / float(sum(weight * weight for weight in valid_raw_weights.values()))
+            if valid_raw_weights
+            else float("nan")
+        )
+        mean_weight = (
+            float(total_weight) / float(len(valid_raw_weights))
+            if valid_raw_weights else float("nan")
+        )
+        weight_cv = (
+            math.sqrt(
+                sum((weight - mean_weight) ** 2 for weight in valid_raw_weights.values())
+                / float(len(valid_raw_weights))
+            ) / mean_weight
+            if valid_raw_weights and mean_weight > 0.0
+            else float("nan")
+        )
+        total_variation = (
+            0.5 * sum(
+                abs(normalized - (1.0 / len(valid_raw_weights)))
+                for normalized in normalized_aggregation_weights.values()
+            )
+            if valid_raw_weights else float("nan")
+        )
+        saturation_fraction = (
+            sum(
+                1 for client_id in valid_raw_weights
+                if math.isfinite(record_calibration[client_id][2])
+                and record_calibration[client_id][2] >= 0.999
+            ) / float(len(valid_raw_weights))
+            if valid_raw_weights else float("nan")
+        )
+        for record_index, record in enumerate(records):
+            if record.client_id in normalized_aggregation_weights:
+                record.components["normalized_aggregation_weight"] = float(
+                    normalized_aggregation_weights[record.client_id]
+                )
+                record.components["effective_weight_ratio_to_uniform"] = float(
+                    normalized_aggregation_weights[record.client_id]
+                    * len(valid_raw_weights)
+                )
+                records[record_index] = replace(
+                    record,
+                    normalized_aggregation_weight=float(
+                        normalized_aggregation_weights[record.client_id]
+                    ),
+                    effective_weight_ratio_to_uniform=float(
+                        normalized_aggregation_weights[record.client_id]
+                        * len(valid_raw_weights)
+                    ),
+                )
         admitted_ids = tuple(record.client_id for record in records if record.admitted)
         freshness_valid_ids = tuple(
             record.client_id for record in records if record.hard_valid
@@ -495,5 +735,14 @@ class VersionContentAwareAdmission:
             nonfinite_policy=self.config.nonfinite_policy,
             history_size=len(self._history),
             freshness_valid_client_ids=freshness_valid_ids,
-            aggregation_weights=aggregation_weights,
+            aggregation_weights=valid_raw_weights,
+            normalized_aggregation_weights=normalized_aggregation_weights,
+            effective_teacher_count=effective_teacher_count,
+            weight_cv=weight_cv,
+            weight_total_variation_from_uniform=total_variation,
+            content_reliability_saturation_fraction=saturation_fraction,
+            content_score_center=float(content_center),
+            content_score_scale=float(content_scale),
+            content_threshold_role="diagnostic_only",
+            vcaa_threshold_used_for_weighting=False,
         )
