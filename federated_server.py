@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -83,7 +84,7 @@ class FederatedServer:
                     source_round=int(packet.source_round),
                     base_server_round=int(packet.base_server_round),
                     received_at_s=received_at_s,
-                    consumed_at_s=received_at_s,
+                    consumed_at_s=float("nan"),
                     proxy_version=str(packet.proxy_version),
                 ),
                 logits=logits,
@@ -94,6 +95,25 @@ class FederatedServer:
                 "participating client."
             )
         return received
+
+    @staticmethod
+    def mark_knowledge_consumed(
+        knowledge_by_client: Dict[int, TeacherKnowledge],
+        *,
+        consumed_at_s: Optional[float] = None,
+    ) -> Dict[int, TeacherKnowledge]:
+        """Attach the actual server admission/aggregation consume time."""
+
+        consumed = float(time.monotonic() if consumed_at_s is None else consumed_at_s)
+        if not torch.isfinite(torch.tensor(consumed)):
+            raise ValueError("consumed_at_s must be finite.")
+        return {
+            int(client_id): replace(
+                knowledge,
+                metadata=replace(knowledge.metadata, consumed_at_s=consumed),
+            )
+            for client_id, knowledge in knowledge_by_client.items()
+        }
 
     def student_proxy_logits(self) -> torch.Tensor:
         return predict_logits(

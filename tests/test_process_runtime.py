@@ -86,7 +86,7 @@ def _profile():
             },
         "2:2": {
             "compute_slowdown_factor": 1.5,
-            "upload_delay_s": 5.0,
+            "upload_delay_s": 2.0,
         },
         },
     }
@@ -161,7 +161,7 @@ def process_result(tmp_path_factory):
             admission_controller=VersionContentAwareAdmission(
                 VCAAConfig(
                     warmup_rounds=1,
-                    max_version_lag=0,
+                    max_version_lag=1,
                     time_unit_s=1.0,
                 )
             ),
@@ -267,28 +267,59 @@ def test_real_slow_client_becomes_stale_and_reaches_vcaa(process_result):
         event for event in stale
         if float(event["injected_compute_delay_s"]) > 0.0
     ]
+    mild_stale = [event for event in stale if int(event["version_lag"]) == 1]
+    too_stale = [event for event in stale if int(event["version_lag"]) > 1]
     fresh = [
         event for event in metrics["runtime_events"]
         if _consumed(event) and int(event["version_lag"]) == 0
     ]
-
     assert stale
     assert injected_stale
-    late = injected_stale[0]
+    assert mild_stale
+    assert all(event["vcaa_hard_valid"] is True for event in mild_stale)
+    assert all(
+        event["vcaa_version_lag_score"] < 1.0
+        for event in mild_stale
+    )
+    assert all(event["admitted"] is False for event in too_stale)
+    late = next(
+        (event for event in injected_stale if int(event["version_lag"]) > 1),
+        injected_stale[0],
+    )
     assert int(late["consumed_round"]) > int(late["source_round"])
     assert late["received_at_s"] >= late["generated_at_s"]
+    assert late["compute_started_at_s"] <= late["compute_finished_at_s"]
+    assert late["compute_finished_at_s"] <= late["generated_at_s"]
+    assert late["generated_at_s"] <= late["first_upload_attempt_at_s"]
+    assert late["first_upload_attempt_at_s"] <= late["received_at_s"]
+    assert late["received_at_s"] <= late["consumed_at_s"]
     assert late["injected_compute_delay_s"] > 0.0
     assert late["transport_status"] in {"accepted", "duplicate"}
-    assert all(event["admitted"] is False for event in stale)
+    assert all(event["admitted"] is False for event in too_stale)
     assert late["knowledge_age_s"] == pytest.approx(
         late["consumed_at_s"] - late["generated_at_s"]
     )
+    assert late["transport_age_s"] == pytest.approx(
+        late["received_at_s"] - late["generated_at_s"]
+    )
+    assert late["queue_age_s"] == pytest.approx(
+        late["consumed_at_s"] - late["received_at_s"]
+    )
+    assert late["knowledge_age_s"] == pytest.approx(
+        late["transport_age_s"] + late["queue_age_s"]
+    )
     assert not torch.isnan(torch.tensor(late["vcaa_version_score"]))
-    # VCAA v4 excludes hard-invalid packets before Stage-B consensus, so
-    # content fields for this stale packet are intentionally NaN.
-    assert torch.isnan(torch.tensor(late["vcaa_content_score"]))
-    assert torch.isnan(torch.tensor(late["vcaa_normalized_aggregation_weight"]))
-    assert late["vcaa_final_score_used_for_weighting"] is False
+    if int(late["version_lag"]) > 1:
+        # Hard-invalid packets are excluded before content consensus; their
+        # content score is unmeasured while their aggregation contribution is
+        # explicitly zero.
+        assert late["vcaa_hard_valid"] is False
+        assert torch.isnan(torch.tensor(late["vcaa_content_score"]))
+        assert late["vcaa_normalized_aggregation_weight"] == 0.0
+        assert late["vcaa_final_score_used_for_weighting"] is False
+    else:
+        assert late["vcaa_hard_valid"] is True
+        assert late["vcaa_version_lag_score"] < 1.0
     assert not torch.isnan(torch.tensor(late["vcaa_final_score"]))
     fresh_event = next(event for event in fresh if event["admitted"] is True)
     assert not torch.isnan(

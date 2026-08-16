@@ -75,7 +75,10 @@ class FederatedClient:
             query_id=query_id,
             logits=logits,
             source_round=self.model_round,
-            base_server_round=self.model_round,
+            # ``model_round`` is the version after this local update; the
+            # update was based on the server/student version immediately
+            # before it.  Keeping these distinct makes lineage auditable.
+            base_server_round=max(0, self.model_round - 1),
             local_model_version=self.model_round,
         )
 

@@ -45,7 +45,14 @@ class TeacherAdmissionRecord:
     hard_rejection_reason: str = ""
     absolute_version_valid: bool = True
     age_valid: bool = True
+    timestamp_valid: bool = True
+    version_lag_score: float = float("nan")
+    age_score: float = float("nan")
     freshness_score: float = float("nan")
+    content_valid: bool = False
+    content_gate_active: bool = False
+    content_rejection_reason: str = ""
+    rejection_reason: str = ""
     content_reliability: float = float("nan")
     aggregation_weight: float = float("nan")
     content_score_center: float = float("nan")
@@ -80,8 +87,14 @@ class AdmissionDecision:
     content_reliability_saturation_fraction: float = float("nan")
     content_score_center: float = float("nan")
     content_score_scale: float = float("nan")
-    content_threshold_role: str = "diagnostic_only"
+    content_threshold_role: str = "admission_gate"
+    content_gate_active: bool = False
+    content_threshold_source: str = "not_calibrated"
+    content_history_observations: int = 0
     vcaa_threshold_used_for_weighting: bool = False
+    effective_age_half_life_s: float = float("nan")
+    effective_max_knowledge_age_s: float = float("nan")
+    age_scale_mode: str = "fixed"
 
 
 class TeacherAdmissionController(Protocol):

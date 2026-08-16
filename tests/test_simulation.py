@@ -3,14 +3,17 @@ import math
 
 import torch
 import torch.nn as nn
+import pytest
 from torch.utils.data import DataLoader, TensorDataset
 
 from admission import (
     AdmissionDecision,
     TeacherAdmissionRecord,
 )
+from defense import DefenseResult
 from federated_runtime import run_fedagg_server_client
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
+from result_schema import VCAA_ALGORITHM_VERSION
 from vcaa import VCAAConfig, VersionContentAwareAdmission
 
 
@@ -159,6 +162,82 @@ class _RejectAllTeachers:
         )
 
 
+class _FixedV5Admission:
+    name = "vcaa"
+    algorithm_version = VCAA_ALGORITHM_VERSION
+
+    def reset(self):
+        return None
+
+    def evaluate(self, **kwargs):
+        del kwargs
+        records = (
+            TeacherAdmissionRecord(
+                client_id=0,
+                admitted=True,
+                score=1.0,
+                hard_valid=True,
+                content_valid=True,
+                aggregation_weight=1.0,
+                normalized_aggregation_weight=1.0,
+                components={"version_lag_score": 1.0, "age_score": 1.0},
+            ),
+            TeacherAdmissionRecord(
+                client_id=1,
+                admitted=False,
+                score=0.0,
+                hard_valid=True,
+                content_valid=False,
+                aggregation_weight=0.0,
+                normalized_aggregation_weight=0.0,
+                components={"version_lag_score": 1.0, "age_score": 1.0},
+            ),
+            TeacherAdmissionRecord(
+                client_id=2,
+                admitted=False,
+                score=0.0,
+                hard_valid=False,
+                content_valid=False,
+                aggregation_weight=0.0,
+                normalized_aggregation_weight=0.0,
+                components={"version_lag_score": 0.0, "age_score": 0.0},
+            ),
+        )
+        return AdmissionDecision(
+            method="vcaa",
+            threshold=0.5,
+            admitted_client_ids=(0,),
+            rejected_client_ids=(1, 2),
+            records=records,
+            algorithm_version=VCAA_ALGORITHM_VERSION,
+            freshness_valid_client_ids=(0, 1),
+            aggregation_weights={0: 1.0},
+            normalized_aggregation_weights={0: 1.0},
+            content_gate_active=True,
+            content_threshold_source="test",
+        )
+
+
+class _SpyDefense:
+    name = "niabd"
+
+    def __init__(self):
+        self.input_ids = []
+
+    def reset(self):
+        self.input_ids = []
+
+    def purify(self, **kwargs):
+        self.input_ids = [
+            int(item.metadata.client_id)
+            for item in kwargs["teacher_knowledge"]
+        ]
+        return DefenseResult(
+            method=self.name,
+            purified_knowledge=tuple(kwargs["teacher_knowledge"]),
+            records=(),
+            metrics={},
+        )
 def test_admission_controller_filters_client_uploads_before_aggregation():
     metrics = run_fedagg_server_client(
         [_TinyVisionModel(), _TinyVisionModel()],
@@ -198,6 +277,27 @@ def test_real_vcaa_controller_runs_inside_one_round_fedagg():
         0.0 <= record["score"] <= 1.0
         for record in metrics["teacher_admission_records"][0]
     )
+
+
+def test_sync_consumption_timestamp_is_distinct_and_causal():
+    metrics = run_fedagg_server_client(
+        [_TinyVisionModel(), _TinyVisionModel()],
+        _TinyVisionModel(),
+        _dataloaders(),
+        device="cpu",
+        rounds=1,
+        admission_controller=VersionContentAwareAdmission(
+            VCAAConfig(warmup_rounds=1, age_scale_mode="fixed")
+        ),
+    )
+    for record in metrics["teacher_admission_records"][0]:
+        assert record["version_lag"] == 0
+        assert record["version_lag_score"] == pytest.approx(1.0)
+        assert record["generated_at_s"] <= record["received_at_s"]
+        assert record["received_at_s"] <= record["consumed_at_s"]
+        assert record["knowledge_age_s"] == pytest.approx(
+            record["transport_age_s"] + record["queue_age_s"]
+        )
 
 
 def test_niabd_only_runs_without_vcaa():
@@ -241,6 +341,22 @@ def test_vcaa_and_niabd_can_be_enabled_together():
     assert metrics["niabd_enabled"] == 1
     assert metrics["teachers_admitted"] == [2]
     assert metrics["teachers_purified"] == [2]
+
+
+def test_vcaa_content_rejection_is_not_reintroduced_into_niabd():
+    defense = _SpyDefense()
+    metrics = run_fedagg_server_client(
+        [_TinyVisionModel() for _ in range(3)],
+        _TinyVisionModel(),
+        _dataloaders(num_clients=3),
+        device="cpu",
+        rounds=1,
+        admission_controller=_FixedV5Admission(),
+        defense_controller=defense,
+    )
+    assert defense.input_ids == [0]
+    assert metrics["teachers_admitted"] == [1]
+    assert metrics["server_updates_from_clients"] == [1]
 
 
 def test_no_admitted_teacher_skips_niabd_and_server_update_cleanly():

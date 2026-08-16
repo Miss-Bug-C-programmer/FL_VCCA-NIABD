@@ -90,12 +90,17 @@ ADMISSION_COLUMNS = (
     "minimum_accepted_round", "proxy_accuracy", "mean_entropy", "mean_kl",
     "num_classes", "accuracy_term", "entropy_term", "divergence_term",
     "content_score", "task_id", "packet_id", "source_round",
-    "consumed_round", "version_lag", "knowledge_age_s",
+    "consumed_round", "version_lag", "raw_version_lag", "version_lag_score",
+    "age_score", "knowledge_age_s",
     "vcaa_algorithm_version", "vcaa_nonfinite_policy",
-    "result_schema_version", "vcaa_history_size", "received_at_s",
+    "result_schema_version", "vcaa_history_size",
+    "base_server_round", "generated_at_s", "received_at_s",
     "consumed_at_s", "proxy_version",
     "hard_valid", "hard_rejection_reason", "absolute_version_valid",
-    "age_valid", "freshness_score", "content_reliability",
+    "timestamp_valid", "age_valid", "freshness_score", "content_reliability",
+    "content_threshold", "content_valid", "content_gate_active",
+    "content_rejection_reason", "rejection_reason", "content_threshold_source",
+    "content_history_observations",
     "aggregation_weight", "transport_age_s",
     "queue_age_s", "consensus_divergence", "entropy_deviation",
     "strategy", "attack_type", "content_score_center",
@@ -103,6 +108,8 @@ ADMISSION_COLUMNS = (
     "normalized_aggregation_weight", "effective_weight_ratio_to_uniform",
     "weighting_mode", "vcaa_threshold_used_for_weighting",
     "vcaa_final_score_used_for_weighting",
+    "effective_age_half_life_s", "effective_max_knowledge_age_s",
+    "age_scale_mode",
 )
 
 DEFENSE_COLUMNS = (
@@ -137,12 +144,14 @@ RUNTIME_EVENT_COLUMNS = (
     "actual_compute_time_s", "proxy_inference_time_s",
     "injected_compute_delay_s", "total_compute_phase_s",
     "injected_upload_delay_s", "knowledge_age_s", "transport_age_s",
+    "queue_age_s",
     "version_lag", "base_version_lag", "upload_attempts",
     "upload_attempt_drop_count", "rpc_timeout_count", "retry_count",
     "duplicate_receive_count", "rpc_elapsed_s", "payload_bytes",
     "wire_bytes", "logits_dtype", "logits_shape", "proxy_version",
     "local_train_count", "predict_logits_calls", "transport_status",
-    "rpc_accept_status", "vcaa_version_score", "vcaa_content_score",
+    "rpc_accept_status", "vcaa_version_score", "vcaa_version_lag_score",
+    "vcaa_age_score", "vcaa_content_score",
     "vcaa_final_score", "vcaa_threshold", "proxy_accuracy",
     "mean_entropy", "mean_kl", "admitted", "niabd_anomaly_fraction",
     "niabd_mean_suppression", "niabd_teacher_memory_score",
@@ -157,7 +166,11 @@ RUNTIME_EVENT_COLUMNS = (
     "threshold_update_mode", "reference_trusted_weight",
     "recovery_stable_rounds", "vcaa_hard_valid",
     "vcaa_hard_rejection_reason", "vcaa_absolute_version_valid",
-    "vcaa_age_valid", "vcaa_freshness_score",
+    "vcaa_timestamp_valid", "vcaa_age_valid", "vcaa_freshness_score",
+    "vcaa_content_valid", "vcaa_content_gate_active",
+    "vcaa_content_rejection_reason", "vcaa_rejection_reason",
+    "vcaa_effective_age_half_life_s", "vcaa_effective_max_knowledge_age_s",
+    "vcaa_age_scale_mode",
     "vcaa_content_reliability", "vcaa_aggregation_weight",
     "vcaa_consensus_divergence", "vcaa_entropy_deviation",
     "vcaa_content_score_center", "vcaa_content_score_scale",
@@ -490,6 +503,12 @@ def _round_rows(
             "vcaa_version_score_mean": float(
                 _metric(metrics, "vcaa_version_score_mean", round_idx)
             ),
+            "vcaa_version_lag_score_mean": float(
+                _metric(metrics, "vcaa_version_lag_score_mean", round_idx, np.nan)
+            ),
+            "vcaa_age_score_mean": float(
+                _metric(metrics, "vcaa_age_score_mean", round_idx, np.nan)
+            ),
             "vcaa_content_score_mean": float(
                 _metric(metrics, "vcaa_content_score_mean", round_idx)
             ),
@@ -747,7 +766,8 @@ def _round_rows(
             "git_dirty": metrics.get("git_dirty", "unavailable"),
             "config_sha256": str(metrics.get("config_sha256", "")),
             "runtime_profile_sha256": str(metrics.get("runtime_profile_sha256", "")),
-            # VCAA v4 fields are appended after the historical round schema.
+            # VCAA v5 lineage/content/timing fields are appended after the
+            # historical round schema.
             "vcaa_freshness_valid_teachers": int(
                 _metric(metrics, "vcaa_freshness_valid_teachers", round_idx, 0)
             ),
@@ -779,12 +799,46 @@ def _round_rows(
             "vcaa_content_score_scale": float(
                 _metric(metrics, "vcaa_content_score_scale", round_idx, np.nan)
             ),
+            "vcaa_content_gate_active": _metric(
+                metrics, "vcaa_content_gate_active", round_idx, None
+            ),
+            "vcaa_content_threshold_source": _metric(
+                metrics, "vcaa_content_threshold_source", round_idx, None
+            ),
+            "vcaa_content_history_observations": _metric(
+                metrics, "vcaa_content_history_observations", round_idx, None
+            ),
+            "vcaa_content_valid": _metric(
+                metrics, "vcaa_content_valid", round_idx, None
+            ),
+            "vcaa_content_rejected": _metric(
+                metrics, "vcaa_content_rejected", round_idx, None
+            ),
+            "vcaa_effective_age_half_life_s": float(
+                _metric(
+                    metrics,
+                    "vcaa_effective_age_half_life_s",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "vcaa_effective_max_knowledge_age_s": float(
+                _metric(
+                    metrics,
+                    "vcaa_effective_max_knowledge_age_s",
+                    round_idx,
+                    np.nan,
+                )
+            ),
+            "vcaa_age_scale_mode": _metric(
+                metrics, "vcaa_age_scale_mode", round_idx, None
+            ),
             "vcaa_content_threshold_role": str(
                 _metric(
                     metrics,
                     "vcaa_content_threshold_role",
                     round_idx,
-                    "diagnostic_only",
+                    "not_applicable",
                 )
             ),
             "vcaa_threshold_used_for_weighting": bool(
@@ -1646,6 +1700,14 @@ def run_experiment(
         "aggregation_trim_fraction": float(aggregation_trim_fraction),
         "server_architecture": str(server_architecture),
         "client_architectures": list(client_architectures or []),
+        "vcaa_algorithm_version": (
+            VCAA_ALGORITHM_VERSION if enable_vcaa else "none"
+        ),
+        "vcaa_config": asdict(vcaa_config) if enable_vcaa else None,
+        "age_scale_mode": str(vcaa_config.age_scale_mode) if enable_vcaa else "none",
+        "freshness_runtime_semantics": (
+            "server-observed-generated-received-consumed-lineage"
+        ),
         "formal_config_unchanged": True,
     }
     manifest_bytes = json.dumps(
@@ -2396,8 +2458,23 @@ def main() -> None:
     parser.add_argument("--vcaa-time-decay-gamma", type=float, default=0.99)
     parser.add_argument("--vcaa-time-unit-s", type=float, default=60.0)
     parser.add_argument("--vcaa-max-version-lag", type=int, default=1)
+    parser.add_argument(
+        "--vcaa-version-lag-half-life-rounds",
+        type=float,
+        default=1.0,
+        help="Round half-life for eligible version lag decay; lag zero is 1.0.",
+    )
     parser.add_argument("--vcaa-max-knowledge-age-s", type=float, default=0.0)
     parser.add_argument("--vcaa-age-half-life-s", type=float, default=0.0)
+    parser.add_argument(
+        "--vcaa-age-scale-mode",
+        choices=["fixed", "runtime-calibrated"],
+        default="runtime-calibrated",
+    )
+    parser.add_argument("--vcaa-runtime-age-reference-multiplier", type=float, default=4.0)
+    parser.add_argument("--vcaa-runtime-age-half-life-floor-s", type=float, default=0.5)
+    parser.add_argument("--vcaa-runtime-age-half-life-ceiling-s", type=float, default=60.0)
+    parser.add_argument("--vcaa-runtime-max-age-multiplier", type=float, default=4.0)
     parser.add_argument("--vcaa-content-threshold-beta", type=float, default=-1.0)
     parser.add_argument("--vcaa-consensus-divergence-scale", type=float, default=0.0)
     parser.add_argument("--vcaa-content-scale-floor", type=float, default=0.05)
@@ -2405,6 +2482,11 @@ def main() -> None:
     parser.add_argument("--vcaa-reliability-z-cap", type=float, default=6.0)
     parser.add_argument(
         "--vcaa-minimum-content-cohort-size",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--vcaa-minimum-content-history-size",
         type=int,
         default=3,
     )
@@ -2680,6 +2762,7 @@ def main() -> None:
         time_decay_gamma=args.vcaa_time_decay_gamma,
         time_unit_s=args.vcaa_time_unit_s,
         max_version_lag=args.vcaa_max_version_lag,
+        version_lag_half_life_rounds=args.vcaa_version_lag_half_life_rounds,
         max_knowledge_age_s=(
             None if float(args.vcaa_max_knowledge_age_s) <= 0.0
             else float(args.vcaa_max_knowledge_age_s)
@@ -2688,6 +2771,11 @@ def main() -> None:
             None if float(args.vcaa_age_half_life_s) <= 0.0
             else float(args.vcaa_age_half_life_s)
         ),
+        age_scale_mode=args.vcaa_age_scale_mode,
+        runtime_age_reference_multiplier=args.vcaa_runtime_age_reference_multiplier,
+        runtime_age_half_life_floor_s=args.vcaa_runtime_age_half_life_floor_s,
+        runtime_age_half_life_ceiling_s=args.vcaa_runtime_age_half_life_ceiling_s,
+        runtime_max_age_multiplier=args.vcaa_runtime_max_age_multiplier,
         content_threshold_beta=(
             None if float(args.vcaa_content_threshold_beta) < 0.0
             else float(args.vcaa_content_threshold_beta)
@@ -2700,6 +2788,7 @@ def main() -> None:
         reliability_temperature=args.vcaa_reliability_temperature,
         reliability_z_cap=args.vcaa_reliability_z_cap,
         minimum_content_cohort_size=args.vcaa_minimum_content_cohort_size,
+        minimum_content_history_size=args.vcaa_minimum_content_history_size,
         accuracy_weight=args.vcaa_accuracy_weight,
         entropy_weight=args.vcaa_entropy_weight,
         divergence_weight=args.vcaa_divergence_weight,

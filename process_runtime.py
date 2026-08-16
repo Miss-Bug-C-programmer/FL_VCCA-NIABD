@@ -673,9 +673,9 @@ def _client_process_main(
                     device=device,
                     amp=bool(config.amp),
                 )
-                generated_at_s = time.monotonic()
+                natural_compute_finished_at_s = time.monotonic()
                 proxy_inference_time_s = (
-                    generated_at_s - inference_started
+                    natural_compute_finished_at_s - inference_started
                 )
                 if not bool(torch.isfinite(logits).all().item()):
                     raise RuntimeError(
@@ -686,7 +686,7 @@ def _client_process_main(
                 raise
 
             actual_compute_time_s = (
-                generated_at_s - compute_started_at_s
+                natural_compute_finished_at_s - compute_started_at_s
             )
             factor = float(task["compute_slowdown_factor"])
             injected_compute_delay_s = max(
@@ -695,7 +695,8 @@ def _client_process_main(
             )
             if injected_compute_delay_s > 0.0:
                 time.sleep(injected_compute_delay_s)
-            compute_finished_at_s = generated_at_s
+            compute_finished_at_s = time.monotonic()
+            generated_at_s = compute_finished_at_s
             total_compute_phase_s = (
                 time.monotonic() - compute_started_at_s
             )
@@ -989,6 +990,9 @@ def _event_from_item(
         "transport_age_s": (
             float(item.received_at_s) - float(packet.generated_at_s)
         ),
+        "queue_age_s": (
+            float(consumed_at_s) - float(item.received_at_s)
+        ),
         "version_lag": int(version_lag),
         "base_version_lag": int(base_version_lag),
         "upload_attempts": int(state["upload_attempts"]),
@@ -1018,6 +1022,8 @@ def _event_from_item(
         "transport_status": str(state["transport_status"]),
         "rpc_accept_status": "accepted",
         "vcaa_version_score": _nan(),
+        "vcaa_version_lag_score": _nan(),
+        "vcaa_age_score": _nan(),
         "vcaa_content_score": _nan(),
         "vcaa_final_score": _nan(),
         "vcaa_threshold": _nan(),
@@ -1025,6 +1031,14 @@ def _event_from_item(
         "mean_entropy": _nan(),
         "mean_kl": _nan(),
         "admitted": _nan(),
+        "vcaa_timestamp_valid": _nan(),
+        "vcaa_content_valid": _nan(),
+        "vcaa_content_gate_active": _nan(),
+        "vcaa_content_rejection_reason": "",
+        "vcaa_rejection_reason": "",
+        "vcaa_effective_age_half_life_s": _nan(),
+        "vcaa_effective_max_knowledge_age_s": _nan(),
+        "vcaa_age_scale_mode": "",
         "niabd_anomaly_fraction": _nan(),
         "niabd_mean_suppression": _nan(),
     }
@@ -1040,7 +1054,9 @@ def _unconsumed_event_from_state(
     event = _event_from_item(
         _MailboxItem(packet=packet, received_at_s=received_at_s),
         consumed_round=int(packet.source_round),
-        consumed_at_s=received_at_s,
+        # This packet is retained in the mailbox and has not been consumed.
+        # Use an unknown consume time rather than equating receipt with use.
+        consumed_at_s=_nan(),
         state=state,
     )
     event.update({
@@ -1048,9 +1064,12 @@ def _unconsumed_event_from_state(
         "consumed_round": _nan(),
         "consumed_at_s": _nan(),
         "knowledge_age_s": _nan(),
+        "queue_age_s": _nan(),
         "version_lag": _nan(),
         "base_version_lag": _nan(),
         "vcaa_version_score": _nan(),
+        "vcaa_version_lag_score": _nan(),
+        "vcaa_age_score": _nan(),
         "vcaa_content_score": _nan(),
         "vcaa_final_score": _nan(),
         "vcaa_threshold": _nan(),
@@ -1058,6 +1077,14 @@ def _unconsumed_event_from_state(
         "mean_entropy": _nan(),
         "mean_kl": _nan(),
         "admitted": _nan(),
+        "vcaa_timestamp_valid": _nan(),
+        "vcaa_content_valid": _nan(),
+        "vcaa_content_gate_active": _nan(),
+        "vcaa_content_rejection_reason": "",
+        "vcaa_rejection_reason": "",
+        "vcaa_effective_age_half_life_s": _nan(),
+        "vcaa_effective_max_knowledge_age_s": _nan(),
+        "vcaa_age_scale_mode": "",
         "niabd_anomaly_fraction": _nan(),
         "niabd_mean_suppression": _nan(),
         "transport_status": "accepted-unconsumed",
@@ -1317,6 +1344,11 @@ def run_fedagg_server_client_process_async(
                 if reference_times
                 else None
             )
+            if (
+                admission_controller is not None
+                and hasattr(admission_controller, "update_runtime_timing")
+            ):
+                admission_controller.update_runtime_timing(reference)
             soft_deadline_s, hard_deadline_s = _deadline_values(
                 config,
                 reference,
@@ -1473,6 +1505,12 @@ def run_fedagg_server_client_process_async(
                     event["vcaa_version_score"] = float(
                         record.components["version_score"]
                     )
+                    event["vcaa_version_lag_score"] = float(
+                        record.components["version_lag_score"]
+                    )
+                    event["vcaa_age_score"] = float(
+                        record.components["age_score"]
+                    )
                     event["vcaa_content_score"] = float(
                         record.components["content_score"]
                     )
@@ -1495,6 +1533,22 @@ def run_fedagg_server_client_process_async(
                         record.absolute_version_valid
                     )
                     event["vcaa_age_valid"] = bool(record.age_valid)
+                    event["vcaa_timestamp_valid"] = bool(record.timestamp_valid)
+                    event["vcaa_content_valid"] = bool(record.content_valid)
+                    event["vcaa_content_gate_active"] = bool(
+                        record.content_gate_active
+                    )
+                    event["vcaa_content_rejection_reason"] = str(
+                        record.content_rejection_reason
+                    )
+                    event["vcaa_rejection_reason"] = str(record.rejection_reason)
+                    event["vcaa_effective_age_half_life_s"] = float(
+                        decision.effective_age_half_life_s
+                    )
+                    event["vcaa_effective_max_knowledge_age_s"] = float(
+                        decision.effective_max_knowledge_age_s
+                    )
+                    event["vcaa_age_scale_mode"] = str(decision.age_scale_mode)
                     event["vcaa_freshness_score"] = float(
                         record.freshness_score
                     )
@@ -1523,7 +1577,9 @@ def run_fedagg_server_client_process_async(
                     event["vcaa_threshold_used_for_weighting"] = bool(
                         decision.vcaa_threshold_used_for_weighting
                     )
-                    event["vcaa_final_score_used_for_weighting"] = False
+                    event["vcaa_final_score_used_for_weighting"] = bool(
+                        record.admitted
+                    )
                     event["vcaa_consensus_divergence"] = float(
                         record.components.get("consensus_divergence", float("nan"))
                     )
@@ -1537,11 +1593,7 @@ def run_fedagg_server_client_process_async(
             if knowledge_by_client:
                 defense_result = server.apply_defense(
                     knowledge_by_client,
-                    admitted_client_ids=(
-                        freshness_valid_ids
-                        if defense_controller is not None
-                        else admitted_ids
-                    ),
+                    admitted_client_ids=admitted_ids,
                     current_round=server_round,
                     controller=defense_controller,
                     student_logits=student_snapshot,
@@ -1551,11 +1603,7 @@ def run_fedagg_server_client_process_async(
                     int(item.metadata.client_id): item
                     for item in defense_result.purified_knowledge
                 }
-                expected_defense_ids = (
-                    freshness_valid_ids
-                    if defense_controller is not None
-                    else admitted_ids
-                )
+                expected_defense_ids = admitted_ids
                 if set(purified) != set(expected_defense_ids):
                     raise RuntimeError(
                         "Defense did not return every admitted teacher."
@@ -1630,11 +1678,7 @@ def run_fedagg_server_client_process_async(
                 try:
                     aggregation_weights = [
                         float(decision.aggregation_weights[int(client_id)])
-                        for client_id in (
-                            freshness_valid_ids
-                            if defense_result is not None
-                            else admitted_ids
-                        )
+                        for client_id in admitted_ids
                     ]
                 except KeyError as exc:
                     raise ValueError(
@@ -1642,7 +1686,7 @@ def run_fedagg_server_client_process_async(
                     ) from exc
             aggregate = server.aggregate_admitted_probabilities(
                 knowledge_by_client,
-                freshness_valid_ids if defense_result is not None else admitted_ids,
+                admitted_ids,
                 temperature=float(distill_temperature),
                 aggregation_rule=str(aggregation_rule),
                 trim_fraction=float(aggregation_trim_fraction),
@@ -1772,10 +1816,10 @@ def run_fedagg_server_client_process_async(
                     * len(dispatch.dispatched_clients)
                 ),
                 "server_client_distillations": len(
-                    freshness_valid_ids if defense_result is not None else admitted_ids
+                    admitted_ids
                 ),
                 "server_updates_from_clients": len(
-                    freshness_valid_ids if defense_result is not None else admitted_ids
+                    admitted_ids
                 ),
                 "client_reverse_distillations": sum(
                     1 for event in round_events
@@ -1800,6 +1844,12 @@ def run_fedagg_server_client_process_async(
                 ),
                 "vcaa_version_score_mean": float(
                     admission_metrics["version_score_mean"]
+                ),
+                "vcaa_version_lag_score_mean": float(
+                    admission_metrics.get("version_lag_score_mean", _nan())
+                ),
+                "vcaa_age_score_mean": float(
+                    admission_metrics.get("age_score_mean", _nan())
                 ),
                 "vcaa_content_score_mean": float(
                     admission_metrics["content_score_mean"]
@@ -1845,7 +1895,33 @@ def run_fedagg_server_client_process_async(
                     admission_metrics.get("content_score_scale", float("nan"))
                 ),
                 "vcaa_content_threshold_role": str(
-                    admission_metrics.get("content_threshold_role", "diagnostic_only")
+                    admission_metrics.get("content_threshold_role", "not_applicable")
+                ),
+                "vcaa_content_gate_active": bool(
+                    admission_metrics.get("content_gate_active", False)
+                ),
+                "vcaa_content_threshold_source": str(
+                    admission_metrics.get("content_threshold_source", "not_applicable")
+                ),
+                "vcaa_content_history_observations": int(
+                    admission_metrics.get("content_history_observations", 0)
+                ),
+                "vcaa_content_valid": int(
+                    admission_metrics.get("content_valid", 0)
+                ),
+                "vcaa_content_rejected": int(
+                    admission_metrics.get("content_rejected", 0)
+                ),
+                "vcaa_effective_age_half_life_s": float(
+                    admission_metrics.get("effective_age_half_life_s", _nan())
+                ),
+                "vcaa_effective_max_knowledge_age_s": float(
+                    admission_metrics.get(
+                        "effective_max_knowledge_age_s", _nan()
+                    )
+                ),
+                "vcaa_age_scale_mode": str(
+                    admission_metrics.get("age_scale_mode", "not_applicable")
                 ),
                 "vcaa_threshold_used_for_weighting": bool(
                     admission_metrics.get("vcaa_threshold_used_for_weighting", False)

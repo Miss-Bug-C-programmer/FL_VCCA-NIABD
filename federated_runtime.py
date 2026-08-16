@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import statistics
 import time
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -135,7 +136,7 @@ def _decision_metrics(
             "result_schema_version": "fedagg-results-v3",
             "vcaa_nonfinite_policy": "none",
             "vcaa_history_size": None,
-            "threshold": 0.0,
+            "threshold": float("nan"),
             "admitted": int(num_clients),
             "rejected": 0,
             "utilization": 1.0,
@@ -158,7 +159,13 @@ def _decision_metrics(
             "content_reliability_saturation_fraction": float("nan"),
             "content_score_center": float("nan"),
             "content_score_scale": float("nan"),
-            "content_threshold_role": "diagnostic_only",
+            "content_threshold_role": "not_applicable",
+            "content_gate_active": False,
+            "content_threshold_source": "not_applicable",
+            "content_history_observations": 0,
+            "effective_age_half_life_s": float("nan"),
+            "effective_max_knowledge_age_s": float("nan"),
+            "age_scale_mode": "not_applicable",
             "vcaa_threshold_used_for_weighting": False,
             "records": [],
         }
@@ -200,6 +207,8 @@ def _decision_metrics(
             else float("nan")
         ),
         "version_score_mean": component_mean("version_score"),
+        "version_lag_score_mean": component_mean("version_lag_score"),
+        "age_score_mean": component_mean("age_score"),
         "content_score_mean": component_mean("content_score"),
         "proxy_accuracy_mean": component_mean("proxy_accuracy"),
         "entropy_mean": component_mean("mean_entropy"),
@@ -224,6 +233,20 @@ def _decision_metrics(
         "content_score_center": float(decision.content_score_center),
         "content_score_scale": float(decision.content_score_scale),
         "content_threshold_role": str(decision.content_threshold_role),
+        "content_gate_active": bool(decision.content_gate_active),
+        "content_threshold_source": str(decision.content_threshold_source),
+        "content_history_observations": int(
+            decision.content_history_observations
+        ),
+        "content_valid": sum(record.content_valid for record in records),
+        "content_rejected": sum(
+            record.hard_valid and not record.content_valid for record in records
+        ),
+        "effective_age_half_life_s": float(decision.effective_age_half_life_s),
+        "effective_max_knowledge_age_s": float(
+            decision.effective_max_knowledge_age_s
+        ),
+        "age_scale_mode": str(decision.age_scale_mode),
         "vcaa_threshold_used_for_weighting": bool(
             decision.vcaa_threshold_used_for_weighting
         ),
@@ -236,7 +259,16 @@ def _decision_metrics(
                 "hard_rejection_reason": str(record.hard_rejection_reason),
                 "absolute_version_valid": bool(record.absolute_version_valid),
                 "age_valid": bool(record.age_valid),
+                "timestamp_valid": bool(record.timestamp_valid),
+                "version_lag_score": float(record.version_lag_score),
+                "age_score": float(record.age_score),
                 "freshness_score": float(record.freshness_score),
+                "content_valid": bool(record.content_valid),
+                "content_gate_active": bool(record.content_gate_active),
+                "content_rejection_reason": str(
+                    record.content_rejection_reason
+                ),
+                "rejection_reason": str(record.rejection_reason),
                 "content_reliability": float(record.content_reliability),
                 "aggregation_weight": float(record.aggregation_weight),
                 "content_score_center": float(record.content_score_center),
@@ -284,20 +316,38 @@ def _validate_decision(
         raise ValueError(
             "Admission decision contains an unknown freshness-valid client."
         )
-    if (
+    current_vcaa = (
         str(decision.method).lower() == "vcaa"
-        and str(decision.algorithm_version)
-        == VCAA_ALGORITHM_VERSION
+        and str(decision.algorithm_version) == VCAA_ALGORITHM_VERSION
+    )
+    if current_vcaa and not admitted.issubset(freshness_valid):
+        raise ValueError(
+            "Admitted teachers must be a subset of freshness-valid teachers."
+        )
+    if (
+        current_vcaa
     ):
-        if admitted != freshness_valid:
-            raise ValueError(
-                "VCAA admitted IDs must equal the freshness-valid IDs."
-            )
+        record_ids = {int(record.client_id) for record in decision.records}
+        if record_ids != expected:
+            raise ValueError("VCAA records must cover every received teacher.")
+        record_admitted = {
+            int(record.client_id)
+            for record in decision.records
+            if bool(record.admitted)
+        }
+        if record_admitted != admitted:
+            raise ValueError("VCAA record admission flags do not match admitted IDs.")
+        if any(
+            bool(record.admitted)
+            and (not bool(record.hard_valid) or not bool(record.content_valid))
+            for record in decision.records
+        ):
+            raise ValueError("VCAA admitted records must be hard- and content-valid.")
         raw_ids = set(decision.aggregation_weights)
         normalized_ids = set(decision.normalized_aggregation_weights)
-        if raw_ids != freshness_valid or normalized_ids != freshness_valid:
+        if raw_ids != admitted or normalized_ids != admitted:
             raise ValueError(
-                "VCAA aggregation weights must exactly cover freshness-valid IDs."
+                "VCAA aggregation weights must exactly cover admitted IDs."
             )
         raw_weights = list(decision.aggregation_weights.values())
         normalized_weights = list(
@@ -632,6 +682,8 @@ def run_fedagg_server_client(
         "admission_threshold": [],
         "admission_score_mean": [],
         "vcaa_version_score_mean": [],
+        "vcaa_version_lag_score_mean": [],
+        "vcaa_age_score_mean": [],
         "vcaa_content_score_mean": [],
         "vcaa_proxy_accuracy_mean": [],
         "vcaa_entropy_mean": [],
@@ -650,6 +702,14 @@ def run_fedagg_server_client(
         "vcaa_content_score_center": [],
         "vcaa_content_score_scale": [],
         "vcaa_content_threshold_role": [],
+        "vcaa_content_gate_active": [],
+        "vcaa_content_threshold_source": [],
+        "vcaa_content_history_observations": [],
+        "vcaa_content_valid": [],
+        "vcaa_content_rejected": [],
+        "vcaa_effective_age_half_life_s": [],
+        "vcaa_effective_max_knowledge_age_s": [],
+        "vcaa_age_scale_mode": [],
         "vcaa_threshold_used_for_weighting": [],
         "vcaa_history_size": [],
         "teacher_admission_records": [],
@@ -843,6 +903,25 @@ def run_fedagg_server_client(
         # One immutable pre-update snapshot is shared by VCAA and NIABD.
         student_snapshot = server.student_proxy_logits().detach().cpu().clone()
         student_snapshot_sha256 = _tensor_sha256(student_snapshot)
+        knowledge_by_client = server.mark_knowledge_consumed(
+            knowledge_by_client,
+            consumed_at_s=time.monotonic(),
+        )
+        if (
+            admission_controller is not None
+            and hasattr(admission_controller, "update_runtime_timing")
+        ):
+            observed_ages = [
+                float(item.metadata.consumed_at_s)
+                - float(item.metadata.generated_at_s)
+                for item in knowledge_by_client.values()
+                if math.isfinite(float(item.metadata.consumed_at_s))
+                and math.isfinite(float(item.metadata.generated_at_s))
+            ]
+            if observed_ages:
+                admission_controller.update_runtime_timing(
+                    statistics.median(observed_ages)
+                )
         admission_start = time.perf_counter()
         decision = server.apply_admission(
             knowledge_by_client,
@@ -871,9 +950,7 @@ def run_fedagg_server_client(
         defense_start = time.perf_counter()
         defense_result = server.apply_defense(
             knowledge_by_client,
-            admitted_client_ids=(
-                freshness_valid_ids if defense_controller is not None else admitted_ids
-            ),
+            admitted_client_ids=admitted_ids,
             current_round=round_number,
             controller=defense_controller,
             student_logits=student_snapshot,
@@ -890,9 +967,7 @@ def run_fedagg_server_client(
                 != {
                     int(client_id)
                     for client_id in (
-                        freshness_valid_ids
-                        if defense_controller is not None
-                        else admitted_ids
+                        admitted_ids
                     )
                 }
             ):
@@ -921,9 +996,7 @@ def run_fedagg_server_client(
         )
 
         distill_start = time.perf_counter()
-        aggregation_ids = (
-            freshness_valid_ids if defense_result is not None else admitted_ids
-        )
+        aggregation_ids = admitted_ids
         aggregation_weights = None
         if (
             decision is not None
@@ -1079,6 +1152,12 @@ def run_fedagg_server_client(
         metrics["vcaa_version_score_mean"].append(
             float(admission_metrics["version_score_mean"])
         )
+        metrics["vcaa_version_lag_score_mean"].append(
+            float(admission_metrics.get("version_lag_score_mean", float("nan")))
+        )
+        metrics["vcaa_age_score_mean"].append(
+            float(admission_metrics.get("age_score_mean", float("nan")))
+        )
         metrics["vcaa_content_score_mean"].append(
             float(admission_metrics["content_score_mean"])
         )
@@ -1139,7 +1218,35 @@ def run_fedagg_server_client(
             float(admission_metrics.get("content_score_scale", float("nan")))
         )
         metrics["vcaa_content_threshold_role"].append(
-            str(admission_metrics.get("content_threshold_role", "diagnostic_only"))
+            str(admission_metrics.get("content_threshold_role", "not_applicable"))
+        )
+        metrics["vcaa_content_gate_active"].append(
+            bool(admission_metrics.get("content_gate_active", False))
+        )
+        metrics["vcaa_content_threshold_source"].append(
+            str(admission_metrics.get("content_threshold_source", "not_applicable"))
+        )
+        metrics["vcaa_content_history_observations"].append(
+            int(admission_metrics.get("content_history_observations", 0))
+        )
+        metrics["vcaa_content_valid"].append(
+            int(admission_metrics.get("content_valid", 0))
+        )
+        metrics["vcaa_content_rejected"].append(
+            int(admission_metrics.get("content_rejected", 0))
+        )
+        metrics["vcaa_effective_age_half_life_s"].append(
+            float(admission_metrics.get("effective_age_half_life_s", float("nan")))
+        )
+        metrics["vcaa_effective_max_knowledge_age_s"].append(
+            float(
+                admission_metrics.get(
+                    "effective_max_knowledge_age_s", float("nan")
+                )
+            )
+        )
+        metrics["vcaa_age_scale_mode"].append(
+            str(admission_metrics.get("age_scale_mode", "not_applicable"))
         )
         metrics["vcaa_threshold_used_for_weighting"].append(
             bool(admission_metrics.get("vcaa_threshold_used_for_weighting", False))

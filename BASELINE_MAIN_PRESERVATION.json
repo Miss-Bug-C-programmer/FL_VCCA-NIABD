@@ -12,7 +12,7 @@
     "models.py",
     "numeric_integrity.py"
   ],
-  "original_file_count": 54,
+  "original_file_count": 55,
   "original_files_sha256": {
     ".dockerignore": "5d29df40d53e2ac60d0b899af321a05f418520ede31cd8a753fe86e2856af8b4",
     ".gitignore": "c0af59c48d3728265dbff4b1abce94c2015a25a2de40f1bec9f48f1e88df7bbd",
@@ -50,6 +50,7 @@
     "runtime_trace.py": "6136a16373769874e81a9ef3a44d9ac9cc03f394a47fdbad26e75f1bb8597e5f",
     "simulate.py": "bfb139affabd8b9b0e32d1526420c4900f911cea013f610a878c0b4560bb6a8f",
     "summarize_results.py": "5f11c493fa1088c6164041bd8f0b834dabf0c61ccd45bcd6ae889c4d39d85929",
+    "scripts/verify_preserved_main.py": "488ef5354d05c29755602223f7819b19bb9c169e963f8cc78ccbeda2142fa403",
     "tests/conftest.py": "ef7125a035b3858196a363f108c3ed611e4a9f3d85db4b9262bf3da4f4076a0f",
     "tests/test_data_utils.py": "23612b3ca8587ffad17d4dbaad76a2915d3ec374c8e03082de4111939a8e26fc",
     "tests/test_import_smoke.py": "14d648116d9692c4e6cfe8db45cf2e4842bb8b36f6dc7b84300abc51577e7c0f",

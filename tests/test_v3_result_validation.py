@@ -99,9 +99,9 @@ def test_v3_validator_accepts_narrow_auxiliary_tables(kind, filename, extra):
     )
 
 
-def test_v4_admission_validator_checks_normalized_contribution_fields():
+def test_v5_admission_validator_checks_normalized_contribution_fields():
     row = {
-        "run_uid": "run-v4",
+        "run_uid": "run-v5",
         "dataset": "cifar10",
         "seed": 0,
         "round": 1,
@@ -109,6 +109,25 @@ def test_v4_admission_validator_checks_normalized_contribution_fields():
         "client_id": 0,
         "admitted": True,
         "hard_valid": True,
+        "content_valid": True,
+        "content_gate_active": True,
+        "content_threshold": 0.4,
+        "content_threshold_source": "historical_median_minus_mad_floor",
+        "content_history_observations": 3,
+        "content_rejection_reason": "",
+        "rejection_reason": "",
+        "timestamp_valid": True,
+        "version_lag": 0,
+        "knowledge_age_s": 0.0,
+        "generated_at_s": 0.0,
+        "received_at_s": 0.1,
+        "consumed_at_s": 0.2,
+        "version_lag_score": 1.0,
+        "age_score": 1.0,
+        "raw_version_lag": 0,
+        "effective_age_half_life_s": 1.0,
+        "effective_max_knowledge_age_s": 4.0,
+        "age_scale_mode": "fixed",
         "aggregation_weight": 1.0,
         "content_reliability": 0.5,
         "normalized_aggregation_weight": 1.0,
@@ -117,8 +136,8 @@ def test_v4_admission_validator_checks_normalized_contribution_fields():
         "content_score_scale": 0.05,
         "content_score_z": 0.0,
         "weighting_mode": "robust_relative_sigmoid",
-        "vcaa_threshold_used_for_weighting": False,
-        "vcaa_final_score_used_for_weighting": False,
+        "vcaa_threshold_used_for_weighting": True,
+        "vcaa_final_score_used_for_weighting": True,
         "vcaa_algorithm_version": VCAA_ALGORITHM_VERSION,
         "result_schema_version": RESULT_SCHEMA_VERSION,
     }

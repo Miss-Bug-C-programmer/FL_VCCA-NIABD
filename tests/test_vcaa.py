@@ -61,6 +61,7 @@ def test_vcaa_uses_content_quality_and_adaptive_history_threshold():
             warmup_rounds=1,
             history_window_rounds=2,
             minimum_content_cohort_size=1,
+            minimum_content_history_size=2,
         ),
         clock=lambda: 100.0,
     )
@@ -79,12 +80,13 @@ def test_vcaa_uses_content_quality_and_adaptive_history_threshold():
     )
 
     assert warmup.admitted_client_ids == (0, 1)
-    assert decision.threshold == 1.0
-    assert decision.admitted_client_ids == (0, 1)
-    assert decision.rejected_client_ids == ()
+    assert decision.threshold == pytest.approx(0.95)
+    assert decision.admitted_client_ids == (0,)
+    assert decision.rejected_client_ids == (1,)
     assert decision.records[0].content_reliability > decision.records[1].content_reliability
-    assert decision.records[0].aggregation_weight > decision.records[1].aggregation_weight
-    assert decision.vcaa_threshold_used_for_weighting is False
+    assert decision.records[0].aggregation_weight > 0.0
+    assert decision.records[1].aggregation_weight == 0.0
+    assert decision.vcaa_threshold_used_for_weighting is True
     assert decision.records[0].components["proxy_accuracy"] == 1.0
     assert decision.records[1].components["proxy_accuracy"] == 0.0
 
@@ -380,8 +382,10 @@ def test_content_lower_bound_is_not_used_as_reliability_divisor():
     reliabilities = [record.content_reliability for record in decision.records]
     assert all(0.0 < value < 1.0 for value in reliabilities)
     assert decision.content_reliability_saturation_fraction == 0.0
+    assert decision.content_gate_active is True
+    assert decision.content_threshold_source == "historical_median_minus_mad_floor"
     assert all(
-        record.components["vcaa_threshold_used_for_weighting"] is False
+        record.components["vcaa_threshold_used_for_weighting"] is True
         for record in decision.records
     )
 
@@ -411,13 +415,15 @@ def test_warmup_uses_uniform_content_reliability():
     assert decision.content_reliability_saturation_fraction == 1.0
 
 
-def test_content_quality_never_hard_rejects_fresh_teacher():
+def test_uncalibrated_content_gate_is_explicitly_inactive():
     controller = VersionContentAwareAdmission(
         _v4_content_config(minimum_content_cohort_size=1), clock=lambda: 100.0
     )
     decision = _evaluate_content_batch(controller, ["bad"], current_round=2)
     record = decision.records[0]
     assert record.hard_valid is True
+    assert decision.content_gate_active is False
+    assert decision.content_threshold_source == "insufficient_history"
     assert record.admitted is True
     assert record.aggregation_weight > 0.0
     assert decision.rejected_client_ids == ()
@@ -658,13 +664,13 @@ def test_normalized_vcaa_weights_sum_to_one():
     )
 
 
-def test_legacy_threshold_is_diagnostic_only():
+def test_historical_threshold_controls_content_admission():
     common = _v4_content_config(history_window_rounds=3)
     low_beta = VersionContentAwareAdmission(
         replace(common, threshold_beta=0.0), clock=lambda: 100.0
     )
     high_beta = VersionContentAwareAdmission(
-        replace(common, threshold_beta=3.0), clock=lambda: 100.0
+        replace(common, threshold_beta=20.0), clock=lambda: 100.0
     )
     for controller in (low_beta, high_beta):
         _evaluate_content_batch(controller, ["good", "mid", "bad"], current_round=1)
@@ -674,10 +680,9 @@ def test_legacy_threshold_is_diagnostic_only():
     assert [record.content_reliability for record in left.records] == pytest.approx(
         [record.content_reliability for record in right.records]
     )
-    assert list(left.aggregation_weights.values()) == pytest.approx(
-        list(right.aggregation_weights.values())
-    )
-    assert left.vcaa_threshold_used_for_weighting is False
+    assert set(left.admitted_client_ids) != set(right.admitted_client_ids)
+    assert left.vcaa_threshold_used_for_weighting is True
+    assert right.vcaa_threshold_used_for_weighting is True
 
 
 def test_vcaa_snapshot_restore_reproduces_next_round_calibration():
@@ -704,3 +709,209 @@ def test_vcaa_snapshot_restore_reproduces_next_round_calibration():
         expected.normalized_aggregation_weights
     )
     assert actual.aggregation_weights == pytest.approx(expected.aggregation_weights)
+
+
+def test_version_lag_zero_and_one_have_distinct_nonzero_scores():
+    config = _v4_content_config(
+        version_weight=1.0,
+        warmup_rounds=0,
+        max_version_lag=1,
+        version_lag_half_life_rounds=1.0,
+        age_scale_mode="fixed",
+        minimum_content_cohort_size=1,
+    )
+    knowledge = [
+        _fresh_knowledge(0, 10, _binary_teacher_logits()["good"]),
+        _fresh_knowledge(1, 9, _binary_teacher_logits()["good"]),
+    ]
+    decision = VersionContentAwareAdmission(config, clock=lambda: 100.0).evaluate(
+        teacher_knowledge=knowledge,
+        student_logits=torch.zeros(4, 2),
+        proxy_labels=_labels(),
+        current_round=10,
+    )
+    fresh, mild = decision.records
+    assert fresh.hard_valid and mild.hard_valid
+    assert fresh.version_lag_score == pytest.approx(1.0)
+    assert mild.version_lag_score == pytest.approx(0.5)
+    assert fresh.version_lag_score > mild.version_lag_score > 0.0
+    assert fresh.aggregation_weight > mild.aggregation_weight
+
+
+def test_version_lag_above_maximum_is_hard_rejected():
+    config = _v4_content_config(
+        max_version_lag=1,
+        warmup_rounds=0,
+        age_scale_mode="fixed",
+    )
+    decision = VersionContentAwareAdmission(config, clock=lambda: 100.0).evaluate(
+        teacher_knowledge=[
+            _fresh_knowledge(0, 8, _binary_teacher_logits()["good"]),
+        ],
+        student_logits=torch.zeros(4, 2),
+        proxy_labels=_labels(),
+        current_round=10,
+    )
+    record = decision.records[0]
+    assert record.hard_valid is False
+    assert record.admitted is False
+    assert record.aggregation_weight == 0.0
+    assert decision.aggregation_weights == {}
+
+
+def test_fixed_age_half_life_controls_age_score_and_hard_expiry():
+    config = _v4_content_config(
+        version_weight=1.0,
+        warmup_rounds=0,
+        age_scale_mode="fixed",
+        age_half_life_s=2.0,
+        max_knowledge_age_s=5.0,
+        minimum_content_cohort_size=1,
+    )
+    decision = VersionContentAwareAdmission(config, clock=lambda: 100.0).evaluate(
+        teacher_knowledge=[
+            _fresh_knowledge(0, 10, _binary_teacher_logits()["good"], generated=0.0, consumed=0.0),
+            _fresh_knowledge(1, 10, _binary_teacher_logits()["good"], generated=0.0, consumed=2.0),
+            _fresh_knowledge(2, 10, _binary_teacher_logits()["good"], generated=0.0, consumed=6.0),
+        ],
+        student_logits=torch.zeros(4, 2),
+        proxy_labels=_labels(),
+        current_round=10,
+    )
+    assert decision.records[0].age_score == pytest.approx(1.0)
+    assert decision.records[1].age_score == pytest.approx(0.5)
+    assert decision.records[1].hard_valid is True
+    assert decision.records[2].hard_valid is False
+    assert decision.records[2].hard_rejection_reason == "expired_knowledge_age"
+
+
+@pytest.mark.parametrize("bad_field", ["received_at_s", "consumed_at_s"])
+def test_timestamp_order_is_a_hard_validity_invariant(bad_field):
+    knowledge = [_fresh_knowledge(0, 10, _binary_teacher_logits()["good"])]
+    metadata = knowledge[0].metadata
+    if bad_field == "received_at_s":
+        metadata = replace(metadata, received_at_s=9.0, consumed_at_s=11.0)
+    else:
+        metadata = replace(metadata, received_at_s=11.0, consumed_at_s=10.0)
+    knowledge[0] = TeacherKnowledge(metadata=metadata, logits=knowledge[0].logits)
+    decision = VersionContentAwareAdmission(
+        _v4_content_config(warmup_rounds=0, age_scale_mode="fixed"),
+        clock=lambda: 100.0,
+    ).evaluate(
+        teacher_knowledge=knowledge,
+        student_logits=torch.zeros(4, 2),
+        proxy_labels=_labels(),
+        current_round=10,
+    )
+    record = decision.records[0]
+    assert record.hard_valid is False
+    assert record.timestamp_valid is False
+    assert record.hard_rejection_reason == "invalid_timestamp_order"
+
+
+def test_content_gate_rejects_content_without_resurrecting_or_weighting_it():
+    config = _v4_content_config(
+        warmup_rounds=0,
+        minimum_content_history_size=3,
+        minimum_content_cohort_size=1,
+        age_scale_mode="fixed",
+    )
+    controller = VersionContentAwareAdmission(config, clock=lambda: 100.0)
+    _evaluate_content_batch(controller, ["good", "good", "good"], current_round=1)
+    decision = _evaluate_content_batch(
+        controller,
+        ["good", "bad", "good"],
+        current_round=2,
+    )
+    records = _records_by_client(decision)
+    assert decision.freshness_valid_client_ids == (0, 1, 2)
+    assert decision.admitted_client_ids == (0, 2)
+    assert records[1].hard_valid is True
+    assert records[1].content_valid is False
+    assert records[1].content_rejection_reason == "below_historical_threshold"
+    assert records[1].aggregation_weight == 0.0
+    assert 1 not in decision.aggregation_weights
+
+
+def test_content_gate_warmup_and_insufficient_history_are_explicit():
+    controller = VersionContentAwareAdmission(
+        _v4_content_config(
+            warmup_rounds=1,
+            minimum_content_history_size=3,
+            age_scale_mode="fixed",
+        ),
+        clock=lambda: 100.0,
+    )
+    warmup = _evaluate_content_batch(controller, ["bad"], current_round=1)
+    assert warmup.content_gate_active is False
+    assert warmup.content_threshold_source == "warmup_disabled"
+    assert math.isnan(warmup.threshold)
+    assert warmup.records[0].content_valid is True
+    assert warmup.records[0].content_rejection_reason == "gate_inactive_warmup_disabled"
+
+    fresh_controller = VersionContentAwareAdmission(
+        _v4_content_config(
+            warmup_rounds=0,
+            minimum_content_history_size=3,
+            age_scale_mode="fixed",
+        ),
+        clock=lambda: 100.0,
+    )
+    insufficient = _evaluate_content_batch(
+        fresh_controller, ["bad"], current_round=1
+    )
+    assert insufficient.content_gate_active is False
+    assert insufficient.content_threshold_source == "insufficient_history"
+    assert math.isnan(insufficient.threshold)
+    assert insufficient.records[0].content_valid is True
+
+
+def test_version_weight_is_a_live_aggregation_parameter():
+    low_version = VersionContentAwareAdmission(
+        _v4_content_config(
+            version_weight=0.0,
+            minimum_content_cohort_size=2,
+            age_scale_mode="fixed",
+        ),
+        clock=lambda: 100.0,
+    )
+    high_version = VersionContentAwareAdmission(
+        _v4_content_config(
+            version_weight=1.0,
+            minimum_content_cohort_size=2,
+            age_scale_mode="fixed",
+        ),
+        clock=lambda: 100.0,
+    )
+    args = {
+        "teacher_knowledge": [
+            _fresh_knowledge(0, 10, _binary_teacher_logits()["good"]),
+            _fresh_knowledge(1, 9, _binary_teacher_logits()["bad"]),
+        ],
+        "student_logits": torch.zeros(4, 2),
+        "proxy_labels": _labels(),
+        "current_round": 10,
+    }
+    left = low_version.evaluate(**args)
+    right = high_version.evaluate(**args)
+    assert left.admitted_client_ids == right.admitted_client_ids
+    assert left.aggregation_weights != right.aggregation_weights
+
+
+def test_runtime_age_calibration_is_bounded_and_checkpointable():
+    config = _v4_content_config(
+        age_scale_mode="runtime-calibrated",
+        runtime_age_reference_multiplier=4.0,
+        runtime_age_half_life_floor_s=0.5,
+        runtime_age_half_life_ceiling_s=2.0,
+    )
+    controller = VersionContentAwareAdmission(config, clock=lambda: 100.0)
+    controller.update_runtime_timing(100.0)
+    assert controller.effective_age_half_life_s == pytest.approx(2.0)
+    snapshot = controller.snapshot_state()
+    restored = VersionContentAwareAdmission(config, clock=lambda: 100.0)
+    restored.restore_state(snapshot)
+    assert restored.effective_age_half_life_s == pytest.approx(2.0)
+    assert restored.effective_max_knowledge_age_s == pytest.approx(
+        controller.effective_max_knowledge_age_s
+    )

@@ -11,13 +11,13 @@ import pandas as pd
 
 
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
-VCAA_ALGORITHM_VERSION = "vcaa-v4-fresh-first-robust-relative-weighting"
+VCAA_ALGORITHM_VERSION = "vcaa-v5-lineage-content-admission-runtime-age"
 NIABD_ALGORITHM_VERSION = (
     "niabd-v3-trusted-memory-recovery-controller"
 )
 AGGREGATION_ALGORITHM_VERSION = "aggregation-v1-probability-space"
 
-VCAA_V4_ROUND_COLUMNS = frozenset({
+VCAA_V5_ROUND_COLUMNS = frozenset({
     "vcaa_freshness_valid_teachers",
     "vcaa_effective_teacher_count",
     "vcaa_weight_cv",
@@ -27,9 +27,26 @@ VCAA_V4_ROUND_COLUMNS = frozenset({
     "vcaa_content_score_scale",
     "vcaa_content_threshold_role",
     "vcaa_threshold_used_for_weighting",
+    "vcaa_version_lag_score_mean",
+    "vcaa_age_score_mean",
+    "vcaa_content_gate_active",
+    "vcaa_content_threshold_source",
+    "vcaa_content_history_observations",
+    "vcaa_content_valid",
+    "vcaa_content_rejected",
+    "vcaa_effective_age_half_life_s",
+    "vcaa_effective_max_knowledge_age_s",
+    "vcaa_age_scale_mode",
 })
 
-VCAA_V4_ADMISSION_COLUMNS = frozenset({
+VCAA_V5_ADMISSION_COLUMNS = frozenset({
+    "admitted",
+    "hard_valid",
+    "version_lag",
+    "knowledge_age_s",
+    "generated_at_s",
+    "received_at_s",
+    "consumed_at_s",
     "content_score_center",
     "content_score_scale",
     "content_score_z",
@@ -38,9 +55,30 @@ VCAA_V4_ADMISSION_COLUMNS = frozenset({
     "weighting_mode",
     "vcaa_threshold_used_for_weighting",
     "vcaa_final_score_used_for_weighting",
+    "version_lag_score",
+    "age_score",
+    "raw_version_lag",
+    "timestamp_valid",
+    "content_threshold",
+    "content_valid",
+    "content_gate_active",
+    "content_rejection_reason",
+    "rejection_reason",
+    "content_threshold_source",
+    "content_history_observations",
+    "effective_age_half_life_s",
+    "effective_max_knowledge_age_s",
+    "age_scale_mode",
+    "content_reliability",
+    "aggregation_weight",
 })
 
-VCAA_V4_RUNTIME_COLUMNS = frozenset({
+VCAA_V5_RUNTIME_COLUMNS = frozenset({
+    "vcaa_hard_valid",
+    "vcaa_absolute_version_valid",
+    "vcaa_age_valid",
+    "vcaa_freshness_score",
+    "vcaa_threshold",
     "vcaa_content_score_center",
     "vcaa_content_score_scale",
     "vcaa_content_score_z",
@@ -49,7 +87,25 @@ VCAA_V4_RUNTIME_COLUMNS = frozenset({
     "vcaa_weighting_mode",
     "vcaa_threshold_used_for_weighting",
     "vcaa_final_score_used_for_weighting",
+    "vcaa_version_lag_score",
+    "vcaa_age_score",
+    "vcaa_timestamp_valid",
+    "vcaa_content_valid",
+    "vcaa_content_gate_active",
+    "vcaa_content_rejection_reason",
+    "vcaa_rejection_reason",
+    "vcaa_effective_age_half_life_s",
+    "vcaa_effective_max_knowledge_age_s",
+    "vcaa_age_scale_mode",
+    "vcaa_content_reliability",
+    "vcaa_aggregation_weight",
 })
+
+# Compatibility aliases keep downstream scripts import-stable while the
+# algorithm lineage and validation semantics move to v5.
+VCAA_V4_ROUND_COLUMNS = VCAA_V5_ROUND_COLUMNS
+VCAA_V4_ADMISSION_COLUMNS = VCAA_V5_ADMISSION_COLUMNS
+VCAA_V4_RUNTIME_COLUMNS = VCAA_V5_RUNTIME_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -88,6 +144,16 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("niabd_memory_update_reason", "string", True, ("niabd", "vcaa-niabd"), ("*",), None, "Explicit NIABD state-machine reason."),
     MetricSchemaEntry("niabd_observations", "number", True, ("niabd", "vcaa-niabd"), ("*",), None, "Cumulative eligible teacher-proxy observations."),
     MetricSchemaEntry("vcaa_history_size", "integer", True, ("vcaa", "vcaa-niabd"), ("*",), None, "VCAA history size."),
+    MetricSchemaEntry("vcaa_version_lag_score_mean", "number", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Mean eligible version-lag decay score."),
+    MetricSchemaEntry("vcaa_age_score_mean", "number", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Mean wall-clock age decay score."),
+    MetricSchemaEntry("vcaa_content_gate_active", "boolean", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Whether historical content admission was active."),
+    MetricSchemaEntry("vcaa_content_threshold_source", "string", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Content threshold calibration source or inactive reason."),
+    MetricSchemaEntry("vcaa_content_history_observations", "integer", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Historical content observations used for calibration."),
+    MetricSchemaEntry("vcaa_content_valid", "integer", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Hard-valid teachers passing content admission."),
+    MetricSchemaEntry("vcaa_content_rejected", "integer", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Hard-valid teachers rejected by content admission."),
+    MetricSchemaEntry("vcaa_effective_age_half_life_s", "number", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Effective VCAA age half-life in seconds."),
+    MetricSchemaEntry("vcaa_effective_max_knowledge_age_s", "number", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Effective VCAA maximum knowledge age in seconds."),
+    MetricSchemaEntry("vcaa_age_scale_mode", "string", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Fixed or bounded runtime-calibrated age scale."),
     MetricSchemaEntry("numeric_failure_count", "integer", False, ("*",), ("*",), 0, "Actual numeric failures."),
     MetricSchemaEntry("rollback_reason", "string", True, ("*",), ("*",), None, "Round/run rollback reason."),
     MetricSchemaEntry("checkpoint_path", "string", True, ("*",), ("*",), None, "Committed checkpoint path."),
@@ -103,6 +169,16 @@ OPTIONAL_BACKWARD_COMPAT_COLUMNS = frozenset({
     "git_dirty",
     "config_sha256",
     "runtime_profile_sha256",
+    "vcaa_version_lag_score_mean",
+    "vcaa_age_score_mean",
+    "vcaa_content_gate_active",
+    "vcaa_content_threshold_source",
+    "vcaa_content_history_observations",
+    "vcaa_content_valid",
+    "vcaa_content_rejected",
+    "vcaa_effective_age_half_life_s",
+    "vcaa_effective_max_knowledge_age_s",
+    "vcaa_age_scale_mode",
 })
 
 
@@ -187,40 +263,42 @@ def validate_frame(
             values = frame[column].dropna().astype(str)
             if any(value and len(value) != 64 for value in values):
                 raise ValueError(f"{column} contains an invalid SHA-256 value.")
-    vcaa_v4_rows = frame[
+    vcaa_v5_rows = frame[
         frame["vcaa_algorithm_version"].astype(str)
         == VCAA_ALGORITHM_VERSION
     ]
-    # The v4 diagnostics below are round-level fields.  Summary rows carry
+    # The v5 diagnostics below are round-level fields.  Summary rows carry
     # the same algorithm lineage but intentionally retain their compact,
     # historical summary schema.
-    if not vcaa_v4_rows.empty and "round" in frame.columns:
-        missing_v4 = sorted(VCAA_V4_ROUND_COLUMNS - set(frame.columns))
-        if missing_v4:
+    if not vcaa_v5_rows.empty and "round" in frame.columns:
+        missing_v5 = sorted(VCAA_V5_ROUND_COLUMNS - set(frame.columns))
+        if missing_v5:
             raise ValueError(
-                "VCAA v4 round result is missing columns: "
-                f"{missing_v4}"
+                "VCAA v5 round result is missing columns: "
+                f"{missing_v5}"
             )
         valid_counts = pd.to_numeric(
-            vcaa_v4_rows["vcaa_freshness_valid_teachers"],
+            vcaa_v5_rows["vcaa_freshness_valid_teachers"],
             errors="coerce",
         )
         if valid_counts.isna().any() or (valid_counts < 0).any():
-            raise ValueError("VCAA v4 freshness-valid teacher counts are invalid.")
-        ess = pd.to_numeric(
-            vcaa_v4_rows["vcaa_effective_teacher_count"],
-            errors="coerce",
+            raise ValueError("VCAA v5 admitted teacher counts are invalid.")
+        admitted_counts = pd.to_numeric(
+            vcaa_v5_rows["admitted_teachers"], errors="coerce"
         )
-        cv = pd.to_numeric(vcaa_v4_rows["vcaa_weight_cv"], errors="coerce")
+        ess = pd.to_numeric(
+            vcaa_v5_rows["vcaa_effective_teacher_count"], errors="coerce"
+        )
+        cv = pd.to_numeric(vcaa_v5_rows["vcaa_weight_cv"], errors="coerce")
         tv = pd.to_numeric(
-            vcaa_v4_rows["vcaa_weight_total_variation_from_uniform"],
+            vcaa_v5_rows["vcaa_weight_total_variation_from_uniform"],
             errors="coerce",
         )
         saturation = pd.to_numeric(
-            vcaa_v4_rows["vcaa_content_reliability_saturation_fraction"],
+            vcaa_v5_rows["vcaa_content_reliability_saturation_fraction"],
             errors="coerce",
         )
-        observed = valid_counts > 0
+        observed = admitted_counts > 0
         for name, values in (
             ("ESS", ess),
             ("weight CV", cv),
@@ -232,16 +310,16 @@ def validate_frame(
                 lambda value: math.isfinite(float(value))
             ).all():
                 raise ValueError(
-                    f"VCAA v4 {name} diagnostics must be finite."
+                    f"VCAA v5 {name} diagnostics must be finite."
                 )
         if (ess[observed] < 1.0).any():
-            raise ValueError("VCAA v4 ESS must be at least one.")
-        if (ess[observed] > valid_counts[observed] + 1e-5).any():
-            raise ValueError("VCAA v4 ESS exceeds freshness-valid teacher count.")
+            raise ValueError("VCAA v5 ESS must be at least one.")
+        if (ess[observed] > admitted_counts[observed] + 1e-5).any():
+            raise ValueError("VCAA v5 ESS exceeds admitted teacher count.")
         if (cv[observed] < 0.0).any() or (tv[observed] < 0.0).any():
-            raise ValueError("VCAA v4 weight dispersion diagnostics are negative.")
+            raise ValueError("VCAA v5 weight dispersion diagnostics are negative.")
         if (saturation[observed] < 0.0).any() or (saturation[observed] > 1.0).any():
-            raise ValueError("VCAA v4 saturation fraction is outside [0, 1].")
+            raise ValueError("VCAA v5 saturation fraction is outside [0, 1].")
     if method is not None:
         method = str(method).lower()
         expected_vcaa = VCAA_ALGORITHM_VERSION if method in {"vcaa", "vcaa-niabd"} else "none"

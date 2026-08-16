@@ -61,6 +61,26 @@ def main() -> None:
             "--method", str(method),
             "--seeds", str(seed),
             "--run-class", "formal",
+            "--runtime", str(config.get("runtime", "sync")),
+            "--runtime-profile", str(
+                config.get("runtime_profile", "configs/runtime_moderate.json")
+            ),
+            "--runtime-warmup-rounds", str(
+                config.get("runtime_warmup_rounds", 1)
+            ),
+            "--quorum-fraction", str(config.get("quorum_fraction", 0.5)),
+            "--vcaa-age-scale-mode", str(
+                config.get("vcaa_age_scale_mode", "runtime-calibrated")
+            ),
+            "--vcaa-max-version-lag", str(
+                config.get("vcaa_max_version_lag", 1)
+            ),
+            "--vcaa-version-lag-half-life-rounds", str(
+                config.get("vcaa_version_lag_half_life_rounds", 1.0)
+            ),
+            "--vcaa-minimum-content-history-size", str(
+                config.get("vcaa_minimum_content_history_size", 3)
+            ),
         ]
         subprocess.run(command, cwd=root, check=True)
 
