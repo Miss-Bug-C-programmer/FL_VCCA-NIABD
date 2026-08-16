@@ -11,6 +11,7 @@ import statistics
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+import uuid
 
 import torch
 
@@ -196,9 +197,11 @@ class _ProcessRpcService:
             raise RpcProtocolError("GET_TASK cannot contain a payload.")
         client_id = int(request.metadata["client_id"])
         pid = int(request.metadata["pid"])
+        request_id = str(request.metadata.get("request_id", ""))
         status, task = self.coordinator.get_task(
             client_id=client_id,
             pid=pid,
+            request_id=request_id,
         )
         if status == "ROLLBACK":
             if task is None:
@@ -470,6 +473,51 @@ def _send_rollback_ack(
     )
 
 
+def _get_task_with_retry(
+    *,
+    host: str,
+    port: int,
+    client_id: int,
+    request_id: str,
+    pid: int,
+    config: ProcessRuntimeConfig,
+    deadline_s: float,
+) -> Tuple[RpcFrame, int, float]:
+    """Fetch one task, retrying only transient TCP delivery failures.
+
+    ``GET_TASK`` carries a request id and the coordinator replays the same
+    response for a repeated id.  Therefore a timeout after the server has
+    already assigned a task cannot cause a second task assignment or silently
+    drop the first task.
+    """
+
+    attempt = 0
+    while True:
+        try:
+            return rpc_call(
+                host,
+                port,
+                message_type="GET_TASK",
+                metadata={
+                    "client_id": int(client_id),
+                    "pid": int(pid),
+                    "request_id": str(request_id),
+                },
+                timeout_s=float(config.rpc_timeout_s),
+                max_message_bytes=int(config.max_message_bytes),
+            )
+        except (OSError, TimeoutError):
+            if time.monotonic() >= float(deadline_s):
+                raise
+            attempt += 1
+            backoff = min(
+                0.5,
+                max(float(config.retry_backoff_s), 0.01)
+                * (2 ** min(attempt - 1, 5)),
+            )
+            time.sleep(backoff)
+
+
 def _client_process_main(
     *,
     client_id: int,
@@ -536,19 +584,29 @@ def _client_process_main(
             else None
         )
         task_snapshots: Dict[str, Dict[str, object]] = {}
+        registered = False
 
         while True:
-            response, _, _ = rpc_call(
-                host,
-                port,
-                message_type="GET_TASK",
-                metadata={
-                    "client_id": int(client_id),
-                    "pid": int(os.getpid()),
-                },
-                timeout_s=float(config.rpc_timeout_s),
-                max_message_bytes=int(config.max_message_bytes),
+            request_id = uuid.uuid4().hex
+            retry_deadline = time.monotonic() + (
+                float(config.registration_timeout_s)
+                if not registered
+                else max(
+                    5.0,
+                    float(config.rpc_timeout_s)
+                    * max(2, int(config.max_retries) + 1),
+                )
             )
+            response, _, _ = _get_task_with_retry(
+                host=host,
+                port=port,
+                client_id=int(client_id),
+                request_id=request_id,
+                pid=os.getpid(),
+                config=config,
+                deadline_s=retry_deadline,
+            )
+            registered = True
             if response.message_type == "STOP":
                 break
             if response.message_type == "ROLLBACK":

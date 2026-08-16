@@ -184,6 +184,11 @@ def rpc_call(
 class _ThreadingRpcServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # The process runtime starts many persistent clients together.  The
+    # socketserver default is typically only five pending connections, which
+    # lets a legitimate startup burst fail before any application RPC is
+    # handled.  This is a transport-level queue, not an application backlog.
+    request_queue_size = 128
 
 
 class _RpcRequestHandler(socketserver.BaseRequestHandler):

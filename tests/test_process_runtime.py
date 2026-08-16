@@ -1,9 +1,11 @@
 import multiprocessing
 import math
 import os
+import time
 
 import pytest
 import torch
+import process_runtime as process_runtime_module
 
 from data_utils import (
     build_client_dataloaders_from_plan,
@@ -41,6 +43,83 @@ def test_process_cuda_device_without_index_resolves_to_visible_device_zero():
     assert _resolve_process_device("cuda") == torch.device("cuda:0")
     assert _resolve_process_device("cuda:2") == torch.device("cuda:2")
     assert _resolve_process_device("cpu") == torch.device("cpu")
+
+
+def test_get_task_request_id_replays_the_same_assignment():
+    trace = generate_runtime_trace(
+        profile={
+            "name": "request-replay",
+            "slow_client_fraction": 0.0,
+            "normal_compute_slowdown_factor": 1.0,
+            "slow_compute_slowdown_factor": 1.0,
+            "normal_upload_delay_s": 0.0,
+            "slow_upload_delay_s": 0.0,
+            "availability_probability": 1.0,
+            "upload_attempt_drop_probability": 0.0,
+            "ack_delay_probability": 0.0,
+            "ack_delay_s": 0.0,
+            "events": {},
+        },
+        seed=0,
+        num_clients=1,
+        rounds=1,
+        warmup_rounds=1,
+        participation_rate=1.0,
+    )
+    coordinator = SemiAsyncRoundCoordinator(
+        trace=trace,
+        proxy_version="proxy",
+        local_epochs=1,
+        learning_rate=0.01,
+        distillation_temperature=2.0,
+        enable_client_distillation=False,
+    )
+    coordinator.dispatch_round(server_round=1, latest_server_packet=None)
+    first_status, first_task = coordinator.get_task(
+        client_id=0,
+        pid=123,
+        request_id="request-1",
+    )
+    replay_status, replay_task = coordinator.get_task(
+        client_id=0,
+        pid=123,
+        request_id="request-1",
+    )
+    assert first_status == replay_status == "TASK"
+    assert first_task is not None
+    assert replay_task is not None
+    assert first_task.task_id == replay_task.task_id
+
+
+def test_get_task_rpc_retries_transient_startup_timeout(monkeypatch):
+    calls = []
+
+    def flaky_rpc_call(*args, **kwargs):
+        calls.append(kwargs["metadata"]["request_id"])
+        if len(calls) == 1:
+            raise TimeoutError("startup backlog")
+        return process_runtime_module.RpcFrame(
+            message_type="NO_TASK",
+            metadata={},
+            payload=b"",
+            wire_bytes=0,
+        ), 0, 0.0
+
+    monkeypatch.setattr(process_runtime_module, "rpc_call", flaky_rpc_call)
+    response, _, _ = process_runtime_module._get_task_with_retry(
+        host="127.0.0.1",
+        port=12345,
+        client_id=0,
+        request_id="request-1",
+        pid=123,
+        config=ProcessRuntimeConfig(
+            rpc_timeout_s=0.01,
+            retry_backoff_s=0.0,
+        ),
+        deadline_s=time.monotonic() + 1.0,
+    )
+    assert response.message_type == "NO_TASK"
+    assert calls == ["request-1", "request-1"]
 
 
 def _write_femnist(root):

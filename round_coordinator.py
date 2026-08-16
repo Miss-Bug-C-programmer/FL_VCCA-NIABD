@@ -118,6 +118,10 @@ class SemiAsyncRoundCoordinator:
             for client_id in range(int(trace.num_clients))
         }
         self._client_pid: Dict[int, int] = {}
+        self._last_get_task_request: Dict[
+            int,
+            Tuple[str, str, Optional[ClientTask]],
+        ] = {}
         self._seen_packet_ids: Dict[str, Tuple[str, str, float]] = {}
         self._rollback_by_client: Dict[int, str] = {}
         self._shutdown = False
@@ -141,6 +145,7 @@ class SemiAsyncRoundCoordinator:
                 "proxy_version": self.proxy_version,
                 "client_state": dict(self._client_state),
                 "client_pid": dict(self._client_pid),
+                "last_get_task_request": dict(self._last_get_task_request),
                 "task_registry": {
                     task_id: {
                         "task": entry.task,
@@ -182,6 +187,19 @@ class SemiAsyncRoundCoordinator:
                 int(key): int(value)
                 for key, value in state["client_pid"].items()
             }
+            self._last_get_task_request = {}
+            for key, value in state.get(
+                "last_get_task_request", {}
+            ).items():
+                if not isinstance(value, (tuple, list)) or len(value) != 3:
+                    raise ValueError(
+                        "Coordinator GET_TASK request snapshot is invalid."
+                    )
+                self._last_get_task_request[int(key)] = (
+                    str(value[0]),
+                    str(value[1]),
+                    value[2],
+                )
             self.task_registry = {}
             for task_id, raw in state["task_registry"].items():
                 if not isinstance(raw, dict) or not isinstance(
@@ -321,25 +339,44 @@ class SemiAsyncRoundCoordinator:
         *,
         client_id: int,
         pid: int,
+        request_id: str = "",
     ) -> Tuple[str, Optional[ClientTask]]:
         with self._lock:
             self.register_client(client_id, pid)
+            request_id = str(request_id)
+            previous = self._last_get_task_request.get(int(client_id))
+            if request_id and previous is not None:
+                if previous[0] == request_id:
+                    return previous[1], previous[2]
             if self._shutdown:
                 self._client_state[int(client_id)] = CLIENT_STOPPED
-                return "STOP", None
-            rollback_task_id = self._rollback_by_client.get(int(client_id))
-            if rollback_task_id is not None:
-                return "ROLLBACK", self.task_registry[rollback_task_id].task
-            task = self._pending_by_client.pop(int(client_id), None)
-            if task is None:
-                return "NO_TASK", None
-            entry = self.task_registry[task.task_id]
-            if entry.status != TASK_DISPATCHED:
-                raise RuntimeError(
-                    f"Task {task.task_id} is not dispatchable."
+                result = ("STOP", None)
+            else:
+                rollback_task_id = self._rollback_by_client.get(int(client_id))
+                if rollback_task_id is not None:
+                    result = (
+                        "ROLLBACK",
+                        self.task_registry[rollback_task_id].task,
+                    )
+                else:
+                    task = self._pending_by_client.pop(int(client_id), None)
+                    if task is None:
+                        result = ("NO_TASK", None)
+                    else:
+                        entry = self.task_registry[task.task_id]
+                        if entry.status != TASK_DISPATCHED:
+                            raise RuntimeError(
+                                f"Task {task.task_id} is not dispatchable."
+                            )
+                        entry.status = TASK_IN_FLIGHT
+                        result = ("TASK", task)
+            if request_id:
+                self._last_get_task_request[int(client_id)] = (
+                    request_id,
+                    result[0],
+                    result[1],
                 )
-            entry.status = TASK_IN_FLIGHT
-            return "TASK", task
+            return result
 
     def request_client_rollback(self, *, task_id: str, reason: str) -> None:
         """Schedule an explicit model restore for the task's owning client."""

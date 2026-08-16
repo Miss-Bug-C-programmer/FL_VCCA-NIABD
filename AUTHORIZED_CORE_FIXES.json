@@ -102,11 +102,11 @@
     {
       "file": "process_runtime.py",
       "upstream_sha256": "2acb78cd48e70ae8ff3c1c3d56b2b7a99527307441413198bc36c2b17ce071e5",
-      "patched_sha256": "b8dc7c9a8c83415ef9034dde0809c45ef3fca2b1fe5503dcfce9f5a3b70bac63",
-      "reason": "Preserve real persistent client/RPC execution while fixing compute-generation timestamps, runtime age calibration, and admitted-set defense/aggregation routing.",
-      "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py",
+      "patched_sha256": "e1415ee53dbb944d113724bde7e995a9ca2831e986c7b6970f36ad01d9a721d2",
+      "reason": "Preserve real persistent client/RPC execution while fixing compute-generation timestamps, runtime age calibration, admitted-set defense/aggregation routing, and burst-safe idempotent GET_TASK startup retries.",
+      "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py tests/test_rpc_transport.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py"],
+      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py", "tests/test_rpc_transport.py"],
       "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v5-lineage-content-admission-runtime-age; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
       "schema_version_impact": "fedagg-results-v3",
       "behavior_change_id": "v3-process-transaction"
@@ -114,14 +114,26 @@
     {
       "file": "round_coordinator.py",
       "upstream_sha256": "9307237a36e386a54285fc9b7021472e43b82d4a9eb3d7b1440ae2e2cf2c0d8d",
-      "patched_sha256": "095361f8a4721c6b2be992071cdeb74b7618b39dae7c78622b6cd72ba3d4b70c",
-      "reason": "Add reserved task lifecycle, explicit commit/abort, client rollback scheduling, and checkpointable coordinator state.",
+      "patched_sha256": "25beac0538e9a48d427db68ecc8212d7297bdf545f370083fd80994774107b51",
+      "reason": "Add reserved task lifecycle, explicit commit/abort, client rollback scheduling, checkpointable coordinator state, and idempotent request-id replay for retried GET_TASK calls.",
       "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_v3_integrity.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
       "tests": ["tests/test_process_runtime.py", "tests/test_v3_integrity.py"],
       "algorithm_version_impact": "none",
       "schema_version_impact": "fedagg-results-v3",
       "behavior_change_id": "v3-coordinator-transaction"
+    },
+    {
+      "file": "rpc_transport.py",
+      "upstream_sha256": "4f8e7ab42c372a53884c9a23a8b2cf81c2f19974f840dfd7194f0504f7aecee0",
+      "patched_sha256": "85cfbe1caa7d39fcfcca3ae6a93414a8095a9eeb2f27a9afc4fdf7371cb815c8",
+      "reason": "Increase the localhost RPC listen backlog so the persistent 20-client startup burst is queued instead of timing out before application-level registration.",
+      "reproducer": "python -m pytest -q tests/test_rpc_transport.py tests/test_process_runtime.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_rpc_transport.py", "tests/test_process_runtime.py"],
+      "algorithm_version_impact": "none; transport startup reliability only",
+      "schema_version_impact": "fedagg-results-v3",
+      "behavior_change_id": "v3-rpc-startup-burst"
     },
     {
       "file": "vcaa.py",
