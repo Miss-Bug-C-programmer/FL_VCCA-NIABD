@@ -643,6 +643,13 @@ def _client_process_main(
                 for key, value in model.state_dict().items()
             }
             task_snapshots[active_task_id] = snapshot
+            source_round = int(task["source_round"])
+            numeric_context = {
+                "round": source_round,
+                "sender": f"client:{int(client_id)}",
+                "receiver": "client-model",
+                "key": f"task:{active_task_id}",
+            }
             compute_started_at_s = time.monotonic()
             try:
                 if bool(task["enable_client_distillation"]):
@@ -670,8 +677,8 @@ def _client_process_main(
                         strict_numeric_checks=bool(
                             config.strict_numeric_checks
                         ),
+                        numeric_context=numeric_context,
                     )
-                source_round = int(task["source_round"])
                 if poisoner is not None:
                     poisoner.start_round(source_round)
                 local_train(
@@ -687,6 +694,7 @@ def _client_process_main(
                     optimizer=optimizer,
                     batch_transform=poisoner,
                     round_number=source_round,
+                    numeric_context=numeric_context,
                 )
                 if attack_stats_queue is not None:
                     stats = poisoner.round_stats if poisoner is not None else None

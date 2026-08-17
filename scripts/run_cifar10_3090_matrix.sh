@@ -30,18 +30,37 @@ fi
 NUM_CLIENTS="${NUM_CLIENTS:-20}"
 ROUNDS="${ROUNDS:-80}"
 EPOCHS="${EPOCHS:-1}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
 ATTACK_END_ROUND="${ATTACK_END_ROUND:-35}"
 
 SERVER_DEVICE="${SERVER_DEVICE:-cuda:0}"
-CLIENT_DEVICE="${CLIENT_DEVICE:-cuda:0}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
-AUXILIARY_NUM_WORKERS="${AUXILIARY_NUM_WORKERS:-2}"
+# A single 24 GB GPU cannot hold the Server plus 20 independent CUDA Client
+# models/optimizers/activations.  Keep the Server on CUDA and run the
+# persistent private-data Clients on CPU by default.  This preserves the
+# Server--Client process/RPC/logits boundary and avoids multiplying one GPU's
+# memory allocation by NUM_CLIENTS.  Users with a genuinely multi-device
+# allocation may override CLIENT_DEVICE explicitly.
+CLIENT_DEVICE="${CLIENT_DEVICE:-cpu}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
+AUXILIARY_NUM_WORKERS="${AUXILIARY_NUM_WORKERS:-0}"
 CLIENT_TORCH_THREADS="${CLIENT_TORCH_THREADS:-1}"
-PIN_MEMORY="${PIN_MEMORY:-1}"
-PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-1}"
+PIN_MEMORY="${PIN_MEMORY:-0}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-0}"
 AMP="${AMP:-1}"
 STRICT_NUMERIC_CHECKS="${STRICT_NUMERIC_CHECKS:-1}"
+
+# With one visible GPU, process-semi-async keeps 20 persistent Client
+# processes alive.  Their local training is CPU-backed by default, so the
+# original CUDA-oriented batch=512 can exhaust host RAM when all clients
+# train concurrently.  Keep 512 for sync or an explicitly selected value;
+# use a conservative process-runtime default only when the caller did not
+# provide BATCH_SIZE.
+if [[ -z "${BATCH_SIZE+x}" ]]; then
+    if [[ "${RUNTIME}" == "process-semi-async" && "${CLIENT_DEVICE}" == "cpu" ]]; then
+        BATCH_SIZE="128"
+    else
+        BATCH_SIZE="512"
+    fi
+fi
 
 PARTITION_SCHEME="${PARTITION_SCHEME:-dirichlet}"
 DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.5}"
@@ -90,6 +109,29 @@ fi
 if [[ "${RUNTIME}" == "process-semi-async" && "${ENABLE_BACKDOOR_DIAGNOSTICS}" == "1" ]]; then
     echo "ERROR: backdoor diagnostics are sync-only in this runner." >&2
     exit 2
+fi
+if [[ "${RUNTIME}" == "process-semi-async" \
+    && "${CLIENT_DEVICE}" == cuda* \
+    && "${NUM_CLIENTS}" -gt 1 \
+    && "${ALLOW_SHARED_CUDA_CLIENTS:-0}" != "1" ]]; then
+    cat >&2 <<EOF
+ERROR: process-semi-async is configured with ${NUM_CLIENTS} CUDA Client
+processes on the shared device ${CLIENT_DEVICE}.  Each Client owns an
+independent model, optimizer, and activation buffers; this commonly exhausts
+a single 24 GB GPU before round 1.  Use the safe single-GPU setting:
+
+  CLIENT_DEVICE=cpu ./scripts/run_cifar10_3090_matrix.sh
+
+Set ALLOW_SHARED_CUDA_CLIENTS=1 only when the visible CUDA devices and memory
+have been deliberately provisioned for this configuration.
+EOF
+    exit 2
+fi
+if [[ "${RUNTIME}" == "process-semi-async" \
+    && "${CLIENT_DEVICE}" == "cpu" \
+    && "${BATCH_SIZE}" -gt 256 ]]; then
+    echo "WARNING: ${NUM_CLIENTS} concurrent CPU Clients with batch size ${BATCH_SIZE} may exhaust host RAM." >&2
+    echo "         Prefer BATCH_SIZE=128 (or 64) unless host memory has been verified." >&2
 fi
 if (( RUN_LIMIT < 0 || RUN_LIMIT > 80 )); then
     echo "ERROR: RUN_LIMIT must be between 0 and 80." >&2

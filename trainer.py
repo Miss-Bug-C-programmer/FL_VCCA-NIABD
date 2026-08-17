@@ -50,6 +50,27 @@ def _gradients_are_finite(params) -> bool:
     return all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
 
 
+def _first_nonfinite_gradient(named_params):
+    """Return the first non-finite gradient's name and value for diagnostics."""
+
+    for name, param in named_params:
+        if param.grad is None:
+            continue
+        flat = param.grad.detach().reshape(-1)
+        bad = ~torch.isfinite(flat)
+        if bool(bad.any().item()):
+            value = flat[bad][0].detach().cpu().item()
+            return str(name), value
+    return None
+
+
+def _batch_numeric_context(numeric_context, step: int):
+    context = dict(numeric_context or {})
+    task_key = str(context.get("key", "training"))
+    context["key"] = f"{task_key}/batch:{int(step)}"
+    return context
+
+
 def local_train(
     model,
     dataloader,
@@ -64,6 +85,7 @@ def local_train(
     optimizer=None,
     batch_transform=None,
     round_number: int = 0,
+    numeric_context=None,
 ):
     """Train one local client model.
 
@@ -75,6 +97,18 @@ def local_train(
     amp_enabled = bool(amp) and use_amp_for_device(device)
     scaler = make_grad_scaler(device, enabled=amp_enabled)
     model.train()
+    if bool(strict_numeric_checks):
+        initial_context = dict(numeric_context or {})
+        initial_context["key"] = (
+            f"{initial_context.get('key', 'training')}/before_training"
+        )
+        for name, param in model.named_parameters():
+            require_finite_tensor(
+                param,
+                phase="training",
+                metric=f"parameter_before:{name}",
+                context=initial_context,
+            )
     if optimizer is None:
         optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     else:
@@ -86,6 +120,7 @@ def local_train(
     for _ in range(epochs):
         for imgs, labels in dataloader:
             step += 1
+            context = _batch_numeric_context(numeric_context, step)
             imgs = imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             if batch_transform is not None:
@@ -103,13 +138,25 @@ def local_train(
                     raise ValueError(
                         "batch_transform changed image/label batch cardinality."
                     )
+            if bool(strict_numeric_checks):
+                require_finite_tensor(
+                    imgs,
+                    phase="training",
+                    metric="inputs",
+                    context=context,
+                )
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, enabled=amp_enabled):
                 output = model(imgs)
                 if isinstance(output, (tuple, list)):
                     output = output[0]
                 if bool(strict_numeric_checks):
-                    require_finite_tensor(output, phase="training", metric="logits")
+                    require_finite_tensor(
+                        output,
+                        phase="training",
+                        metric="logits",
+                        context=context,
+                    )
                 loss = loss_fn(output, labels)
 
             should_check = _should_run_numeric_check(step, strict_numeric_checks, numeric_check_interval)
@@ -120,6 +167,7 @@ def local_train(
                         phase="training",
                         metric="loss",
                         value=float(loss.detach().cpu().item()),
+                        context=context,
                     )
                 if isinstance(numeric_stats, dict):
                     numeric_stats["numeric_failure_count"] = numeric_stats.get("numeric_failure_count", 0.0) + 1.0
@@ -132,10 +180,27 @@ def local_train(
             else:
                 loss.backward()
 
-            params = [p for p in model.parameters() if p.grad is not None]
-            if should_check and (not _gradients_are_finite(params)):
+            named_params = [
+                (name, param)
+                for name, param in model.named_parameters()
+                if param.grad is not None
+            ]
+            params = [param for _, param in named_params]
+            gradient_failure = (
+                _first_nonfinite_gradient(named_params)
+                if should_check
+                else None
+            )
+            if gradient_failure is not None:
+                gradient_name, gradient_value = gradient_failure
                 if bool(strict_numeric_checks):
-                    raise NumericIntegrityError("Non-finite local training gradient.", phase="training", metric="gradient", value="nonfinite")
+                    raise NumericIntegrityError(
+                        "Non-finite local training gradient.",
+                        phase="training",
+                        metric=f"gradient:{gradient_name}",
+                        value=gradient_value,
+                        context=context,
+                    )
                 if isinstance(numeric_stats, dict):
                     numeric_stats["numeric_failure_count"] = numeric_stats.get("numeric_failure_count", 0.0) + 1.0
                 optimizer.zero_grad(set_to_none=True)
@@ -145,9 +210,21 @@ def local_train(
 
             if grad_clip_norm is not None and float(grad_clip_norm) > 0 and params:
                 nn.utils.clip_grad_norm_(params, float(grad_clip_norm))
-                if should_check and (not _gradients_are_finite(params)):
+                gradient_failure = (
+                    _first_nonfinite_gradient(named_params)
+                    if should_check
+                    else None
+                )
+                if gradient_failure is not None:
+                    gradient_name, gradient_value = gradient_failure
                     if bool(strict_numeric_checks):
-                        raise NumericIntegrityError("Non-finite local training gradient after clipping.", phase="training", metric="gradient", value="nonfinite")
+                        raise NumericIntegrityError(
+                            "Non-finite local training gradient after clipping.",
+                            phase="training",
+                            metric=f"gradient_after_clip:{gradient_name}",
+                            value=gradient_value,
+                            context=context,
+                        )
                     if isinstance(numeric_stats, dict):
                         numeric_stats["numeric_failure_count"] = numeric_stats.get("numeric_failure_count", 0.0) + 1.0
                     optimizer.zero_grad(set_to_none=True)
@@ -162,7 +239,12 @@ def local_train(
                 optimizer.step()
             if bool(strict_numeric_checks):
                 for name, param in model.named_parameters():
-                    require_finite_tensor(param, phase="training", metric=f"parameter:{name}")
+                    require_finite_tensor(
+                        param,
+                        phase="training",
+                        metric=f"parameter:{name}",
+                        context=context,
+                    )
 
 
 @torch.no_grad()
@@ -226,6 +308,7 @@ def distill_with_logits(
     numeric_stats=None,
     targets_are_probabilities=False,
     clean_ce_weight=0.0,
+    numeric_context=None,
 ):
     device = normalize_device(device)
     amp_enabled = bool(amp) and use_amp_for_device(device)
@@ -247,6 +330,7 @@ def distill_with_logits(
             else:
                 imgs = batch_data
             step += 1
+            context = _batch_numeric_context(numeric_context, step)
             batch = imgs.size(0)
             target = target_logits[cursor: cursor + batch]
             if target.numel() == 0:
@@ -254,14 +338,37 @@ def distill_with_logits(
             cursor += batch
             imgs = imgs.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            if bool(strict_numeric_checks):
+                require_finite_tensor(
+                    imgs,
+                    phase="training",
+                    metric="distillation_inputs",
+                    context=context,
+                )
+                require_finite_tensor(
+                    target,
+                    phase="training",
+                    metric="teacher_logits_raw",
+                    context=context,
+                )
             optimizer.zero_grad(set_to_none=True)
             with _amp_context(device, enabled=amp_enabled):
                 outputs = model(imgs)
                 if isinstance(outputs, (tuple, list)):
                     outputs = outputs[0]
                 if bool(strict_numeric_checks):
-                    require_finite_tensor(outputs, phase="training", metric="student_logits")
-                    require_finite_tensor(target, phase="training", metric="teacher_logits")
+                    require_finite_tensor(
+                        outputs,
+                        phase="training",
+                        metric="student_logits",
+                        context=context,
+                    )
+                    require_finite_tensor(
+                        target,
+                        phase="training",
+                        metric="teacher_logits",
+                        context=context,
+                    )
                 outputs = torch.nan_to_num(outputs, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
                 if targets_are_probabilities:
                     target_probabilities = torch.nan_to_num(
@@ -307,7 +414,13 @@ def distill_with_logits(
             should_check = _should_run_numeric_check(step, strict_numeric_checks, numeric_check_interval)
             if should_check and (not torch.isfinite(loss).item()):
                 if bool(strict_numeric_checks):
-                    raise NumericIntegrityError("Non-finite distillation loss.", phase="training", metric="loss", value=float(loss.detach().cpu().item()))
+                    raise NumericIntegrityError(
+                        "Non-finite distillation loss.",
+                        phase="training",
+                        metric="distillation_loss",
+                        value=float(loss.detach().cpu().item()),
+                        context=context,
+                    )
                 if isinstance(numeric_stats, dict):
                     numeric_stats["numeric_failure_count"] = numeric_stats.get("numeric_failure_count", 0.0) + 1.0
                 optimizer.zero_grad(set_to_none=True)
@@ -319,10 +432,27 @@ def distill_with_logits(
             else:
                 loss.backward()
 
-            params = [p for p in model.parameters() if p.grad is not None]
-            if should_check and (not _gradients_are_finite(params)):
+            named_params = [
+                (name, param)
+                for name, param in model.named_parameters()
+                if param.grad is not None
+            ]
+            params = [param for _, param in named_params]
+            gradient_failure = (
+                _first_nonfinite_gradient(named_params)
+                if should_check
+                else None
+            )
+            if gradient_failure is not None:
+                gradient_name, gradient_value = gradient_failure
                 if bool(strict_numeric_checks):
-                    raise NumericIntegrityError("Non-finite distillation gradient.", phase="training", metric="gradient", value="nonfinite")
+                    raise NumericIntegrityError(
+                        "Non-finite distillation gradient.",
+                        phase="training",
+                        metric=f"distillation_gradient:{gradient_name}",
+                        value=gradient_value,
+                        context=context,
+                    )
                 if isinstance(numeric_stats, dict):
                     numeric_stats["numeric_failure_count"] = numeric_stats.get("numeric_failure_count", 0.0) + 1.0
                 optimizer.zero_grad(set_to_none=True)
@@ -332,9 +462,21 @@ def distill_with_logits(
 
             if grad_clip_norm is not None and float(grad_clip_norm) > 0 and params:
                 nn.utils.clip_grad_norm_(params, float(grad_clip_norm))
-                if should_check and (not _gradients_are_finite(params)):
+                gradient_failure = (
+                    _first_nonfinite_gradient(named_params)
+                    if should_check
+                    else None
+                )
+                if gradient_failure is not None:
+                    gradient_name, gradient_value = gradient_failure
                     if bool(strict_numeric_checks):
-                        raise NumericIntegrityError("Non-finite distillation gradient after clipping.", phase="training", metric="gradient", value="nonfinite")
+                        raise NumericIntegrityError(
+                            "Non-finite distillation gradient after clipping.",
+                            phase="training",
+                            metric=f"distillation_gradient_after_clip:{gradient_name}",
+                            value=gradient_value,
+                            context=context,
+                        )
                     if isinstance(numeric_stats, dict):
                         numeric_stats["numeric_failure_count"] = numeric_stats.get("numeric_failure_count", 0.0) + 1.0
                     optimizer.zero_grad(set_to_none=True)
@@ -347,3 +489,11 @@ def distill_with_logits(
                 scaler.update()
             else:
                 optimizer.step()
+            if bool(strict_numeric_checks):
+                for name, param in model.named_parameters():
+                    require_finite_tensor(
+                        param,
+                        phase="training",
+                        metric=f"distillation_parameter:{name}",
+                        context=context,
+                    )

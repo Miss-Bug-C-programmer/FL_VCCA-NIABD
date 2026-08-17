@@ -102,11 +102,11 @@
     {
       "file": "process_runtime.py",
       "upstream_sha256": "2acb78cd48e70ae8ff3c1c3d56b2b7a99527307441413198bc36c2b17ce071e5",
-      "patched_sha256": "e1415ee53dbb944d113724bde7e995a9ca2831e986c7b6970f36ad01d9a721d2",
-      "reason": "Preserve real persistent client/RPC execution while fixing compute-generation timestamps, runtime age calibration, admitted-set defense/aggregation routing, and burst-safe idempotent GET_TASK startup retries.",
-      "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py tests/test_rpc_transport.py",
+      "patched_sha256": "6ae0518b72710f8d6180250d8c3c5885794fc50d5369e2ef17c14a4ec81e7828",
+      "reason": "Preserve real persistent client/RPC execution while fixing compute-generation timestamps, runtime age calibration, admitted-set defense/aggregation routing, burst-safe idempotent GET_TASK startup retries, and contextual client numeric-integrity diagnostics.",
+      "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py tests/test_rpc_transport.py tests/test_numeric_safety.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
-      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py", "tests/test_rpc_transport.py"],
+      "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py", "tests/test_rpc_transport.py", "tests/test_numeric_safety.py"],
       "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v5-lineage-content-admission-runtime-age; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
       "schema_version_impact": "fedagg-results-v3",
       "behavior_change_id": "v3-process-transaction"
