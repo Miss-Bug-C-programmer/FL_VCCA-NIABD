@@ -15,9 +15,23 @@ def _amp_context(device, enabled=True):
     return contextlib.nullcontext()
 
 
-def _finalize_amp_skip(scaler, optimizer, *, strict_numeric_checks=False):
-    """Reset GradScaler state after an early-continue that happened post-unscale_."""
+DEFAULT_MAX_CONSECUTIVE_AMP_OVERFLOWS = 8
+
+
+def _finalize_amp_skip(
+    scaler,
+    optimizer,
+    *,
+    strict_numeric_checks=False,
+    numeric_context=None,
+):
+    """Skip an overflowed AMP step and advance GradScaler's backoff state."""
+
+    scale_before = float(scaler.get_scale())
     try:
+        # ``unscale_`` has already populated GradScaler's found-inf state.
+        # ``step`` therefore skips optimizer.step() and ``update`` lowers the
+        # dynamic loss scale.
         scaler.step(optimizer)
     except (AssertionError, RuntimeError) as exc:
         if bool(strict_numeric_checks):
@@ -26,8 +40,10 @@ def _finalize_amp_skip(scaler, optimizer, *, strict_numeric_checks=False):
                 phase="training",
                 metric="grad_scaler",
                 value=type(exc).__name__,
+                context=numeric_context,
             ) from exc
     scaler.update()
+    return scale_before, float(scaler.get_scale())
 
 
 def _should_run_numeric_check(step: int, strict_numeric_checks: bool, numeric_check_interval: int) -> bool:
@@ -44,10 +60,6 @@ def _should_run_numeric_check(step: int, strict_numeric_checks: bool, numeric_ch
         return True
     interval = int(max(0, numeric_check_interval))
     return interval > 0 and int(step) % interval == 0
-
-
-def _gradients_are_finite(params) -> bool:
-    return all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
 
 
 def _first_nonfinite_gradient(named_params):
@@ -71,6 +83,51 @@ def _batch_numeric_context(numeric_context, step: int):
     return context
 
 
+def _increment_stat(numeric_stats, key: str, amount: int = 1) -> None:
+    if isinstance(numeric_stats, dict):
+        numeric_stats[key] = int(numeric_stats.get(key, 0)) + int(amount)
+
+
+def _record_amp_overflow(
+    numeric_stats,
+    *,
+    scale_before: float,
+    scale_after: float,
+    consecutive_overflows: int,
+) -> None:
+    _increment_stat(numeric_stats, "amp_overflow_count")
+    _increment_stat(numeric_stats, "optimizer_step_skipped_count")
+    if isinstance(numeric_stats, dict):
+        numeric_stats["amp_loss_scale_before"] = float(scale_before)
+        numeric_stats["amp_loss_scale_after"] = float(scale_after)
+        numeric_stats["max_consecutive_amp_overflows"] = max(
+            int(numeric_stats.get("max_consecutive_amp_overflows", 0)),
+            int(consecutive_overflows),
+        )
+
+
+def _raise_if_amp_overflow_streak_exceeded(
+    *,
+    consecutive_overflows: int,
+    max_consecutive_amp_overflows: int,
+    gradient_failure,
+    context,
+) -> None:
+    if int(consecutive_overflows) <= int(max_consecutive_amp_overflows):
+        return
+    gradient_name, gradient_value = gradient_failure or (
+        "unknown",
+        "nonfinite",
+    )
+    raise NumericIntegrityError(
+        "AMP gradient overflow did not recover within the configured streak limit.",
+        phase="training",
+        metric=f"amp_gradient_overflow:{gradient_name}",
+        value=gradient_value,
+        context=context,
+    )
+
+
 def local_train(
     model,
     dataloader,
@@ -86,6 +143,8 @@ def local_train(
     batch_transform=None,
     round_number: int = 0,
     numeric_context=None,
+    scaler=None,
+    max_consecutive_amp_overflows=DEFAULT_MAX_CONSECUTIVE_AMP_OVERFLOWS,
 ):
     """Train one local client model.
 
@@ -95,7 +154,13 @@ def local_train(
     """
     device = normalize_device(device)
     amp_enabled = bool(amp) and use_amp_for_device(device)
-    scaler = make_grad_scaler(device, enabled=amp_enabled)
+    if int(max_consecutive_amp_overflows) < 1:
+        raise ValueError("max_consecutive_amp_overflows must be positive.")
+    scaler = (
+        make_grad_scaler(device, enabled=amp_enabled)
+        if scaler is None
+        else scaler
+    )
     model.train()
     if bool(strict_numeric_checks):
         initial_context = dict(numeric_context or {})
@@ -116,6 +181,7 @@ def local_train(
             group["lr"] = float(lr)
     loss_fn = nn.CrossEntropyLoss()
     step = 0
+    consecutive_amp_overflows = 0
 
     for _ in range(epochs):
         for imgs, labels in dataloader:
@@ -193,6 +259,30 @@ def local_train(
             )
             if gradient_failure is not None:
                 gradient_name, gradient_value = gradient_failure
+                if amp_enabled:
+                    scale_before, scale_after = _finalize_amp_skip(
+                        scaler,
+                        optimizer,
+                        strict_numeric_checks=strict_numeric_checks,
+                        numeric_context=context,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    consecutive_amp_overflows += 1
+                    _record_amp_overflow(
+                        numeric_stats,
+                        scale_before=scale_before,
+                        scale_after=scale_after,
+                        consecutive_overflows=consecutive_amp_overflows,
+                    )
+                    _raise_if_amp_overflow_streak_exceeded(
+                        consecutive_overflows=consecutive_amp_overflows,
+                        max_consecutive_amp_overflows=(
+                            max_consecutive_amp_overflows
+                        ),
+                        gradient_failure=gradient_failure,
+                        context=context,
+                    )
+                    continue
                 if bool(strict_numeric_checks):
                     raise NumericIntegrityError(
                         "Non-finite local training gradient.",
@@ -217,6 +307,16 @@ def local_train(
                 )
                 if gradient_failure is not None:
                     gradient_name, gradient_value = gradient_failure
+                    if amp_enabled:
+                        # The pre-clip gradients were finite, so GradScaler
+                        # did not classify this as a recoverable overflow.
+                        raise NumericIntegrityError(
+                            "Gradient clipping produced a non-finite AMP gradient.",
+                            phase="training",
+                            metric=f"gradient_after_clip:{gradient_name}",
+                            value=gradient_value,
+                            context=context,
+                        )
                     if bool(strict_numeric_checks):
                         raise NumericIntegrityError(
                             "Non-finite local training gradient after clipping.",
@@ -233,10 +333,32 @@ def local_train(
                     continue
 
             if amp_enabled:
+                scale_before = float(scaler.get_scale())
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = float(scaler.get_scale())
+                if scale_after < scale_before:
+                    consecutive_amp_overflows += 1
+                    _record_amp_overflow(
+                        numeric_stats,
+                        scale_before=scale_before,
+                        scale_after=scale_after,
+                        consecutive_overflows=consecutive_amp_overflows,
+                    )
+                    _raise_if_amp_overflow_streak_exceeded(
+                        consecutive_overflows=consecutive_amp_overflows,
+                        max_consecutive_amp_overflows=(
+                            max_consecutive_amp_overflows
+                        ),
+                        gradient_failure=gradient_failure,
+                        context=context,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             else:
                 optimizer.step()
+            consecutive_amp_overflows = 0
+            _increment_stat(numeric_stats, "optimizer_step_count")
             if bool(strict_numeric_checks):
                 for name, param in model.named_parameters():
                     require_finite_tensor(
@@ -309,14 +431,23 @@ def distill_with_logits(
     targets_are_probabilities=False,
     clean_ce_weight=0.0,
     numeric_context=None,
+    scaler=None,
+    max_consecutive_amp_overflows=DEFAULT_MAX_CONSECUTIVE_AMP_OVERFLOWS,
 ):
     device = normalize_device(device)
     amp_enabled = bool(amp) and use_amp_for_device(device)
-    scaler = make_grad_scaler(device, enabled=amp_enabled)
+    if int(max_consecutive_amp_overflows) < 1:
+        raise ValueError("max_consecutive_amp_overflows must be positive.")
+    scaler = (
+        make_grad_scaler(device, enabled=amp_enabled)
+        if scaler is None
+        else scaler
+    )
     model.train()
     optimizer = torch.optim.SGD(model.parameters(), lr=float(lr))
     T = float(temperature)
     step = 0
+    consecutive_amp_overflows = 0
     for _ in range(int(max(1, epochs))):
         cursor = 0
         for batch_data in dataloader:
@@ -445,6 +576,30 @@ def distill_with_logits(
             )
             if gradient_failure is not None:
                 gradient_name, gradient_value = gradient_failure
+                if amp_enabled:
+                    scale_before, scale_after = _finalize_amp_skip(
+                        scaler,
+                        optimizer,
+                        strict_numeric_checks=strict_numeric_checks,
+                        numeric_context=context,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    consecutive_amp_overflows += 1
+                    _record_amp_overflow(
+                        numeric_stats,
+                        scale_before=scale_before,
+                        scale_after=scale_after,
+                        consecutive_overflows=consecutive_amp_overflows,
+                    )
+                    _raise_if_amp_overflow_streak_exceeded(
+                        consecutive_overflows=consecutive_amp_overflows,
+                        max_consecutive_amp_overflows=(
+                            max_consecutive_amp_overflows
+                        ),
+                        gradient_failure=gradient_failure,
+                        context=context,
+                    )
+                    continue
                 if bool(strict_numeric_checks):
                     raise NumericIntegrityError(
                         "Non-finite distillation gradient.",
@@ -469,6 +624,17 @@ def distill_with_logits(
                 )
                 if gradient_failure is not None:
                     gradient_name, gradient_value = gradient_failure
+                    if amp_enabled:
+                        raise NumericIntegrityError(
+                            "Gradient clipping produced a non-finite AMP distillation gradient.",
+                            phase="training",
+                            metric=(
+                                "distillation_gradient_after_clip:"
+                                f"{gradient_name}"
+                            ),
+                            value=gradient_value,
+                            context=context,
+                        )
                     if bool(strict_numeric_checks):
                         raise NumericIntegrityError(
                             "Non-finite distillation gradient after clipping.",
@@ -485,10 +651,32 @@ def distill_with_logits(
                     continue
 
             if amp_enabled:
+                scale_before = float(scaler.get_scale())
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = float(scaler.get_scale())
+                if scale_after < scale_before:
+                    consecutive_amp_overflows += 1
+                    _record_amp_overflow(
+                        numeric_stats,
+                        scale_before=scale_before,
+                        scale_after=scale_after,
+                        consecutive_overflows=consecutive_amp_overflows,
+                    )
+                    _raise_if_amp_overflow_streak_exceeded(
+                        consecutive_overflows=consecutive_amp_overflows,
+                        max_consecutive_amp_overflows=(
+                            max_consecutive_amp_overflows
+                        ),
+                        gradient_failure=gradient_failure,
+                        context=context,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             else:
                 optimizer.step()
+            consecutive_amp_overflows = 0
+            _increment_stat(numeric_stats, "optimizer_step_count")
             if bool(strict_numeric_checks):
                 for name, param in model.named_parameters():
                     require_finite_tensor(

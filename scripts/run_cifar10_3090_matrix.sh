@@ -47,6 +47,7 @@ PIN_MEMORY="${PIN_MEMORY:-0}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-0}"
 AMP="${AMP:-1}"
 STRICT_NUMERIC_CHECKS="${STRICT_NUMERIC_CHECKS:-1}"
+AMP_MAX_CONSECUTIVE_OVERFLOWS="${AMP_MAX_CONSECUTIVE_OVERFLOWS:-8}"
 
 # With one visible GPU, process-semi-async keeps 20 persistent Client
 # processes alive.  Their local training is CPU-backed by default, so the
@@ -152,6 +153,7 @@ echo "Attack window        : 15 / ${ATTACK_END_ROUND}"
 echo "Batch / epochs       : ${BATCH_SIZE} / ${EPOCHS}"
 echo "Server device        : ${SERVER_DEVICE}"
 echo "Client device        : ${CLIENT_DEVICE}"
+echo "AMP overflow limit   : ${AMP_MAX_CONSECUTIVE_OVERFLOWS} consecutive steps"
 echo "Output               : ${OUT_ROOT}"
 echo
 
@@ -253,6 +255,7 @@ COMMON_ARGS=(
     --num-workers "${NUM_WORKERS}"
     --auxiliary-num-workers "${AUXILIARY_NUM_WORKERS}"
     --client-torch-threads "${CLIENT_TORCH_THREADS}"
+    --amp-max-consecutive-overflows "${AMP_MAX_CONSECUTIVE_OVERFLOWS}"
     --run-class formal
     --attack-condition attacked
     --niabd-warmup-rounds 5

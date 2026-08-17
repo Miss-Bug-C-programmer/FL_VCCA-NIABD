@@ -81,6 +81,11 @@ class ClientLogitsPacket:
     client_pid: int = 0
     local_train_count: int = 0
     predict_logits_calls: int = 0
+    local_amp_overflow_count: int = 0
+    distillation_amp_overflow_count: int = 0
+    optimizer_step_skipped_count: int = 0
+    local_optimizer_step_count: int = 0
+    distillation_optimizer_step_count: int = 0
     inference_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -112,6 +117,21 @@ class ClientLogitsPacket:
             raise ValueError(
                 "Client proxy logits must have shape [samples, classes]."
             )
+        counters = {
+            "local_amp_overflow_count": self.local_amp_overflow_count,
+            "distillation_amp_overflow_count": (
+                self.distillation_amp_overflow_count
+            ),
+            "optimizer_step_skipped_count": (
+                self.optimizer_step_skipped_count
+            ),
+            "local_optimizer_step_count": self.local_optimizer_step_count,
+            "distillation_optimizer_step_count": (
+                self.distillation_optimizer_step_count
+            ),
+        }
+        if any(int(value) < 0 for value in counters.values()):
+            raise ValueError("Client optimizer/AMP counters cannot be negative.")
         _decode_float32_tensor(self.logits_shape, self.logits_payload)
 
     @classmethod
@@ -139,6 +159,11 @@ class ClientLogitsPacket:
         client_pid: int = 0,
         local_train_count: int = 0,
         predict_logits_calls: int = 0,
+        local_amp_overflow_count: int = 0,
+        distillation_amp_overflow_count: int = 0,
+        optimizer_step_skipped_count: int = 0,
+        local_optimizer_step_count: int = 0,
+        distillation_optimizer_step_count: int = 0,
     ) -> "ClientLogitsPacket":
         shape, payload = _encode_float32_tensor(logits)
         digest = _payload_hash(payload)
@@ -174,6 +199,15 @@ class ClientLogitsPacket:
             client_pid=int(client_pid),
             local_train_count=int(local_train_count),
             predict_logits_calls=int(predict_logits_calls),
+            local_amp_overflow_count=int(local_amp_overflow_count),
+            distillation_amp_overflow_count=int(
+                distillation_amp_overflow_count
+            ),
+            optimizer_step_skipped_count=int(optimizer_step_skipped_count),
+            local_optimizer_step_count=int(local_optimizer_step_count),
+            distillation_optimizer_step_count=int(
+                distillation_optimizer_step_count
+            ),
             inference_sha256=digest,
         )
 

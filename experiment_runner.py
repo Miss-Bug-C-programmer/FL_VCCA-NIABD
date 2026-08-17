@@ -77,6 +77,11 @@ PROCESS_ONLY_ROUND_FIELDS = (
     "upload_attempt_drop_count",
     "rpc_timeout_count",
     "retry_count",
+    "local_amp_overflow_count",
+    "distillation_amp_overflow_count",
+    "optimizer_step_skipped_count",
+    "local_optimizer_step_count",
+    "distillation_optimizer_step_count",
     "quorum_required",
     "quorum_reached",
     "soft_deadline_s",
@@ -150,6 +155,9 @@ RUNTIME_EVENT_COLUMNS = (
     "duplicate_receive_count", "rpc_elapsed_s", "payload_bytes",
     "wire_bytes", "logits_dtype", "logits_shape", "proxy_version",
     "local_train_count", "predict_logits_calls", "transport_status",
+    "local_amp_overflow_count", "distillation_amp_overflow_count",
+    "optimizer_step_skipped_count", "local_optimizer_step_count",
+    "distillation_optimizer_step_count",
     "rpc_accept_status", "vcaa_version_score", "vcaa_version_lag_score",
     "vcaa_age_score", "vcaa_content_score",
     "vcaa_final_score", "vcaa_threshold", "proxy_accuracy",
@@ -1708,6 +1716,12 @@ def run_experiment(
         "freshness_runtime_semantics": (
             "server-observed-generated-received-consumed-lineage"
         ),
+        "amp_enabled": bool(amp),
+        "max_consecutive_amp_overflows": int(
+            process_config.max_consecutive_amp_overflows
+            if process_config is not None
+            else 8
+        ),
         "formal_config_unchanged": True,
     }
     manifest_bytes = json.dumps(
@@ -2651,6 +2665,16 @@ def main() -> None:
         choices=["none", "fork", "spawn", "forkserver"],
     )
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--amp-max-consecutive-overflows",
+        type=int,
+        default=8,
+        help=(
+            "Fail after this many consecutive recoverable AMP gradient "
+            "overflows; each earlier overflow skips the optimizer step and "
+            "backs off GradScaler."
+        ),
+    )
     parser.add_argument("--strict-numeric-checks", action="store_true")
     parser.add_argument("--outdir", default="experiment_results")
     parser.add_argument("--append", action="store_true")
@@ -2745,6 +2769,9 @@ def main() -> None:
             else None
         ),
         amp=bool(args.amp),
+        max_consecutive_amp_overflows=(
+            args.amp_max_consecutive_overflows
+        ),
         strict_numeric_checks=args.strict_numeric_checks,
         client_num_workers=args.num_workers,
         client_torch_threads=args.client_torch_threads,

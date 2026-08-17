@@ -30,9 +30,9 @@
     {
       "file": "experiment_runner.py",
       "upstream_sha256": "88d3982110cc91af527f0d1a004190b9813351ffcb5469ccb3110160f1c628d4",
-      "patched_sha256": "340f323e4f2e7346fad70c21d3ce59eab7f0d87dbd1bb95be67deab38942d142",
-      "reason": "Export VCAA v5 lineage/content/timing configuration and add the explicit semi-async formal experiment configuration path.",
-      "reproducer": "python experiment_runner.py --help",
+      "patched_sha256": "7e90c4ceb3ef252bdea4acbaec2b2d17f3ca09500787fa985bd3e938ddd1b4c8",
+      "reason": "Export VCAA v5 lineage/content/timing configuration, expose bounded AMP overflow recovery, emit its round/event metrics, and add the explicit semi-async formal experiment configuration path.",
+      "reproducer": "python experiment_runner.py --help && python -m pytest -q tests/test_runner_outputs.py tests/test_numeric_safety.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
       "tests": ["tests/test_runner_outputs.py", "tests/test_v3_integrity.py"],
       "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v5-lineage-content-admission-runtime-age; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
@@ -62,6 +62,18 @@
       "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v5-lineage-content-admission-runtime-age",
       "schema_version_impact": "fedagg-results-v3",
       "behavior_change_id": "v3-server-lineage"
+    },
+    {
+      "file": "logits_transport.py",
+      "upstream_sha256": "64b46ec9856affcf43f7757b5b35fdf58aa4d63608d784675c7d315aed96997e",
+      "patched_sha256": "3739bfa9c84c36ef14b18e41f3790a88859879a734e9bc52cc49e5e3fa3a0c6b",
+      "reason": "Carry non-negative AMP overflow, skipped-step, and successful-step counters with the existing immutable serialized-logits packet without adding model, gradient, parameter, or private-data payloads.",
+      "reproducer": "python -m pytest -q tests/test_logits_transport.py tests/test_server_client_topology.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_logits_transport.py", "tests/test_server_client_topology.py"],
+      "algorithm_version_impact": "none; serialized logits payload and aggregation semantics are unchanged",
+      "schema_version_impact": "fedagg-results-v3 backward-compatible optional diagnostics",
+      "behavior_change_id": "v3-amp-runtime-diagnostics"
     },
     {
       "file": "model_factory.py",
@@ -102,14 +114,26 @@
     {
       "file": "process_runtime.py",
       "upstream_sha256": "2acb78cd48e70ae8ff3c1c3d56b2b7a99527307441413198bc36c2b17ce071e5",
-      "patched_sha256": "6ae0518b72710f8d6180250d8c3c5885794fc50d5369e2ef17c14a4ec81e7828",
-      "reason": "Preserve real persistent client/RPC execution while fixing compute-generation timestamps, runtime age calibration, admitted-set defense/aggregation routing, burst-safe idempotent GET_TASK startup retries, and contextual client numeric-integrity diagnostics.",
+      "patched_sha256": "f9b611dca37d5c13ea649c648aee4ffe1a905816318dae0510f516dd2f8c24a4",
+      "reason": "Preserve real persistent client/RPC execution while fixing compute-generation timestamps, runtime age calibration, admitted-set defense/aggregation routing, burst-safe idempotent GET_TASK startup retries, persistent per-client GradScaler state, auditable bounded AMP overflow recovery, and orderly child-process cleanup.",
       "reproducer": "python -m pytest -q tests/test_process_runtime.py tests/test_process_backdoor_runtime.py tests/test_rpc_transport.py tests/test_numeric_safety.py",
       "fix_report": "NIABD_CORE_FIX_REPORT.md",
       "tests": ["tests/test_process_runtime.py", "tests/test_process_backdoor_runtime.py", "tests/test_rpc_transport.py", "tests/test_numeric_safety.py"],
       "algorithm_version_impact": "aggregation-v1-probability-space; vcaa-v5-lineage-content-admission-runtime-age; niabd-v2.1-proxy-conditioned-transactional-robust-memory",
       "schema_version_impact": "fedagg-results-v3",
       "behavior_change_id": "v3-process-transaction"
+    },
+    {
+      "file": "result_schema.py",
+      "upstream_sha256": "3ed1dc2a76379685a559d80450150ee936fd16abcec66ed4e2e4089a13ab98b1",
+      "patched_sha256": "efc7341de22888e3a690a5177295491702a6c9d591213219618aeada07853850",
+      "reason": "Declare backward-compatible nullable process-runtime AMP overflow and optimizer-step diagnostics and validate all observed values as non-negative integers.",
+      "reproducer": "python -m pytest -q tests/test_runner_outputs.py tests/test_v3_integrity.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_runner_outputs.py", "tests/test_v3_integrity.py"],
+      "algorithm_version_impact": "none",
+      "schema_version_impact": "fedagg-results-v3 backward-compatible optional diagnostics",
+      "behavior_change_id": "v3-amp-result-schema"
     },
     {
       "file": "round_coordinator.py",
@@ -158,6 +182,18 @@
       "algorithm_version_impact": "none",
       "schema_version_impact": "fedagg-results-v3",
       "behavior_change_id": "v3-preservation-auth"
+    },
+    {
+      "file": "trainer.py",
+      "upstream_sha256": "c6de6fdfb674cbcd142dd1c6af6abfd5ea2c87f25ff585ef528c3b2f0e7bec8f",
+      "patched_sha256": "f4d64a96cefe4f943ce4bc27054fb113a6ed887ef79119e71754521e87a161ae",
+      "reason": "Implement standard dynamic-loss-scaling behavior for finite-loss AMP gradient overflow: skip the unsafe optimizer step, back off GradScaler, retain strict FP32 failures, and fail after a configurable consecutive overflow bound.",
+      "reproducer": "python -m pytest -q tests/test_numeric_safety.py",
+      "fix_report": "NIABD_CORE_FIX_REPORT.md",
+      "tests": ["tests/test_numeric_safety.py"],
+      "algorithm_version_impact": "none for VCAA/NIABD; CUDA AMP optimizer execution semantics corrected",
+      "schema_version_impact": "fedagg-results-v3 backward-compatible optional diagnostics",
+      "behavior_change_id": "v3-bounded-amp-overflow-recovery"
     }
   ]
 }

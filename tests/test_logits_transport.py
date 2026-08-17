@@ -31,12 +31,22 @@ def test_client_packet_roundtrip_is_a_detached_byte_upload():
         generated_at_s=12.0,
         query_id="query-7",
         logits=logits,
+        local_amp_overflow_count=1,
+        distillation_amp_overflow_count=2,
+        optimizer_step_skipped_count=3,
+        local_optimizer_step_count=4,
+        distillation_optimizer_step_count=5,
     )
     logits[0, 0] = -99.0
 
     decoded = packet.decode_logits()
     assert decoded.tolist() == [[1.0, 2.0], [3.0, 4.0]]
     assert packet.payload_bytes == 4 * 4
+    assert packet.local_amp_overflow_count == 1
+    assert packet.distillation_amp_overflow_count == 2
+    assert packet.optimizer_step_skipped_count == 3
+    assert packet.local_optimizer_step_count == 4
+    assert packet.distillation_optimizer_step_count == 5
     assert not hasattr(packet, "model")
     assert not hasattr(packet, "train_loader")
 

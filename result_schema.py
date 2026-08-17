@@ -155,6 +155,11 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("vcaa_effective_max_knowledge_age_s", "number", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Effective VCAA maximum knowledge age in seconds."),
     MetricSchemaEntry("vcaa_age_scale_mode", "string", True, ("vcaa", "vcaa-niabd"), ("*",), None, "Fixed or bounded runtime-calibrated age scale."),
     MetricSchemaEntry("numeric_failure_count", "integer", False, ("*",), ("*",), 0, "Actual numeric failures."),
+    MetricSchemaEntry("local_amp_overflow_count", "integer", True, ("*",), ("process-semi-async",), None, "Recoverable Client local-training AMP overflows."),
+    MetricSchemaEntry("distillation_amp_overflow_count", "integer", True, ("*",), ("process-semi-async",), None, "Recoverable Client reverse-distillation AMP overflows."),
+    MetricSchemaEntry("optimizer_step_skipped_count", "integer", True, ("*",), ("process-semi-async",), None, "Optimizer steps safely skipped by AMP overflow handling."),
+    MetricSchemaEntry("local_optimizer_step_count", "integer", True, ("*",), ("process-semi-async",), None, "Successful Client local optimizer steps."),
+    MetricSchemaEntry("distillation_optimizer_step_count", "integer", True, ("*",), ("process-semi-async",), None, "Successful Client reverse-distillation optimizer steps."),
     MetricSchemaEntry("rollback_reason", "string", True, ("*",), ("*",), None, "Round/run rollback reason."),
     MetricSchemaEntry("checkpoint_path", "string", True, ("*",), ("*",), None, "Committed checkpoint path."),
     MetricSchemaEntry("checkpoint_sha256", "string", True, ("*",), ("*",), None, "Committed checkpoint hash."),
@@ -179,6 +184,11 @@ OPTIONAL_BACKWARD_COMPAT_COLUMNS = frozenset({
     "vcaa_effective_age_half_life_s",
     "vcaa_effective_max_knowledge_age_s",
     "vcaa_age_scale_mode",
+    "local_amp_overflow_count",
+    "distillation_amp_overflow_count",
+    "optimizer_step_skipped_count",
+    "local_optimizer_step_count",
+    "distillation_optimizer_step_count",
 })
 
 
@@ -252,6 +262,11 @@ def validate_frame(
         "drift_recovery_candidates",
         "memory_update_teachers",
         "vcaa_history_size",
+        "local_amp_overflow_count",
+        "distillation_amp_overflow_count",
+        "optimizer_step_skipped_count",
+        "local_optimizer_step_count",
+        "distillation_optimizer_step_count",
     ):
         if column not in frame.columns:
             continue

@@ -33,6 +33,7 @@ from data_utils import (
     cleanup_dataloaders,
 )
 from defense import DefenseResult, KnowledgeDefenseController
+from device_utils import make_grad_scaler
 from federated_runtime import (
     _decision_metrics,
     _defense_metrics,
@@ -91,6 +92,7 @@ class ProcessRuntimeConfig:
     server_device: str = "cpu"
     client_device: str = "cpu"
     amp: bool = False
+    max_consecutive_amp_overflows: int = 8
     strict_numeric_checks: bool = False
     client_num_workers: int = 0
     client_torch_threads: int = 1
@@ -150,6 +152,10 @@ class ProcessRuntimeConfig:
             raise ValueError("max_message_bytes must be positive.")
         if int(self.client_torch_threads) <= 0:
             raise ValueError("client_torch_threads must be positive.")
+        if int(self.max_consecutive_amp_overflows) < 1:
+            raise ValueError(
+                "max_consecutive_amp_overflows must be positive."
+            )
 
 
 @dataclass(frozen=True)
@@ -577,6 +583,14 @@ def _client_process_main(
             device=device,
         )
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        local_scaler = make_grad_scaler(
+            device,
+            enabled=bool(config.amp),
+        )
+        distillation_scaler = make_grad_scaler(
+            device,
+            enabled=bool(config.amp),
+        )
         local_model_version = 0
         poisoner = (
             BackdoorBatchPoisoner(plan=attack_plan, client_id=int(client_id))
@@ -650,6 +664,8 @@ def _client_process_main(
                 "receiver": "client-model",
                 "key": f"task:{active_task_id}",
             }
+            local_numeric_stats: Dict[str, object] = {}
+            distillation_numeric_stats: Dict[str, object] = {}
             compute_started_at_s = time.monotonic()
             try:
                 if bool(task["enable_client_distillation"]):
@@ -677,7 +693,12 @@ def _client_process_main(
                         strict_numeric_checks=bool(
                             config.strict_numeric_checks
                         ),
+                        numeric_stats=distillation_numeric_stats,
                         numeric_context=numeric_context,
+                        scaler=distillation_scaler,
+                        max_consecutive_amp_overflows=int(
+                            config.max_consecutive_amp_overflows
+                        ),
                     )
                 if poisoner is not None:
                     poisoner.start_round(source_round)
@@ -691,10 +712,15 @@ def _client_process_main(
                     strict_numeric_checks=bool(
                         config.strict_numeric_checks
                     ),
+                    numeric_stats=local_numeric_stats,
                     optimizer=optimizer,
                     batch_transform=poisoner,
                     round_number=source_round,
                     numeric_context=numeric_context,
+                    scaler=local_scaler,
+                    max_consecutive_amp_overflows=int(
+                        config.max_consecutive_amp_overflows
+                    ),
                 )
                 if attack_stats_queue is not None:
                     stats = poisoner.round_stats if poisoner is not None else None
@@ -787,6 +813,34 @@ def _client_process_main(
                 client_pid=os.getpid(),
                 local_train_count=1,
                 predict_logits_calls=1,
+                local_amp_overflow_count=int(
+                    local_numeric_stats.get("amp_overflow_count", 0)
+                ),
+                distillation_amp_overflow_count=int(
+                    distillation_numeric_stats.get(
+                        "amp_overflow_count",
+                        0,
+                    )
+                ),
+                optimizer_step_skipped_count=int(
+                    local_numeric_stats.get(
+                        "optimizer_step_skipped_count",
+                        0,
+                    )
+                    + distillation_numeric_stats.get(
+                        "optimizer_step_skipped_count",
+                        0,
+                    )
+                ),
+                local_optimizer_step_count=int(
+                    local_numeric_stats.get("optimizer_step_count", 0)
+                ),
+                distillation_optimizer_step_count=int(
+                    distillation_numeric_stats.get(
+                        "optimizer_step_count",
+                        0,
+                    )
+                ),
             )
             upload_delay_s = float(task["upload_delay_s"])
             if upload_delay_s > 0.0:
@@ -924,6 +978,38 @@ def _raise_child_error(error_queue, processes) -> None:
                 f"Client process pid={process.pid} exited with "
                 f"code={process.exitcode}."
             )
+
+
+def _stop_client_processes(
+    processes: Sequence[multiprocessing.Process],
+    *,
+    graceful_timeout_s: float = 2.0,
+) -> None:
+    """Stop spawned Clients without abandoning bootstrap/semaphore state."""
+
+    deadline = time.monotonic() + max(0.0, float(graceful_timeout_s))
+    for process in processes:
+        if not process.is_alive():
+            process.join(timeout=0.0)
+            continue
+        remaining = max(0.0, deadline - time.monotonic())
+        process.join(timeout=remaining)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+    for process in alive:
+        process.join(timeout=5.0)
+    stubborn = [process for process in alive if process.is_alive()]
+    for process in stubborn:
+        process.kill()
+    for process in stubborn:
+        process.join(timeout=5.0)
+    for process in processes:
+        if not process.is_alive():
+            try:
+                process.close()
+            except ValueError:
+                pass
 
 
 def _deadline_values(
@@ -1085,6 +1171,21 @@ def _event_from_item(
         "proxy_version": packet.proxy_version,
         "local_train_count": int(packet.local_train_count),
         "predict_logits_calls": int(packet.predict_logits_calls),
+        "local_amp_overflow_count": int(
+            packet.local_amp_overflow_count
+        ),
+        "distillation_amp_overflow_count": int(
+            packet.distillation_amp_overflow_count
+        ),
+        "optimizer_step_skipped_count": int(
+            packet.optimizer_step_skipped_count
+        ),
+        "local_optimizer_step_count": int(
+            packet.local_optimizer_step_count
+        ),
+        "distillation_optimizer_step_count": int(
+            packet.distillation_optimizer_step_count
+        ),
         "transport_status": str(state["transport_status"]),
         "rpc_accept_status": "accepted",
         "vcaa_version_score": _nan(),
@@ -2186,6 +2287,26 @@ def run_fedagg_server_client_process_async(
                     int(event["retry_count"])
                     for event in round_events
                 ),
+                "local_amp_overflow_count": sum(
+                    int(event["local_amp_overflow_count"])
+                    for event in round_events
+                ),
+                "distillation_amp_overflow_count": sum(
+                    int(event["distillation_amp_overflow_count"])
+                    for event in round_events
+                ),
+                "optimizer_step_skipped_count": sum(
+                    int(event["optimizer_step_skipped_count"])
+                    for event in round_events
+                ),
+                "local_optimizer_step_count": sum(
+                    int(event["local_optimizer_step_count"])
+                    for event in round_events
+                ),
+                "distillation_optimizer_step_count": sum(
+                    int(event["distillation_optimizer_step_count"])
+                    for event in round_events
+                ),
                 "quorum_required": int(quorum_required),
                 "quorum_reached": int(quorum_reached),
                 "soft_deadline_s": float(soft_deadline_s),
@@ -2366,10 +2487,10 @@ def run_fedagg_server_client_process_async(
         return metrics
     finally:
         coordinator.request_shutdown()
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5.0)
+        _stop_client_processes(
+            processes,
+            graceful_timeout_s=float(config.shutdown_timeout_s),
+        )
         rpc_server.close()
         error_queue.close()
         error_queue.join_thread()
