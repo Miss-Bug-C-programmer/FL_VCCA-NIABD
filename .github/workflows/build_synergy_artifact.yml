@@ -36,13 +36,33 @@ jobs:
           path = pathlib.Path('tools/apply_vcaa_niabd_synergy_fix.py')
           path.write_bytes(decoded)
           assert path.stat().st_size == 39557
-          # Reviewed marker correction: current niabd.py keeps the compact
-          # _upper_robust_z signature on one line.
           text = path.read_text()
-          old = "    start = '''    @staticmethod\\n    def _upper_robust_z(\\n'''"
-          new = "    start = '''    @staticmethod\\n    def _upper_robust_z'''"
-          assert text.count(old) == 1
-          path.write_text(text.replace(old, new, 1))
+          corrections = [
+              (
+                  "    start = '''    @staticmethod\\n    def _upper_robust_z(\\n'''",
+                  "    start = '''    @staticmethod\\n    def _upper_robust_z'''",
+                  "compact _upper_robust_z signature",
+              ),
+              (
+                  "    end = '''    def _safe_reference(\\n'''",
+                  "    end = '''    def _safe_reference'''",
+                  "compact _safe_reference signature",
+              ),
+              (
+                  "        if reference_items == action_knowledge:\\n",
+                  "        same_reference = (\\n"
+                  "            len(reference_items) == len(action_knowledge)\\n"
+                  "            and all(left is right for left, right in zip(reference_items, action_knowledge))\\n"
+                  "        )\\n"
+                  "        if same_reference:\\n",
+                  "tensor-safe cohort identity check",
+              ),
+          ]
+          for old, new, label in corrections:
+              if text.count(old) != 1:
+                  raise RuntimeError(f'{label}: expected one patcher marker, found {text.count(old)}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
           PY
       - name: Apply synergy fix to exact reviewed base
         run: python tools/apply_vcaa_niabd_synergy_fix.py --repo .
@@ -67,6 +87,9 @@ jobs:
         run: |
           rm -rf __pycache__ .pytest_cache
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          rm -rf tools/synergy_fix_chunks
+          rm -f tools/apply_vcaa_niabd_synergy_fix.py.zlib.b64
+          rm -f .github/workflows/build_synergy_artifact.yml
           zip -qr FL_VCCA-NIABD_vcaa_niabd_synergy_fix_20260818.zip . \
             -x '.git/*' 'dataset/*' 'smoke_results/*' 'experiment_result/*' \
                'experiment_results/*' '*.pyc' '.pytest_cache/*'
