@@ -48,6 +48,11 @@ jobs:
                   "    end = '''    def _safe_reference'''",
                   "compact _safe_reference signature",
               ),
+              (
+                  '    text = replace_once(text, old, new, "niabd metric recovery risk")',
+                  '    text = text.replace(old, new, 1)',
+                  "two-path NIABD metrics replacement",
+              ),
           ]
           for old, new, label in corrections:
               if text.count(old) != 1:
