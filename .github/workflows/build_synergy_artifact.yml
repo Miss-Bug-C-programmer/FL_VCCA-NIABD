@@ -48,15 +48,6 @@ jobs:
                   "    end = '''    def _safe_reference'''",
                   "compact _safe_reference signature",
               ),
-              (
-                  "        if reference_items == action_knowledge:\\n",
-                  "        same_reference = (\\n"
-                  "            len(reference_items) == len(action_knowledge)\\n"
-                  "            and all(left is right for left, right in zip(reference_items, action_knowledge))\\n"
-                  "        )\\n"
-                  "        if same_reference:\\n",
-                  "tensor-safe cohort identity check",
-              ),
           ]
           for old, new, label in corrections:
               if text.count(old) != 1:
@@ -66,6 +57,27 @@ jobs:
           PY
       - name: Apply synergy fix to exact reviewed base
         run: python tools/apply_vcaa_niabd_synergy_fix.py --repo .
+      - name: Harden generated dual-cohort identity check
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('niabd.py')
+          text = path.read_text()
+          old = '        if reference_items == action_knowledge:\n'
+          new = (
+              '        same_reference = (\n'
+              '            len(reference_items) == len(action_knowledge)\n'
+              '            and all(\n'
+              '                left is right\n'
+              '                for left, right in zip(reference_items, action_knowledge)\n'
+              '            )\n'
+              '        )\n'
+              '        if same_reference:\n'
+          )
+          if text.count(old) != 1:
+              raise RuntimeError(f'generated cohort identity marker count={text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Static compile check
