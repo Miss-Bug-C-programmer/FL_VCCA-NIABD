@@ -62,7 +62,7 @@ jobs:
           PY
       - name: Apply synergy fix to exact reviewed base
         run: python tools/apply_vcaa_niabd_synergy_fix.py --repo .
-      - name: Preserve server ownership and schema-compatible labels
+      - name: Preserve ownership and schema compatibility
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -99,6 +99,16 @@ jobs:
           path.write_text(
               text.replace(old_label, 'historical_median_minus_mad_floor', 1)
           )
+
+          path = Path('tests/test_vcaa_niabd_synergy_regression.py')
+          text = path.read_text()
+          old_expectation = 'decision.content_threshold_source == "hard_valid_historical_median_minus_mad_floor"'
+          new_expectation = 'decision.content_threshold_source == "historical_median_minus_mad_floor"'
+          if text.count(old_expectation) != 1:
+              raise RuntimeError(
+                  f'generated VCAA threshold expectation count={text.count(old_expectation)}'
+              )
+          path.write_text(text.replace(old_expectation, new_expectation, 1))
           PY
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
@@ -125,6 +135,7 @@ jobs:
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
           rm -rf tools/synergy_fix_chunks
           rm -f tools/apply_vcaa_niabd_synergy_fix.py.zlib.b64
+          rm -f tools/apply_vcaa_niabd_synergy_fix.py
           rm -f .github/workflows/build_synergy_artifact.yml
           zip -qr FL_VCCA-NIABD_vcaa_niabd_synergy_fix_20260818.zip . \
             -x '.git/*' 'dataset/*' 'smoke_results/*' 'experiment_result/*' \
