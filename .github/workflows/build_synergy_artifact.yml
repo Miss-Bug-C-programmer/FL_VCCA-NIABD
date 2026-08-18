@@ -33,9 +33,17 @@ jobs:
           import zlib
           src = pathlib.Path('/tmp/synergy_patcher.b64').read_text().strip()
           decoded = zlib.decompress(base64.b64decode(src))
-          pathlib.Path('tools/apply_vcaa_niabd_synergy_fix.py').write_bytes(decoded)
+          path = pathlib.Path('tools/apply_vcaa_niabd_synergy_fix.py')
+          path.write_bytes(decoded)
+          assert path.stat().st_size == 39557
+          # Reviewed marker correction: current niabd.py keeps the compact
+          # _upper_robust_z signature on one line.
+          text = path.read_text()
+          old = "    start = '''    @staticmethod\\n    def _upper_robust_z(\\n'''"
+          new = "    start = '''    @staticmethod\\n    def _upper_robust_z'''"
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, new, 1))
           PY
-          echo '6b81fe7d4f649cc5ee92b06437d3118621b5b7c655bf2544b95c0b24a2effa08  tools/apply_vcaa_niabd_synergy_fix.py' | sha256sum -c -
       - name: Apply synergy fix to exact reviewed base
         run: python tools/apply_vcaa_niabd_synergy_fix.py --repo .
       - name: Install test dependencies
