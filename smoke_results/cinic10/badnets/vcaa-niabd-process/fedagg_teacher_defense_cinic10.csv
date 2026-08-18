@@ -1,4 +1,0 @@
-run_uid,dataset,seed,round,topology,num_clients,partition_scheme,defense_method,client_id,anomaly_fraction,mean_abs_deviation,max_abs_deviation,mean_suppression,memory_eligible,task_id,packet_id,source_round,consumed_round,version_lag
-bf095d6e6adc,cinic10,0,1,server-client,2,dirichlet,niabd,1,0.0,0.0,0.0,0.0,True,d040b2d275a4537d89ac17337aeeb2da,61d0686007fa4ddca31e9c43172ceae4,1,1,0
-bf095d6e6adc,cinic10,0,2,server-client,2,dirichlet,niabd,0,0.20999999344348907,1.4571789503097534,7.558547019958496,0.10120189934968948,False,7602bac80a085abf98b6dffa0c74bf2f,fdf02e3811af46e09f2c5612fe29ae8d,1,2,1
-bf095d6e6adc,cinic10,0,3,server-client,2,dirichlet,niabd,0,0.13500000536441803,1.0701775550842285,4.692747592926025,0.043455448001623154,False,513b30bfae9252109cc8aebe06df095e,5df8155c42984da48b73b41b2e3bed72,3,3,0

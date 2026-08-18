@@ -2608,6 +2608,29 @@ def main() -> None:
         default=1e-3,
     )
     parser.add_argument(
+        "--niabd-teacher-score-effective-floor",
+        type=float,
+        default=0.05,
+        help=(
+            "Minimum relative robust scale for teacher-level score features; "
+            "prevents near-zero cohort MAD from exploding NIABD scores."
+        ),
+    )
+    parser.add_argument(
+        "--niabd-teacher-score-z-cap",
+        type=float,
+        default=12.0,
+    )
+    parser.add_argument(
+        "--niabd-consensus-purification-threshold",
+        type=float,
+        default=1.5,
+        help=(
+            "Current-cohort consensus z threshold required in addition to "
+            "trusted-memory deviation before a logit dimension is suppressed."
+        ),
+    )
+    parser.add_argument(
         "--niabd-minimum-consensus-teachers",
         type=int,
         default=4,
@@ -2851,6 +2874,11 @@ def main() -> None:
         ),
         teacher_score_beta=args.niabd_teacher_score_beta,
         teacher_score_scale_floor=args.niabd_teacher_score_scale_floor,
+        teacher_score_effective_floor=args.niabd_teacher_score_effective_floor,
+        teacher_score_z_cap=args.niabd_teacher_score_z_cap,
+        consensus_purification_threshold=(
+            args.niabd_consensus_purification_threshold
+        ),
         minimum_consensus_teachers=args.niabd_minimum_consensus_teachers,
         consensus_recovery_fraction=args.niabd_consensus_recovery_fraction,
         threshold_exposure_quantile=args.niabd_threshold_exposure_quantile,

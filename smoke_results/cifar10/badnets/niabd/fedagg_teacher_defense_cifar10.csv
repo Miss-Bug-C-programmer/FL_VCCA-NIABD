@@ -1,5 +1,0 @@
-run_uid,dataset,seed,round,topology,num_clients,partition_scheme,defense_method,client_id,anomaly_fraction,mean_abs_deviation,max_abs_deviation,mean_suppression,memory_eligible
-9f033731b938,cifar10,0,1,server-client,2,dirichlet,niabd,0,0.0,0.0,0.0,0.0,True
-9f033731b938,cifar10,0,1,server-client,2,dirichlet,niabd,1,0.0,0.0,0.0,0.0,True
-9f033731b938,cifar10,0,2,server-client,2,dirichlet,niabd,0,0.0015625000232830644,0.6376218199729919,2.234348773956299,4.2321997170802206e-05,True
-9f033731b938,cifar10,0,2,server-client,2,dirichlet,niabd,1,0.0078125,0.548220157623291,3.188708782196045,0.001613254309631884,True

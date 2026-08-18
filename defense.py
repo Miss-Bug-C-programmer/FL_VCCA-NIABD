@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Protocol, Sequence, Tuple, Union
+from typing import Dict, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
 
@@ -59,7 +59,15 @@ class KnowledgeDefenseController(Protocol):
         student_logits: torch.Tensor,
         proxy_labels: torch.Tensor,
         current_round: int,
+        reference_knowledge: Optional[Sequence[TeacherKnowledge]] = None,
     ) -> DefenseResult:
+        """Purify the action cohort using an optional calibration cohort.
+
+        ``teacher_knowledge`` is the only cohort whose returned packets may be
+        consumed by aggregation.  ``reference_knowledge`` is observation-only:
+        defenses may use it to estimate robust current statistics, but must not
+        return or aggregate a reference-only packet.
+        """
         ...
 
     def reset(self) -> None:

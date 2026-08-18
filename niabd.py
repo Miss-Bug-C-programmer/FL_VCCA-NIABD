@@ -43,6 +43,9 @@ class NIABDConfig:
     maximum_memory_anomaly_fraction: float = 0.10
     teacher_score_beta: float = 3.0
     teacher_score_scale_floor: float = 1e-3
+    teacher_score_effective_floor: float = 0.05
+    teacher_score_z_cap: float = 12.0
+    consensus_purification_threshold: float = 1.5
     minimum_consensus_teachers: int = 4
     consensus_recovery_fraction: float = 0.75
     threshold_exposure_quantile: float = 0.75
@@ -105,6 +108,12 @@ class NIABDConfig:
             raise ValueError("maximum_memory_anomaly_fraction must be in [0, 1].")
         if float(self.teacher_score_beta) <= 0.0 or float(self.teacher_score_scale_floor) <= 0.0:
             raise ValueError("teacher score controls must be positive.")
+        if float(self.teacher_score_effective_floor) <= 0.0:
+            raise ValueError("teacher_score_effective_floor must be positive.")
+        if float(self.teacher_score_z_cap) <= 0.0:
+            raise ValueError("teacher_score_z_cap must be positive.")
+        if float(self.consensus_purification_threshold) < 0.0:
+            raise ValueError("consensus_purification_threshold must be non-negative.")
         if int(self.minimum_consensus_teachers) < 2:
             raise ValueError("minimum_consensus_teachers must be at least 2.")
         if not 0.5 < float(self.consensus_recovery_fraction) <= 1.0:
@@ -165,6 +174,8 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._phase = self.NORMAL
         self._risk_ema = 0.0
         self._round_risk = 0.0
+        self._recovery_risk = 0.0
+        self._recovery_risk_ema = 0.0
         self._consensus_shift = 0.0
         self._eligible_ratio = 0.0
         self._suspicious_rounds = 0
@@ -193,6 +204,8 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._phase = self.NORMAL
         self._risk_ema = 0.0
         self._round_risk = 0.0
+        self._recovery_risk = 0.0
+        self._recovery_risk_ema = 0.0
         self._consensus_shift = 0.0
         self._eligible_ratio = 0.0
         self._suspicious_rounds = 0
@@ -215,6 +228,8 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "phase": self._phase,
             "risk_ema": float(self._risk_ema),
             "round_risk": float(self._round_risk),
+            "recovery_risk": float(self._recovery_risk),
+            "recovery_risk_ema": float(self._recovery_risk_ema),
             "consensus_shift": float(self._consensus_shift),
             "eligible_ratio": float(self._eligible_ratio),
             "suspicious_rounds": int(self._suspicious_rounds),
@@ -246,6 +261,10 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._phase = phase
         self._risk_ema = float(state.get("risk_ema", 0.0))
         self._round_risk = float(state.get("round_risk", self._risk_ema))
+        self._recovery_risk = float(state.get("recovery_risk", 0.0))
+        self._recovery_risk_ema = float(
+            state.get("recovery_risk_ema", self._recovery_risk)
+        )
         self._consensus_shift = float(state.get("consensus_shift", 0.0))
         self._eligible_ratio = float(state.get("eligible_ratio", 0.0))
         self._suspicious_rounds = int(state.get("suspicious_rounds", 0))
@@ -372,12 +391,25 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._memory_update_rounds = 1
         self._proxy_shape = (int(values.shape[1]), int(values.shape[2]))
 
-    @staticmethod
-    def _upper_robust_z(values: torch.Tensor, floor: float) -> torch.Tensor:
+    def _upper_robust_z(
+        self,
+        values: torch.Tensor,
+        floor: float,
+    ) -> torch.Tensor:
         center = torch.median(values)
         mad = torch.median((values - center).abs())
-        scale = max(float(_ROBUST_MAD_SCALE * mad.item()), float(floor))
-        return torch.relu((values - center) / scale)
+        configured_floor = max(
+            float(floor),
+            float(self.config.teacher_score_effective_floor),
+        )
+        # Teacher-level metrics can be almost identical after VCAA narrows the
+        # action cohort.  A tiny absolute MAD floor (1e-3) turns harmless
+        # numerical differences into scores in the thousands.  Use a relative
+        # dimensionless floor and an explicit finite cap.
+        relative_floor = configured_floor * max(1.0, abs(float(center.item())))
+        scale = max(float(_ROBUST_MAD_SCALE * mad.item()), relative_floor)
+        z = torch.relu((values - center) / scale)
+        return z.clamp_max(float(self.config.teacher_score_z_cap))
 
     def _teacher_metrics(
         self,
@@ -438,9 +470,13 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             return mask, "freeze_no_safe_candidate"
         return mask, "warmup_robust_update"
 
-    def _transition(self, risk: float) -> None:
+    def _transition(self, risk: float, recovery_risk: float) -> None:
         beta = float(self.config.risk_ema_beta)
         self._risk_ema = beta * float(risk) + (1.0 - beta) * self._risk_ema
+        self._recovery_risk_ema = (
+            beta * float(recovery_risk)
+            + (1.0 - beta) * self._recovery_risk_ema
+        )
         if self._phase == self.NORMAL:
             self._recovery_rounds = 0
             self._stable_rounds = 0
@@ -453,7 +489,11 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 self._suspicious_rounds = 0
         elif self._phase == self.SUSPICIOUS:
             self._stable_rounds = 0
-            if self._risk_ema <= float(self.config.risk_off):
+            # Exiting SUSPICIOUS must not require a frozen historical memory to
+            # already match a legitimately drifting model.  Recovery is driven
+            # by present-cohort agreement; the historical memory remains frozen
+            # until RECOVERY, where it can move conservatively toward consensus.
+            if self._recovery_risk_ema <= float(self.config.risk_off):
                 self._recovery_rounds += 1
             else:
                 self._recovery_rounds = 0
@@ -462,11 +502,14 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 self._recovery_rounds = 0
                 self._stable_rounds = 0
         else:
-            if self._risk_ema >= float(self.config.risk_on):
+            if (
+                self._risk_ema >= float(self.config.risk_on)
+                and self._recovery_risk_ema >= float(self.config.risk_on)
+            ):
                 self._phase = self.SUSPICIOUS
                 self._suspicious_rounds = 0
                 self._stable_rounds = 0
-            elif self._risk_ema <= float(self.config.risk_off):
+            elif self._recovery_risk_ema <= float(self.config.risk_off):
                 self._stable_rounds += 1
             else:
                 self._stable_rounds = 0
@@ -658,6 +701,8 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "niabd_phase": self._phase,
             "niabd_round_risk": float(self._round_risk),
             "niabd_risk_ema": float(self._risk_ema),
+            "niabd_recovery_risk": float(self._recovery_risk),
+            "niabd_recovery_risk_ema": float(self._recovery_risk_ema),
             "niabd_consensus_shift": float(self._consensus_shift),
             "niabd_eligible_ratio": float(self._eligible_ratio),
             "niabd_trusted_memory_frozen": bool(self._phase == self.SUSPICIOUS),
@@ -674,70 +719,231 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         student_logits: torch.Tensor,
         proxy_labels: torch.Tensor,
         current_round: int,
+        reference_knowledge: Optional[Sequence[TeacherKnowledge]] = None,
     ) -> DefenseResult:
         del proxy_labels
         if int(current_round) <= 0:
             raise ValueError("current_round must be positive.")
-        stacked, original_dtypes = self._stack_knowledge(teacher_knowledge)
+        if not teacher_knowledge:
+            raise ValueError("NIABD requires at least one action teacher.")
+
+        action_knowledge = tuple(teacher_knowledge)
+        reference_items = tuple(reference_knowledge or action_knowledge)
+        action_ids = [int(item.metadata.client_id) for item in action_knowledge]
+        reference_ids = [int(item.metadata.client_id) for item in reference_items]
+        if len(set(action_ids)) != len(action_ids):
+            raise ValueError("NIABD action teacher IDs must be unique.")
+        if len(set(reference_ids)) != len(reference_ids):
+            raise ValueError("NIABD reference teacher IDs must be unique.")
+        reference_index = {client_id: index for index, client_id in enumerate(reference_ids)}
+        missing_action = [client_id for client_id in action_ids if client_id not in reference_index]
+        if missing_action:
+            raise ValueError(
+                "NIABD reference cohort must contain every action teacher; "
+                f"missing={missing_action}."
+            )
+
+        action_stacked, original_dtypes = self._stack_knowledge(action_knowledge)
+        same_reference = (
+            len(reference_items) == len(action_knowledge)
+            and all(
+                left is right
+                for left, right in zip(reference_items, action_knowledge)
+            )
+        )
+        if same_reference:
+            reference_stacked = action_stacked
+        else:
+            reference_stacked, _ = self._stack_knowledge(reference_items)
+        if action_stacked.shape[1:] != reference_stacked.shape[1:]:
+            raise ValueError("NIABD action/reference cohorts must share one proxy shape.")
+        action_reference_indices = torch.tensor(
+            [reference_index[client_id] for client_id in action_ids],
+            dtype=torch.long,
+        )
+
         student = self._to_cpu_float(student_logits, name="student_logits")
-        if student.shape != stacked.shape[1:]:
+        if student.shape != action_stacked.shape[1:]:
             raise ValueError("NIABD student and teacher logits must share a proxy shape.")
         self._validate_memory_shape(student.shape)
-        candidates, warmup_reason = self._warmup_candidates(stacked)
+
+        reference_candidates, warmup_reason = self._warmup_candidates(reference_stacked)
+        action_candidates = reference_candidates.index_select(0, action_reference_indices)
         if self._trusted_mean is None:
             if warmup_reason != "warmup_robust_update":
                 self._consecutive_frozen_rounds += 1
-                return self._warmup_result(teacher_knowledge, candidates, warmup_reason)
-            self._initialize_memory(stacked[candidates])
-            return self._warmup_result(teacher_knowledge, candidates, "warmup_robust_update")
-        assert self._trusted_mean is not None and self._trusted_variance is not None and self._thresholds is not None
+                return self._warmup_result(
+                    action_knowledge,
+                    action_candidates,
+                    warmup_reason,
+                )
+            self._initialize_memory(reference_stacked[reference_candidates])
+            return self._warmup_result(
+                action_knowledge,
+                action_candidates,
+                "warmup_robust_update",
+            )
+        assert (
+            self._trusted_mean is not None
+            and self._trusted_variance is not None
+            and self._thresholds is not None
+        )
         if int(current_round) <= int(self.config.warmup_rounds):
-            updated = self._update_memory(stacked, candidates)
-            self._consecutive_frozen_rounds = 0 if updated else self._consecutive_frozen_rounds + 1
-            return self._warmup_result(teacher_knowledge, candidates, "warmup_robust_update" if updated else warmup_reason)
+            updated = self._update_memory(reference_stacked, reference_candidates)
+            self._consecutive_frozen_rounds = (
+                0 if updated else self._consecutive_frozen_rounds + 1
+            )
+            return self._warmup_result(
+                action_knowledge,
+                action_candidates,
+                "warmup_robust_update" if updated else warmup_reason,
+            )
 
         previous_mean = self._trusted_mean
         previous_variance = self._trusted_variance
-        std = torch.sqrt(previous_variance).clamp_min(float(self.config.minimum_standard_deviation))
-        abs_deviation = ((stacked - previous_mean.unsqueeze(0)) / (std.unsqueeze(0) + self.config.epsilon)).abs()
-        current_consensus = torch.median(stacked, dim=0).values
-        current_mad = torch.median((stacked - current_consensus.unsqueeze(0)).abs(), dim=0).values
+        std = torch.sqrt(previous_variance).clamp_min(
+            float(self.config.minimum_standard_deviation)
+        )
+        reference_abs_deviation = (
+            (reference_stacked - previous_mean.unsqueeze(0))
+            / (std.unsqueeze(0) + self.config.epsilon)
+        ).abs()
+        current_consensus = torch.median(reference_stacked, dim=0).values
+        current_mad = torch.median(
+            (reference_stacked - current_consensus.unsqueeze(0)).abs(),
+            dim=0,
+        ).values
         current_scale = torch.maximum(
             _ROBUST_MAD_SCALE * current_mad,
-            torch.full_like(current_mad, float(self.config.minimum_standard_deviation)),
+            torch.full_like(
+                current_mad,
+                float(self.config.minimum_standard_deviation),
+            ),
         )
-        consensus_z = (stacked - current_consensus.unsqueeze(0)).abs() / (current_scale.unsqueeze(0) + self.config.epsilon)
-        teacher_metrics = self._teacher_metrics(abs_deviation, consensus_z)
-        eligible = teacher_metrics["eligible"]
-        self._eligible_ratio = float(eligible.float().mean().item())
-        consensus_shift_tensor = (current_consensus - previous_mean).abs() / (std + self.config.epsilon)
-        self._consensus_shift = float(torch.quantile(consensus_shift_tensor.reshape(-1), 0.95).item())
-        anomaly_fraction = float((abs_deviation > self._thresholds.view(1, 1, -1)).float().mean().item())
+        reference_consensus_z = (
+            (reference_stacked - current_consensus.unsqueeze(0)).abs()
+            / (current_scale.unsqueeze(0) + self.config.epsilon)
+        )
+        reference_metrics = self._teacher_metrics(
+            reference_abs_deviation,
+            reference_consensus_z,
+        )
+        reference_eligible = reference_metrics["eligible"]
+        self._eligible_ratio = float(reference_eligible.float().mean().item())
+
+        consensus_shift_tensor = (
+            (current_consensus - previous_mean).abs()
+            / (std + self.config.epsilon)
+        )
+        self._consensus_shift = float(
+            torch.quantile(consensus_shift_tensor.reshape(-1), 0.95).item()
+        )
+        anomaly_fraction = float(
+            (
+                reference_abs_deviation
+                > self._thresholds.view(1, 1, -1)
+            )
+            .float()
+            .mean()
+            .item()
+        )
         risk_components = [
             self._consensus_shift / float(self.config.benign_deviation_limit),
-            anomaly_fraction / max(float(self.config.maximum_memory_anomaly_fraction), self.config.epsilon),
+            anomaly_fraction
+            / max(
+                float(self.config.maximum_memory_anomaly_fraction),
+                self.config.epsilon,
+            ),
             1.0 - self._eligible_ratio,
-            float(torch.median(teacher_metrics["teacher_memory_score"]).item()) / float(self.config.teacher_score_beta),
+            float(torch.median(reference_metrics["teacher_memory_score"]).item())
+            / float(self.config.teacher_score_beta),
         ]
         self._round_risk = float(max(0.0, max(risk_components)))
-        self._transition(self._round_risk)
+
+        # Recovery risk intentionally ignores distance to frozen historical
+        # memory.  It answers a different question: does the *current* robust
+        # cohort still contain a material outlier faction?  A collective benign
+        # training drift therefore permits RECOVERY, while a minority backdoor
+        # faction remains visible through consensus deviation.
+        consensus_teacher_deviation = reference_metrics["consensus_deviation"]
+        consensus_outlier_fraction = float(
+            (
+                consensus_teacher_deviation
+                > float(self.config.benign_deviation_limit)
+            )
+            .float()
+            .mean()
+            .item()
+        )
+        median_consensus_deviation = float(
+            torch.median(consensus_teacher_deviation).item()
+        )
+        self._recovery_risk = float(
+            max(
+                0.0,
+                consensus_outlier_fraction
+                / max(
+                    float(self.config.maximum_memory_anomaly_fraction),
+                    self.config.epsilon,
+                ),
+                median_consensus_deviation
+                / float(self.config.benign_deviation_limit),
+            )
+        )
+        self._transition(self._round_risk, self._recovery_risk)
+
         reference, alpha = self._safe_reference(current_consensus, student)
         self._reference_trusted_weight = float(alpha)
+
+        action_abs_deviation = reference_abs_deviation.index_select(
+            0, action_reference_indices
+        )
+        action_consensus_z = reference_consensus_z.index_select(
+            0, action_reference_indices
+        )
+        action_metrics = {
+            key: value.index_select(0, action_reference_indices)
+            for key, value in reference_metrics.items()
+        }
         threshold_view = self._thresholds.view(1, 1, -1)
-        excess = torch.relu(abs_deviation - threshold_view)
-        weights = torch.exp(-(excess.square()) / (2.0 * float(self.config.transition_smoothness) ** 2))
-        purified = weights * stacked + (1.0 - weights) * reference.unsqueeze(0)
+        memory_excess = torch.relu(action_abs_deviation - threshold_view)
+        consensus_excess = torch.relu(
+            action_consensus_z
+            - float(self.config.consensus_purification_threshold)
+        )
+        # Purification now requires independent evidence from both temporal
+        # memory and current-cohort disagreement.  This preserves common benign
+        # representation drift instead of pulling every teacher back toward a
+        # frozen prototype.
+        purification_excess = torch.minimum(memory_excess, consensus_excess)
+        weights = torch.exp(
+            -(purification_excess.square())
+            / (2.0 * float(self.config.transition_smoothness) ** 2)
+        )
+        purified = (
+            weights * action_stacked
+            + (1.0 - weights) * reference.unsqueeze(0)
+        )
         require_finite_tensor(purified, phase="niabd", metric="purified_logits")
-        update_mask = eligible.clone()
+
+        update_mask = reference_eligible.clone()
         consensus_recovery = False
         if (
-            int(eligible.sum().item()) < int(self.config.minimum_consensus_teachers)
+            int(reference_eligible.sum().item())
+            < int(self.config.minimum_consensus_teachers)
             and self._phase != self.SUSPICIOUS
         ):
-            recovery_candidates, recovery_reason = self._warmup_candidates(stacked)
+            recovery_candidates, recovery_reason = self._warmup_candidates(
+                reference_stacked
+            )
             required = max(
                 int(self.config.minimum_consensus_teachers),
-                int(ceil(float(self.config.consensus_recovery_fraction) * int(stacked.shape[0]))),
+                int(
+                    ceil(
+                        float(self.config.consensus_recovery_fraction)
+                        * int(reference_stacked.shape[0])
+                    )
+                ),
             )
             if (
                 recovery_reason == "warmup_robust_update"
@@ -745,12 +951,15 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             ):
                 update_mask = recovery_candidates
                 consensus_recovery = True
-        memory_updated = self._update_memory(stacked, update_mask)
+        memory_updated = self._update_memory(reference_stacked, update_mask)
         if memory_updated:
             self._consecutive_frozen_rounds = 0
         else:
             self._consecutive_frozen_rounds += 1
-        threshold_mode = self._update_thresholds(abs_deviation, eligible)
+        threshold_mode = self._update_thresholds(
+            reference_abs_deviation,
+            reference_eligible,
+        )
         reason = {
             self.NORMAL: (
                 "consensus_drift_update"
@@ -761,15 +970,20 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             ),
             self.SUSPICIOUS: (
                 "freeze_no_safe_candidate"
-                if not bool(eligible.any().item())
+                if not bool(reference_eligible.any().item())
                 else "suspicious_memory_frozen"
             ),
-            self.RECOVERY: "recovery_clipped_update" if memory_updated else "recovery_no_safe_candidate",
+            self.RECOVERY: (
+                "recovery_clipped_update"
+                if memory_updated
+                else "recovery_no_safe_candidate"
+            ),
         }[self._phase]
+        action_eligible = action_metrics["eligible"]
         records = self._record_tuple(
-            teacher_knowledge,
-            teacher_metrics,
-            abs_deviation,
+            action_knowledge,
+            action_metrics,
+            action_abs_deviation,
             1.0 - weights,
             memory_updated,
             threshold_mode,
@@ -779,20 +993,30 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             reason=reason,
             prototype_updated=memory_updated,
             candidate_count=int(update_mask.sum().item()),
-            memory_eligible=int(eligible.sum().item()),
+            memory_eligible=int(action_eligible.sum().item()),
             anomaly_fraction=anomaly_fraction,
             mean_suppression=float((1.0 - weights).mean().item()),
-            teacher_metrics=teacher_metrics,
+            teacher_metrics=action_metrics,
             threshold_mode=threshold_mode,
+        )
+        metrics.update(
+            {
+                "niabd_reference_teachers": int(reference_stacked.shape[0]),
+                "niabd_action_teachers": int(action_stacked.shape[0]),
+                "niabd_recovery_risk": float(self._recovery_risk),
+                "niabd_recovery_risk_ema": float(self._recovery_risk_ema),
+            }
         )
         return DefenseResult(
             method=self.name,
             purified_knowledge=tuple(
                 TeacherKnowledge(
                     metadata=item.metadata,
-                    logits=purified[index].to(dtype=original_dtypes[index]).clone(),
+                    logits=purified[index]
+                    .to(dtype=original_dtypes[index])
+                    .clone(),
                 )
-                for index, item in enumerate(teacher_knowledge)
+                for index, item in enumerate(action_knowledge)
             ),
             records=records,
             metrics=metrics,
@@ -862,6 +1086,8 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "niabd_phase": self._phase,
             "niabd_round_risk": float(self._round_risk),
             "niabd_risk_ema": float(self._risk_ema),
+            "niabd_recovery_risk": float(self._recovery_risk),
+            "niabd_recovery_risk_ema": float(self._recovery_risk_ema),
             "niabd_consensus_shift": float(self._consensus_shift),
             "niabd_eligible_ratio": float(self._eligible_ratio),
             "niabd_trusted_memory_frozen": False,

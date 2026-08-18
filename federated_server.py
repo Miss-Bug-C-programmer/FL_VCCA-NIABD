@@ -37,6 +37,11 @@ class FederatedServer:
         self.amp = bool(amp)
         self.strict_numeric_checks = bool(strict_numeric_checks)
         self._proxy_labels = self._collect_proxy_labels(proxy_loader)
+        # The admission decision and defense are sequential stages of one
+        # server round.  Cache only the hard-valid calibration cohort for that
+        # same round; it is never an aggregation authorization.
+        self._defense_reference_round: Optional[int] = None
+        self._defense_reference_ids: tuple[int, ...] = ()
 
     @staticmethod
     def _collect_proxy_labels(proxy_loader) -> torch.Tensor:
@@ -131,9 +136,14 @@ class FederatedServer:
         controller: Optional[TeacherAdmissionController],
         student_logits: Optional[torch.Tensor] = None,
     ) -> Optional[AdmissionDecision]:
+        round_number = int(current_round)
         if controller is None:
+            self._defense_reference_round = round_number
+            self._defense_reference_ids = tuple(
+                sorted(int(client_id) for client_id in knowledge_by_client)
+            )
             return None
-        return controller.evaluate(
+        decision = controller.evaluate(
             teacher_knowledge=[
                 knowledge_by_client[client_id]
                 for client_id in sorted(knowledge_by_client)
@@ -144,8 +154,28 @@ class FederatedServer:
                 else student_logits
             ),
             proxy_labels=self._proxy_labels,
-            current_round=int(current_round),
+            current_round=round_number,
         )
+        reference_ids = tuple(
+            int(client_id)
+            for client_id in (
+                decision.freshness_valid_client_ids
+                or decision.admitted_client_ids
+            )
+        )
+        unknown = set(reference_ids).difference(knowledge_by_client)
+        if unknown:
+            raise ValueError(
+                "Admission returned unknown freshness-valid reference clients: "
+                f"{sorted(unknown)}"
+            )
+        if not set(decision.admitted_client_ids).issubset(reference_ids):
+            raise ValueError(
+                "Defense reference cohort must contain every admitted teacher."
+            )
+        self._defense_reference_round = round_number
+        self._defense_reference_ids = reference_ids
+        return decision
 
     def apply_defense(
         self,
@@ -158,12 +188,21 @@ class FederatedServer:
     ) -> Optional[DefenseResult]:
         if controller is None or not admitted_client_ids:
             return None
-        admitted = [
-            knowledge_by_client[int(client_id)]
-            for client_id in admitted_client_ids
-        ]
-        return controller.purify(
+        admitted_ids = tuple(int(client_id) for client_id in admitted_client_ids)
+        admitted = [knowledge_by_client[client_id] for client_id in admitted_ids]
+        reference_ids = admitted_ids
+        if self._defense_reference_round == int(current_round):
+            cached = tuple(
+                client_id
+                for client_id in self._defense_reference_ids
+                if client_id in knowledge_by_client
+            )
+            if cached and set(admitted_ids).issubset(cached):
+                reference_ids = cached
+        reference = [knowledge_by_client[client_id] for client_id in reference_ids]
+        result = controller.purify(
             teacher_knowledge=admitted,
+            reference_knowledge=reference,
             student_logits=(
                 self.student_proxy_logits()
                 if student_logits is None
@@ -172,6 +211,14 @@ class FederatedServer:
             proxy_labels=self._proxy_labels,
             current_round=int(current_round),
         )
+        returned_ids = tuple(
+            int(item.metadata.client_id) for item in result.purified_knowledge
+        )
+        if set(returned_ids) != set(admitted_ids) or len(returned_ids) != len(admitted_ids):
+            raise ValueError(
+                "Defense may return only, and exactly, the admitted action cohort."
+            )
+        return result
 
     @staticmethod
     def aggregate_admitted_logits(
