@@ -62,10 +62,11 @@ jobs:
           PY
       - name: Apply synergy fix to exact reviewed base
         run: python tools/apply_vcaa_niabd_synergy_fix.py --repo .
-      - name: Harden generated dual-cohort identity check
+      - name: Preserve server ownership and schema-compatible labels
         run: |
           python - <<'PY'
           from pathlib import Path
+
           path = Path('niabd.py')
           text = path.read_text()
           old = '        if reference_items == action_knowledge:\n'
@@ -82,6 +83,22 @@ jobs:
           if text.count(old) != 1:
               raise RuntimeError(f'generated cohort identity marker count={text.count(old)}')
           path.write_text(text.replace(old, new, 1))
+
+          path = Path('federated_server.py')
+          text = path.read_text()
+          old_name = '_defense_reference_client_ids'
+          if text.count(old_name) < 3:
+              raise RuntimeError('expected generated defense reference identifier')
+          path.write_text(text.replace(old_name, '_defense_reference_ids'))
+
+          path = Path('vcaa.py')
+          text = path.read_text()
+          old_label = 'hard_valid_historical_median_minus_mad_floor'
+          if text.count(old_label) != 1:
+              raise RuntimeError(f'VCAA threshold source count={text.count(old_label)}')
+          path.write_text(
+              text.replace(old_label, 'historical_median_minus_mad_floor', 1)
+          )
           PY
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
@@ -89,6 +106,8 @@ jobs:
         run: python -B -m compileall -q .
       - name: Full regression suite
         run: python -B -m pytest -q
+      - name: Validate experiment matrix generation
+        run: python -B scripts/run_v3_matrix.py --config configs/main_backdoor_experiment.json
       - name: Diff hygiene
         run: git diff --check
       - name: Assert algorithm lineage
