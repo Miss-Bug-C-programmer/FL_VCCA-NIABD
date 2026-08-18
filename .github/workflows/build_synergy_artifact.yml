@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - artifact/vcaa-niabd-synergy-fix-20260818
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build-and-validate:
