@@ -22,7 +22,6 @@ from attacks import (
     split_defense_diagnostics,
 )
 from admission import (
-    AdmissionDecision,
     TeacherAdmissionController,
     TeacherKnowledge,
     TeacherMetadata,
@@ -40,9 +39,9 @@ from federated_runtime import (
     _finite_int,
     _freeze_state_dict,
     _model_is_finite,
+    _apply_optional_admission,
     _restore_model,
     _tensor_sha256,
-    _validate_decision,
     evaluate_with_loss,
 )
 from federated_server import FederatedServer
@@ -1632,25 +1631,14 @@ def run_fedagg_server_client_process_async(
             admission_started = time.monotonic()
             student_snapshot = server.student_proxy_logits().detach().cpu().clone()
             student_snapshot_sha256 = _tensor_sha256(student_snapshot)
-            decision: Optional[AdmissionDecision] = None
-            if knowledge_by_client:
-                decision = server.apply_admission(
-                    knowledge_by_client,
-                    current_round=server_round,
-                    controller=admission_controller,
-                    student_logits=student_snapshot,
-                )
+            decision, admitted_ids, freshness_valid_ids = _apply_optional_admission(
+                server=server,
+                knowledge_by_client=knowledge_by_client,
+                current_round=server_round,
+                admission_controller=admission_controller,
+                student_logits=student_snapshot,
+            )
             candidate_ids = sorted(knowledge_by_client)
-            if decision is None:
-                admitted_ids = candidate_ids
-                freshness_valid_ids = list(admitted_ids)
-            else:
-                _validate_decision(decision, candidate_ids)
-                admitted_ids = list(decision.admitted_client_ids)
-                freshness_valid_ids = list(
-                    decision.freshness_valid_client_ids
-                    or decision.admitted_client_ids
-                )
             admission_time = time.monotonic() - admission_started
             admission_metrics = _decision_metrics(
                 decision,
@@ -1754,6 +1742,14 @@ def run_fedagg_server_client_process_async(
                         record.components.get("entropy_deviation", float("nan"))
                     )
                     event["admitted"] = bool(record.admitted)
+
+            if admission_controller is None and any(
+                event.get("admitted") is not True for event in round_events
+            ):
+                raise RuntimeError(
+                    "Admission-disabled process runtime must pass through every "
+                    "consumed teacher packet."
+                )
 
             defense_started = time.monotonic()
             defense_result: Optional[DefenseResult] = None

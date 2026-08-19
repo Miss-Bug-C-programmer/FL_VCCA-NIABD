@@ -12,6 +12,7 @@ from admission import (
 )
 from defense import DefenseResult
 from federated_runtime import run_fedagg_server_client
+from federated_server import FederatedServer
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from result_schema import VCAA_ALGORITHM_VERSION
 from vcaa import VCAAConfig, VersionContentAwareAdmission
@@ -77,12 +78,48 @@ def test_one_round_runs_with_real_serialized_client_logits():
     assert metrics["vcaa_enabled"] == 0
     assert metrics["teachers_admitted"] == [2]
     assert metrics["teachers_rejected"] == [0]
+    assert metrics["teacher_utilization"] == [1.0]
+    assert metrics["teacher_admission_records"] == [[]]
     assert math.isnan(metrics["niabd_anomaly_fraction"][0])
     assert math.isnan(metrics["niabd_threshold_mean"][0])
     assert any(
         not torch.equal(server_before[key], server.state_dict()[key])
         for key in server_before
     )
+
+
+def test_disabled_admission_stage_is_not_called_for_baseline_or_niabd(
+    monkeypatch,
+):
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("admission stage must be bypassed when VCAA is disabled")
+
+    monkeypatch.setattr(FederatedServer, "apply_admission", fail_if_called)
+
+    baseline = run_fedagg_server_client(
+        [_TinyVisionModel(), _TinyVisionModel()],
+        _TinyVisionModel(),
+        _dataloaders(),
+        device="cpu",
+        rounds=1,
+    )
+    assert baseline["teachers_admitted"] == [2]
+    assert baseline["teachers_rejected"] == [0]
+
+    niabd = run_fedagg_server_client(
+        [_TinyVisionModel(), _TinyVisionModel()],
+        _TinyVisionModel(),
+        _dataloaders(),
+        device="cpu",
+        rounds=1,
+        defense_controller=NeuroInspiredAdaptiveBackdoorDefense(
+            NIABDConfig(warmup_rounds=1)
+        ),
+    )
+    assert niabd["teachers_admitted"] == [2]
+    assert niabd["teachers_rejected"] == [0]
+    assert niabd["teachers_purified"] == [2]
 
 
 def test_model_loader_cardinality_mismatch_is_rejected():
@@ -316,6 +353,10 @@ def test_niabd_only_runs_without_vcaa():
     assert metrics["vcaa_enabled"] == 0
     assert metrics["niabd_enabled"] == 1
     assert metrics["defense_method"] == "niabd"
+    assert metrics["teachers_admitted"] == [2]
+    assert metrics["teachers_rejected"] == [0]
+    assert metrics["teacher_utilization"] == [1.0]
+    assert metrics["teacher_admission_records"] == [[]]
     assert metrics["teachers_purified"] == [2]
     assert metrics["niabd_warmup"] == [1.0]
 

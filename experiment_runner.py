@@ -36,6 +36,7 @@ from device_utils import (
 )
 from model_factory import build_model, build_models, dataset_spec
 from model_factory import architecture_assignment_hash, model_parameter_count
+from method_switches import resolve_method_switches, strategy_name
 from federated_runtime import run_fedagg_server_client
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from process_runtime import (
@@ -1501,13 +1502,7 @@ def _ensure_csv_header(path: str, columns: tuple[str, ...]) -> None:
 
 
 def _strategy_name(enable_vcaa: bool, enable_niabd: bool) -> str:
-    if enable_vcaa and enable_niabd:
-        return "vcaa-niabd"
-    if enable_vcaa:
-        return "vcaa"
-    if enable_niabd:
-        return "niabd"
-    return "baseline"
+    return strategy_name(enable_vcaa, enable_niabd)
 
 
 def _trace_output_path(
@@ -1708,6 +1703,11 @@ def run_experiment(
         "aggregation_trim_fraction": float(aggregation_trim_fraction),
         "server_architecture": str(server_architecture),
         "client_architectures": list(client_architectures or []),
+        "method": _strategy_name(enable_vcaa, enable_niabd),
+        "vcaa_enabled": bool(enable_vcaa),
+        "niabd_enabled": bool(enable_niabd),
+        "admission_owner": "vcaa" if enable_vcaa else "none",
+        "defense_owner": "niabd" if enable_niabd else "none",
         "vcaa_algorithm_version": (
             VCAA_ALGORITHM_VERSION if enable_vcaa else "none"
         ),
@@ -2409,8 +2409,14 @@ def main() -> None:
     parser.add_argument(
         "--method",
         choices=["baseline", "vcaa", "niabd", "vcaa-niabd"],
-        default="",
-        help="Optional formal-method alias; existing --enable-vcaa/--enable-niabd flags remain supported.",
+        default=None,
+        help=(
+            "Mechanism alias: baseline enables neither VCAA nor NIABD; "
+            "vcaa enables admission only; niabd enables purification only; "
+            "vcaa-niabd enables both. If omitted, legacy --enable-vcaa/"
+            "--enable-niabd flags are honored; with no mechanism argument "
+            "the run is baseline."
+        ),
     )
     parser.add_argument(
         "--attack",
@@ -2706,21 +2712,13 @@ def main() -> None:
     parser.add_argument("--resume-from-checkpoint", default="")
     args = parser.parse_args()
 
-    enable_vcaa = bool(args.enable_vcaa)
-    enable_niabd = bool(args.enable_niabd)
-    if args.method:
-        method_flags = {
-            "baseline": (False, False),
-            "vcaa": (True, False),
-            "niabd": (False, True),
-            "vcaa-niabd": (True, True),
-        }[args.method]
-        explicitly_enabled = (bool(args.enable_vcaa), bool(args.enable_niabd))
-        if any(explicitly_enabled) and explicitly_enabled != method_flags:
-            raise ValueError(
-                "--method conflicts with explicit --enable-vcaa/--enable-niabd flags."
-            )
-        enable_vcaa, enable_niabd = method_flags
+    switches = resolve_method_switches(
+        args.method,
+        enable_vcaa=bool(args.enable_vcaa),
+        enable_niabd=bool(args.enable_niabd),
+    )
+    enable_vcaa = bool(switches.enable_vcaa)
+    enable_niabd = bool(switches.enable_niabd)
     trigger_size = int(args.trigger_size)
     if trigger_size <= 0:
         trigger_size = 8 if args.dataset_name == "tiny-imagenet-200" else 4

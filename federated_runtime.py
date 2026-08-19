@@ -20,6 +20,7 @@ from checkpointing import restore_checkpoint
 from admission import (
     AdmissionDecision,
     TeacherAdmissionController,
+    TeacherKnowledge,
 )
 from defense import DefenseResult, KnowledgeDefenseController
 from federated_client import FederatedClient
@@ -371,6 +372,48 @@ def _validate_decision(
             raise ValueError(
                 "VCAA normalized aggregation weights must sum to one."
             )
+
+
+def _apply_optional_admission(
+    *,
+    server: FederatedServer,
+    knowledge_by_client: Dict[int, TeacherKnowledge],
+    current_round: int,
+    admission_controller: Optional[TeacherAdmissionController],
+    student_logits: torch.Tensor,
+) -> tuple[Optional[AdmissionDecision], List[int], List[int]]:
+    """Apply admission only when an admission controller is enabled.
+
+    The disabled path is an explicit pass-through: every teacher knowledge
+    packet that reached the round candidate cohort is admitted.  NIABD is a
+    post-admission defense and therefore cannot reject teachers through this
+    path.
+    """
+
+    candidate_ids = sorted(int(client_id) for client_id in knowledge_by_client)
+    if admission_controller is None:
+        return None, candidate_ids, list(candidate_ids)
+
+    decision = server.apply_admission(
+        knowledge_by_client,
+        current_round=int(current_round),
+        controller=admission_controller,
+        student_logits=student_logits,
+    )
+    if decision is None:
+        raise RuntimeError(
+            "An enabled admission controller must return an AdmissionDecision."
+        )
+    _validate_decision(decision, candidate_ids)
+    admitted_ids = [int(client_id) for client_id in decision.admitted_client_ids]
+    freshness_valid_ids = [
+        int(client_id)
+        for client_id in (
+            decision.freshness_valid_client_ids
+            or decision.admitted_client_ids
+        )
+    ]
+    return decision, admitted_ids, freshness_valid_ids
 
 
 def _defense_metrics(
@@ -923,25 +966,13 @@ def run_fedagg_server_client(
                     statistics.median(observed_ages)
                 )
         admission_start = time.perf_counter()
-        decision = server.apply_admission(
-            knowledge_by_client,
+        decision, admitted_ids, freshness_valid_ids = _apply_optional_admission(
+            server=server,
+            knowledge_by_client=knowledge_by_client,
             current_round=round_number,
-            controller=admission_controller,
+            admission_controller=admission_controller,
             student_logits=student_snapshot,
         )
-        if decision is None:
-            admitted_ids = [client.client_id for client in clients]
-            freshness_valid_ids = list(admitted_ids)
-        else:
-            _validate_decision(
-                decision,
-                [client.client_id for client in clients],
-            )
-            admitted_ids = list(decision.admitted_client_ids)
-            freshness_valid_ids = list(
-                decision.freshness_valid_client_ids
-                or decision.admitted_client_ids
-            )
         admission_time = time.perf_counter() - admission_start
         admission_metrics = _decision_metrics(
             decision,

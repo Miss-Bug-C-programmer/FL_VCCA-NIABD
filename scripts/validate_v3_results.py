@@ -235,6 +235,115 @@ def _validate_v5_admission_frame(
             )
 
 
+def _validate_admission_switch_semantics(
+    frame: pd.DataFrame,
+    *,
+    path: Path,
+    kind: str,
+) -> None:
+    """Enforce method ownership of the teacher-admission decision.
+
+    Baseline and NIABD-only runs do not own an admission gate.  For rows that
+    reached the admission/aggregation candidate cohort, their admitted value
+    must therefore be true.  Transport-level rows with no admission outcome
+    (NaN) are intentionally ignored because a dropped/unconsumed packet is not
+    a VCAA rejection.
+    """
+
+    if frame.empty or "strategy" not in frame.columns:
+        return
+
+    strategy = frame["strategy"].astype(str).str.strip().str.lower()
+    no_admission = strategy.isin({"baseline", "niabd"})
+    if not no_admission.any():
+        return
+
+    if kind == "admission":
+        raise ValueError(
+            f"{path.name} contains teacher-admission records for a method "
+            "without VCAA enabled."
+        )
+
+    if "vcaa_enabled" in frame.columns:
+        enabled = _as_bool(frame.loc[no_admission, "vcaa_enabled"])
+        if enabled.any():
+            raise ValueError(
+                f"{path.name} marks VCAA enabled for baseline/NIABD-only rows."
+            )
+
+    if "admission_method" in frame.columns:
+        methods = (
+            frame.loc[no_admission, "admission_method"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        if (~methods.isin({"none", "", "nan"})).any():
+            raise ValueError(
+                f"{path.name} assigns an admission method to baseline/NIABD-only rows."
+            )
+
+    if "teachers_rejected" in frame.columns:
+        rejected = pd.to_numeric(
+            frame.loc[no_admission, "teachers_rejected"],
+            errors="coerce",
+        )
+        observed = rejected.dropna()
+        if (observed != 0).any():
+            raise ValueError(
+                f"{path.name} reports rejected teachers while VCAA is disabled."
+            )
+
+    if "teacher_utilization" in frame.columns:
+        utilization = pd.to_numeric(
+            frame.loc[no_admission, "teacher_utilization"],
+            errors="coerce",
+        ).dropna()
+        if any(
+            not math.isclose(float(value), 1.0, rel_tol=1e-7, abs_tol=1e-7)
+            for value in utilization
+        ):
+            raise ValueError(
+                f"{path.name} reports teacher_utilization < 1 while VCAA is disabled."
+            )
+
+    if "admitted" in frame.columns:
+        raw = frame.loc[no_admission, "admitted"]
+        observed = raw[raw.notna()]
+        if not observed.empty and not _as_bool(observed).all():
+            raise ValueError(
+                f"{path.name} contains a rejected admission outcome for a "
+                "baseline/NIABD-only row."
+            )
+
+
+def _validate_manifest_method_switches(manifest: dict) -> None:
+    method = str(manifest.get("method", "")).strip().lower()
+    if not method:
+        return
+    expected = {
+        "baseline": (False, False),
+        "vcaa": (True, False),
+        "niabd": (False, True),
+        "vcaa-niabd": (True, True),
+    }
+    if method not in expected:
+        raise ValueError(f"run_manifest.json has unsupported method={method!r}.")
+    vcaa_expected, niabd_expected = expected[method]
+    if "vcaa_enabled" in manifest and bool(manifest["vcaa_enabled"]) != vcaa_expected:
+        raise ValueError("run_manifest.json method/vcaa_enabled mismatch.")
+    if "niabd_enabled" in manifest and bool(manifest["niabd_enabled"]) != niabd_expected:
+        raise ValueError("run_manifest.json method/niabd_enabled mismatch.")
+    if "admission_owner" in manifest:
+        owner = str(manifest["admission_owner"]).strip().lower()
+        if owner != ("vcaa" if vcaa_expected else "none"):
+            raise ValueError("run_manifest.json has invalid admission_owner.")
+    if "defense_owner" in manifest:
+        owner = str(manifest["defense_owner"]).strip().lower()
+        if owner != ("niabd" if niabd_expected else "none"):
+            raise ValueError("run_manifest.json has invalid defense_owner.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--indir", required=True)
@@ -252,6 +361,7 @@ def main() -> None:
     ).hexdigest()
     if recorded != actual:
         raise SystemExit("FAIL: run manifest hash mismatch.")
+    _validate_manifest_method_switches(manifest)
     checked = 0
     for path in sorted(root.glob("fedagg_*.csv")):
         frame = pd.read_csv(path)
@@ -269,6 +379,11 @@ def main() -> None:
             )
         else:
             _validate_auxiliary_frame(frame, path=path, kind=kind)
+        _validate_admission_switch_semantics(
+            frame,
+            path=path,
+            kind=kind,
+        )
         checked += 1
     if checked == 0:
         raise SystemExit("FAIL: no non-empty v3 result table found.")

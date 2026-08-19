@@ -11,7 +11,9 @@ from result_schema import (
 )
 from scripts.validate_v3_results import (
     _table_kind,
+    _validate_admission_switch_semantics,
     _validate_auxiliary_frame,
+    _validate_manifest_method_switches,
 )
 
 LEGACY_VCAA_ALGORITHM_VERSION = "vcaa-v3-absolute-freshness-robust-content"
@@ -146,3 +148,97 @@ def test_v5_admission_validator_checks_normalized_contribution_fields():
         path=Path("fedagg_teacher_admission_cifar10.csv"),
         kind="admission",
     )
+
+
+@pytest.mark.parametrize("strategy", ["baseline", "niabd"])
+def test_validator_requires_full_admission_when_vcaa_is_disabled(strategy):
+    good = pd.DataFrame([
+        {
+            "strategy": strategy,
+            "vcaa_enabled": 0,
+            "admission_method": "none",
+            "teachers_rejected": 0,
+            "teacher_utilization": 1.0,
+        }
+    ])
+    _validate_admission_switch_semantics(
+        good,
+        path=Path("fedagg_experiment_results_cifar10.csv"),
+        kind="round",
+    )
+
+    bad = good.copy()
+    bad.loc[0, "teachers_rejected"] = 1
+    bad.loc[0, "teacher_utilization"] = 0.5
+    with pytest.raises(ValueError, match="rejected teachers"):
+        _validate_admission_switch_semantics(
+            bad,
+            path=Path("fedagg_experiment_results_cifar10.csv"),
+            kind="round",
+        )
+
+
+@pytest.mark.parametrize("strategy", ["baseline", "niabd"])
+def test_validator_rejects_false_admitted_runtime_event_without_vcaa(strategy):
+    frame = pd.DataFrame([
+        {"strategy": strategy, "admitted": True},
+        {"strategy": strategy, "admitted": None},
+    ])
+    _validate_admission_switch_semantics(
+        frame,
+        path=Path("fedagg_runtime_events_cifar10.csv"),
+        kind="runtime",
+    )
+
+    frame.loc[0, "admitted"] = False
+    with pytest.raises(ValueError, match="rejected admission outcome"):
+        _validate_admission_switch_semantics(
+            frame,
+            path=Path("fedagg_runtime_events_cifar10.csv"),
+            kind="runtime",
+        )
+
+
+def test_validator_rejects_admission_rows_owned_by_niabd_only():
+    with pytest.raises(ValueError, match="without VCAA"):
+        _validate_admission_switch_semantics(
+            pd.DataFrame([{"strategy": "niabd", "admitted": True}]),
+            path=Path("fedagg_teacher_admission_cifar10.csv"),
+            kind="admission",
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "vcaa", "niabd", "admission_owner", "defense_owner"),
+    [
+        ("baseline", False, False, "none", "none"),
+        ("vcaa", True, False, "vcaa", "none"),
+        ("niabd", False, True, "none", "niabd"),
+        ("vcaa-niabd", True, True, "vcaa", "niabd"),
+    ],
+)
+def test_manifest_records_canonical_mechanism_ownership(
+    method,
+    vcaa,
+    niabd,
+    admission_owner,
+    defense_owner,
+):
+    _validate_manifest_method_switches({
+        "method": method,
+        "vcaa_enabled": vcaa,
+        "niabd_enabled": niabd,
+        "admission_owner": admission_owner,
+        "defense_owner": defense_owner,
+    })
+
+
+def test_manifest_rejects_niabd_claiming_admission_ownership():
+    with pytest.raises(ValueError, match="admission_owner"):
+        _validate_manifest_method_switches({
+            "method": "niabd",
+            "vcaa_enabled": False,
+            "niabd_enabled": True,
+            "admission_owner": "vcaa",
+            "defense_owner": "niabd",
+        })
