@@ -2076,6 +2076,21 @@ def run_experiment(
                                 attack_plan=attack_plan,
                             )
                         )
+                    # Owner-pinned, final-model export for independent evaluation.
+                    # Only numeric state tensors; no pickle or self-reported metrics.
+                    export_path = os.path.join(outdir, "final_student.npz")
+                    export_tmp = export_path + ".tmp"
+                    with open(export_tmp, "wb") as export_handle:
+                        np.savez(
+                            export_handle,
+                            **{
+                                name: value.detach().cpu().numpy()
+                                for name, value in server_model.state_dict().items()
+                            },
+                        )
+                        export_handle.flush()
+                        os.fsync(export_handle.fileno())
+                    os.replace(export_tmp, export_path)
                     strategy = _strategy_name(
                         enable_vcaa,
                         enable_niabd,

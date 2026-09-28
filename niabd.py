@@ -926,13 +926,14 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         )
         require_finite_tensor(purified, phase="niabd", metric="purified_logits")
 
+        insufficient_consensus = (
+            self._phase in {self.NORMAL, self.RECOVERY}
+            and int(reference_eligible.sum().item())
+            < int(self.config.minimum_consensus_teachers)
+        )
         update_mask = reference_eligible.clone()
         consensus_recovery = False
-        if (
-            int(reference_eligible.sum().item())
-            < int(self.config.minimum_consensus_teachers)
-            and self._phase != self.SUSPICIOUS
-        ):
+        if insufficient_consensus:
             recovery_candidates, recovery_reason = self._warmup_candidates(
                 reference_stacked
             )
@@ -951,14 +952,20 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             ):
                 update_mask = recovery_candidates
                 consensus_recovery = True
+            else:
+                update_mask = torch.zeros_like(reference_eligible)
         memory_updated = self._update_memory(reference_stacked, update_mask)
         if memory_updated:
             self._consecutive_frozen_rounds = 0
         else:
             self._consecutive_frozen_rounds += 1
-        threshold_mode = self._update_thresholds(
-            reference_abs_deviation,
-            reference_eligible,
+        threshold_mode = (
+            "frozen_insufficient_consensus"
+            if insufficient_consensus
+            else self._update_thresholds(
+                reference_abs_deviation,
+                reference_eligible,
+            )
         )
         reason = {
             self.NORMAL: (
