@@ -75,7 +75,7 @@ def build_models(
     device,
     *,
     server_architecture: str = "resnet18",
-    client_architecture: str = "resnet18",
+    client_architecture: str | None = None,
     client_architectures: Sequence[str] | None = None,
 ) -> tuple[List[nn.Module], nn.Module]:
     """Build one global student and one local teacher per client."""
@@ -86,7 +86,13 @@ def build_models(
     assignments = (
         [str(value) for value in client_architectures]
         if client_architectures is not None
-        else [str(client_architecture)] * int(num_clients)
+        else [
+            str(
+                client_architecture
+                if client_architecture is not None
+                else server_architecture
+            )
+        ] * int(num_clients)
     )
     if len(assignments) != int(num_clients):
         raise ValueError("client_architectures must contain one value per client.")

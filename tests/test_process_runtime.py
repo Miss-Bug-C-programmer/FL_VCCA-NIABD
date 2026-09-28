@@ -7,6 +7,7 @@ import pytest
 import torch
 import process_runtime as process_runtime_module
 
+from attacks import AttackConfig, AttackPlan
 from data_utils import (
     build_client_dataloaders_from_plan,
     build_federated_data_plan,
@@ -18,9 +19,59 @@ from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from process_runtime import (
     ProcessRuntimeConfig,
     _require_warmup_progress,
+    _apply_attack_stats_to_event,
     _resolve_process_device,
     run_fedagg_server_client_process_async,
 )
+
+
+def test_process_attack_stats_separate_current_plan_from_packet_source_round():
+    plan = AttackPlan.build(
+        seed=0,
+        num_clients=1,
+        config=AttackConfig(
+            attack_type="badnets",
+            malicious_fraction=1.0,
+            attack_start_round=2,
+            attack_end_round=3,
+        ),
+    )
+    event = {
+        "client_id": 0,
+        "source_round": 2,
+    }
+    _apply_attack_stats_to_event(
+        event,
+        attack_plan=plan,
+        plan_round=3,
+        attack_record={
+            "client_id": 0,
+            "source_round": 1,
+            "poisoned_samples": 4,
+            "eligible_poison_samples": 4,
+            "poisoned_batches": 1,
+        },
+    )
+    assert event["attack_plan_active"] is True
+    assert event["attack_source_active"] is True
+    assert event["attack_stats_missing"] == 1
+    assert event["attack_stats_missing_reason"] == "source_round_mismatch"
+    assert math.isnan(event["poisoned_samples"])
+
+    _apply_attack_stats_to_event(
+        event,
+        attack_plan=plan,
+        plan_round=3,
+        attack_record={
+            "client_id": 0,
+            "source_round": 2,
+            "poisoned_samples": 4,
+            "eligible_poison_samples": 4,
+            "poisoned_batches": 1,
+        },
+    )
+    assert event["attack_stats_missing"] == 0
+    assert event["poisoned_samples"] == 4
 from round_coordinator import SemiAsyncRoundCoordinator
 from runtime_trace import generate_runtime_trace
 from vcaa import VCAAConfig, VersionContentAwareAdmission
@@ -176,6 +227,118 @@ def _consumed(event):
         isinstance(event["version_lag"], float)
         and math.isnan(event["version_lag"])
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("method", "expect_vcaa", "expect_niabd"),
+    (
+        ("baseline", False, False),
+        ("vcaa", True, False),
+        ("niabd", False, True),
+        ("vcaa-niabd", True, True),
+    ),
+)
+def test_process_runtime_method_matrix_reaches_student_update(
+    tmp_path,
+    method,
+    expect_vcaa,
+    expect_niabd,
+):
+    """Each public method switch reaches the real process aggregation path."""
+
+    _write_femnist(tmp_path)
+    plan = build_federated_data_plan(
+        dataset_path=str(tmp_path),
+        dataset_name="femnist",
+        num_clients=1,
+        batch_size=8,
+        seed=17,
+        partition_scheme="iid",
+        label_skew_classes=2,
+        quantity_skew_alpha=0.5,
+        val_ratio=0.1,
+        proxy_ratio=0.1,
+        proxy_dataset_size=6,
+    )
+    server_loaders = build_server_dataloaders_from_plan(plan)
+    trace = generate_runtime_trace(
+        profile={
+            "name": "method-matrix",
+            "slow_client_fraction": 0.0,
+            "normal_compute_slowdown_factor": 1.0,
+            "slow_compute_slowdown_factor": 1.0,
+            "normal_upload_delay_s": 0.0,
+            "slow_upload_delay_s": 0.0,
+            "availability_probability": 1.0,
+            "upload_attempt_drop_probability": 0.0,
+            "ack_delay_probability": 0.0,
+            "ack_delay_s": 0.0,
+            "events": {},
+        },
+        seed=17,
+        num_clients=1,
+        rounds=1,
+        warmup_rounds=1,
+        participation_rate=1.0,
+    )
+    config = ProcessRuntimeConfig(
+        quorum_fraction=1.0,
+        warmup_rounds=1,
+        soft_deadline_override_s=2.0,
+        hard_deadline_override_s=10.0,
+        rpc_timeout_s=0.1,
+        registration_timeout_s=60.0,
+        shutdown_timeout_s=30.0,
+        server_device="cpu",
+        client_device="cpu",
+        strict_numeric_checks=True,
+    )
+    admission = (
+        VersionContentAwareAdmission(VCAAConfig(warmup_rounds=1))
+        if expect_vcaa
+        else None
+    )
+    defense = (
+        NeuroInspiredAdaptiveBackdoorDefense(NIABDConfig(warmup_rounds=1))
+        if expect_niabd
+        else None
+    )
+    try:
+        metrics = run_fedagg_server_client_process_async(
+            server_model=build_model(
+                "resnet18",
+                dataset_name="femnist",
+                device="cpu",
+            ),
+            server_dataloaders=server_loaders,
+            data_plan=plan,
+            trace=trace,
+            config=config,
+            local_epochs=1,
+            rounds=1,
+            learning_rate=0.01,
+            distill_temperature=2.0,
+            admission_controller=admission,
+            defense_controller=defense,
+            enable_client_distillation=True,
+        )
+    finally:
+        cleanup_dataloaders(server_loaders)
+
+    assert int(metrics["vcaa_enabled"]) == int(expect_vcaa)
+    assert int(metrics["niabd_enabled"]) == int(expect_niabd)
+    assert metrics["server_update_applied"] == [1]
+    assert metrics["teachers_admitted"] == [1]
+    assert metrics["teachers_purified"] == [1 if expect_niabd else 0]
+    if expect_vcaa:
+        assert metrics["admission_method"] == "vcaa"
+    else:
+        assert metrics["admission_method"] == "none"
+    if expect_niabd:
+        assert metrics["defense_method"] == "niabd"
+    else:
+        assert metrics["defense_method"] == "none"
 
 
 @pytest.fixture(scope="module")

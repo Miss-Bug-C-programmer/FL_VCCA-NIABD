@@ -18,6 +18,7 @@ import torch
 from attacks import (
     AttackPlan,
     BackdoorBatchPoisoner,
+    evaluate_ta,
     evaluate_backdoor_suite,
     split_defense_diagnostics,
 )
@@ -1271,6 +1272,67 @@ def _drain_attack_stats(attack_stats_queue, cache: Dict[str, Dict[str, object]])
         cache[str(record["task_id"])] = dict(record)
 
 
+def _apply_attack_stats_to_event(
+    event: Dict[str, object],
+    *,
+    attack_record: Optional[Dict[str, object]],
+    attack_plan: Optional[AttackPlan],
+    plan_round: int,
+) -> None:
+    """Attach auditable plan/source/stat identities to one consumed packet.
+
+    ``attack_plan_active`` describes the server's current-round schedule;
+    ``attack_source_active`` describes the schedule for the packet's actual
+    source round.  Poison counts are left missing when the client record has
+    not arrived or does not match the packet, rather than being converted to
+    an observed zero.
+    """
+
+    client_id = int(event["client_id"])
+    source_round = int(event["source_round"])
+    event["attack_plan_active"] = bool(
+        attack_plan is not None
+        and attack_plan.config.active(int(plan_round))
+    )
+    source_active = bool(
+        attack_plan is not None
+        and attack_plan.active_for(client_id, source_round)
+    )
+    event["attack_source_active"] = source_active
+    # Preserve the historical event field as the source-round meaning.
+    event["attack_active"] = source_active
+    event["attack_stats_source_round"] = (
+        int(attack_record["source_round"])
+        if attack_record is not None and "source_round" in attack_record
+        else _nan()
+    )
+    mismatch_reason = None
+    if attack_record is None:
+        mismatch_reason = "not_received_before_consume"
+    elif int(attack_record.get("client_id", -1)) != client_id:
+        mismatch_reason = "client_id_mismatch"
+    elif int(attack_record.get("source_round", -1)) != source_round:
+        mismatch_reason = "source_round_mismatch"
+    if mismatch_reason is not None:
+        event.update({
+            "poisoned_samples": _nan(),
+            "eligible_poison_samples": _nan(),
+            "poisoned_batches": _nan(),
+            "attack_stats_missing": 1,
+            "attack_stats_missing_reason": mismatch_reason,
+        })
+        return
+    event.update({
+        "poisoned_samples": int(attack_record["poisoned_samples"]),
+        "eligible_poison_samples": int(
+            attack_record["eligible_poison_samples"]
+        ),
+        "poisoned_batches": int(attack_record["poisoned_batches"]),
+        "attack_stats_missing": 0,
+        "attack_stats_missing_reason": "",
+    })
+
+
 def _append_metric(metrics: Dict[str, object], key: str, value) -> None:
     values = metrics.setdefault(key, [])
     if not isinstance(values, list):
@@ -1336,6 +1398,24 @@ def _initialize_metrics(
         "attack_start_round": (
             int(attack_plan.config.attack_start_round) if attack_plan is not None else -1
         ),
+        "ta": [],
+        "ta_numerator": [],
+        "ta_denominator": [],
+        "ta_valid": [],
+        "ta_nonfinite_batches": [],
+        "ta_test_dataset_identity": [],
+        "aa": [],
+        "aa_numerator": [],
+        "aa_denominator": [],
+        "aa_valid": [],
+        "aa_nonfinite_batches": [],
+        "aa_invalid_reason": [],
+        "aa_target_label": [],
+        "aa_trigger_type": [],
+        "aa_trigger_size": [],
+        "aa_trigger_value": [],
+        "aa_evaluation_round": [],
+        "aa_test_dataset_identity": [],
         "backdoor_client_records": [],
         "student_snapshot_sha256": [],
         "student_snapshot_source_round": [],
@@ -1590,24 +1670,6 @@ def run_fedagg_server_client_process_async(
                         attack_plan is not None
                         and attack_plan.is_malicious(packet.client_id)
                     ),
-                    "attack_active": bool(
-                        attack_plan is not None
-                        and attack_plan.active_for(
-                            packet.client_id, packet.source_round
-                        )
-                    ),
-                    "poisoned_samples": (
-                        int(attack_record["poisoned_samples"])
-                        if attack_record is not None else _nan()
-                    ),
-                    "eligible_poison_samples": (
-                        int(attack_record["eligible_poison_samples"])
-                        if attack_record is not None else _nan()
-                    ),
-                    "poisoned_batches": (
-                        int(attack_record["poisoned_batches"])
-                        if attack_record is not None else _nan()
-                    ),
                     "dba_trigger_part": (
                         int(attack_record["dba_trigger_part"])
                         if attack_record is not None else (
@@ -1618,8 +1680,13 @@ def run_fedagg_server_client_process_async(
                             else -1
                         )
                     ),
-                    "attack_stats_missing": int(attack_record is None),
                 })
+                _apply_attack_stats_to_event(
+                    event,
+                    attack_record=attack_record,
+                    attack_plan=attack_plan,
+                    plan_round=server_round,
+                )
                 round_events.append(event)
                 coordinator.reserve_consumed(task_id=packet.task_id)
                 if server_round <= int(config.warmup_rounds):
@@ -1772,6 +1839,21 @@ def run_fedagg_server_client_process_async(
                         "Defense did not return every admitted teacher."
                     )
                 knowledge_by_client.update(purified)
+            # Client attack statistics are sent before the packet upload, but
+            # the queue is asynchronous.  Refresh once after the decision
+            # path so a late matching record is observable in this round;
+            # unresolved records remain explicitly missing.
+            _drain_attack_stats(attack_stats_queue, attack_stats_cache)
+            for event in round_events:
+                if int(event.get("attack_stats_missing", 0)):
+                    _apply_attack_stats_to_event(
+                        event,
+                        attack_record=attack_stats_cache.get(
+                            str(event["task_id"])
+                        ),
+                        attack_plan=attack_plan,
+                        plan_round=server_round,
+                    )
             defense_time = time.monotonic() - defense_started
             defense_metrics = _defense_metrics(
                 defense_result,
@@ -1888,12 +1970,23 @@ def run_fedagg_server_client_process_async(
                 proxy_version=data_plan.proxy_version,
                 logits=server.student_proxy_logits(),
             )
-            accuracy, loss, nonfinite_eval = evaluate_with_loss(
+            legacy_accuracy, loss, nonfinite_eval = evaluate_with_loss(
                 server.model,
                 test_loader,
                 device=torch.device(config.server_device),
                 amp=bool(config.amp),
                 strict_numeric_checks=bool(config.strict_numeric_checks),
+            )
+            ta_eval = evaluate_ta(
+                server.model,
+                test_loader,
+                device=torch.device(config.server_device),
+                amp=bool(config.amp),
+                strict_numeric_checks=bool(config.strict_numeric_checks),
+            )
+            accuracy = float(ta_eval.value)
+            nonfinite_eval = max(
+                int(nonfinite_eval), int(ta_eval.nonfinite_batches)
             )
             if attack_plan is not None:
                 backdoor_eval = evaluate_backdoor_suite(
@@ -1903,6 +1996,7 @@ def run_fedagg_server_client_process_async(
                     plan=attack_plan,
                     round_number=server_round,
                     amp=bool(config.amp),
+                    strict_numeric_checks=bool(config.strict_numeric_checks),
                 )
             else:
                 backdoor_eval = {
@@ -1913,6 +2007,9 @@ def run_fedagg_server_client_process_async(
                     "basr_local_2": _nan(),
                     "basr_local_3": _nan(),
                     "basr_local_4": _nan(),
+                    "aa_valid": False,
+                    "aa_nonfinite_batches": 0,
+                    "aa_invalid_reason": "not_applicable_clean_run",
                 }
             round_time = time.monotonic() - round_started
             version_lags = [
@@ -1950,6 +2047,11 @@ def run_fedagg_server_client_process_async(
                 })
             metric_values = {
                 "acc_list": float(accuracy),
+                "ta": float(ta_eval.value),
+                "ta_numerator": int(ta_eval.numerator),
+                "ta_denominator": int(ta_eval.denominator),
+                "ta_valid": bool(ta_eval.valid),
+                "ta_nonfinite_batches": int(ta_eval.nonfinite_batches),
                 "loss_list": float(loss),
                 "local_train_time_s": float(sum(
                     event["actual_compute_time_s"]
@@ -2187,26 +2289,45 @@ def run_fedagg_server_client_process_async(
                     int(attack_plan.config.active(server_round))
                     if attack_plan is not None else 0
                 ),
-                "poisoned_samples": int(sum(
-                    int(event["poisoned_samples"])
+                "attack_plan_active": int(
+                    attack_plan.config.active(server_round)
+                    if attack_plan is not None else 0
+                ),
+                "consumed_attack_active_packets": int(sum(
+                    int(bool(event.get("attack_source_active", False)))
                     for event in round_events
-                    if not (
-                        isinstance(event["poisoned_samples"], float)
-                        and math.isnan(event["poisoned_samples"])
-                    )
                 )),
-                "eligible_poison_samples": int(sum(
-                    int(event["eligible_poison_samples"])
-                    for event in round_events
-                    if not (
-                        isinstance(event["eligible_poison_samples"], float)
-                        and math.isnan(event["eligible_poison_samples"])
+                "poisoned_samples": (
+                    float("nan")
+                    if any(
+                        int(event["attack_stats_missing"])
+                        for event in round_events
                     )
-                )),
+                    else int(sum(
+                        int(event["poisoned_samples"])
+                        for event in round_events
+                    ))
+                ),
+                "eligible_poison_samples": (
+                    float("nan")
+                    if any(
+                        int(event["attack_stats_missing"])
+                        for event in round_events
+                    )
+                    else int(sum(
+                        int(event["eligible_poison_samples"])
+                        for event in round_events
+                    ))
+                ),
                 "attack_stats_missing_count": sum(
                     int(event["attack_stats_missing"])
                     for event in round_events
                 ),
+                "attack_stats_missing_reason": ";".join(sorted({
+                    str(event["attack_stats_missing_reason"])
+                    for event in round_events
+                    if str(event.get("attack_stats_missing_reason", ""))
+                })),
                 "basr_global": float(backdoor_eval["basr_global"]),
                 "basr_global_numerator": int(
                     backdoor_eval["basr_global_numerator"]
@@ -2214,6 +2335,34 @@ def run_fedagg_server_client_process_async(
                 "basr_global_denominator": int(
                     backdoor_eval["basr_global_denominator"]
                 ),
+                "aa": float(backdoor_eval["basr_global"]),
+                "aa_numerator": int(backdoor_eval["basr_global_numerator"]),
+                "aa_denominator": int(backdoor_eval["basr_global_denominator"]),
+                "aa_valid": bool(backdoor_eval.get("aa_valid", False)),
+                "aa_nonfinite_batches": int(
+                    backdoor_eval.get("aa_nonfinite_batches", 0)
+                ),
+                "aa_invalid_reason": str(
+                    backdoor_eval.get("aa_invalid_reason", "")
+                ),
+                "aa_target_label": (
+                    int(attack_plan.config.target_label)
+                    if attack_plan is not None else -1
+                ),
+                "aa_trigger_type": (
+                    str(attack_plan.config.attack_type)
+                    if attack_plan is not None else "none"
+                ),
+                "aa_trigger_size": (
+                    int(attack_plan.config.trigger_size)
+                    if attack_plan is not None else -1
+                ),
+                "aa_trigger_value": (
+                    float(attack_plan.config.trigger_value)
+                    if attack_plan is not None else _nan()
+                ),
+                "aa_evaluation_round": int(server_round),
+                "aa_test_dataset_identity": f"{data_plan.dataset_name}:test_split",
                 "basr_local_1": float(backdoor_eval["basr_local_1"]),
                 "basr_local_2": float(backdoor_eval["basr_local_2"]),
                 "basr_local_3": float(backdoor_eval["basr_local_3"]),
@@ -2432,34 +2581,22 @@ def run_fedagg_server_client_process_async(
                 task_id = str(event["task_id"])
                 attack_record = attack_stats_cache.get(task_id)
                 client_id = int(event["client_id"])
-                source_round = int(event["source_round"])
                 event.update({
                     "is_malicious": bool(
                         attack_plan is not None
                         and attack_plan.is_malicious(client_id)
                     ),
-                    "attack_active": bool(
-                        attack_plan is not None
-                        and attack_plan.active_for(client_id, source_round)
-                    ),
-                    "poisoned_samples": (
-                        int(attack_record["poisoned_samples"])
-                        if attack_record is not None else _nan()
-                    ),
-                    "eligible_poison_samples": (
-                        int(attack_record["eligible_poison_samples"])
-                        if attack_record is not None else _nan()
-                    ),
-                    "poisoned_batches": (
-                        int(attack_record["poisoned_batches"])
-                        if attack_record is not None else _nan()
-                    ),
                     "dba_trigger_part": (
                         int(attack_record["dba_trigger_part"])
                         if attack_record is not None else -1
                     ),
-                    "attack_stats_missing": int(attack_record is None),
                 })
+                _apply_attack_stats_to_event(
+                    event,
+                    attack_record=attack_record,
+                    attack_plan=attack_plan,
+                    plan_round=int(event["receive_server_round"]),
+                )
             state = service.event_state(str(event["packet_id"]))
             event["upload_attempts"] = int(state["upload_attempts"])
             event["upload_attempt_drop_count"] = int(

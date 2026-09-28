@@ -10,7 +10,10 @@ from attacks import (
     AttackConfig,
     AttackPlan,
     BackdoorBatchPoisoner,
+    evaluate_aa,
     evaluate_basr,
+    evaluate_backdoor_suite,
+    evaluate_ta,
 )
 from attacks.trigger import (
     apply_badnets,
@@ -150,3 +153,108 @@ def test_basr_excludes_samples_already_in_target_class():
     assert result.denominator == 4
     assert result.numerator == 4
     assert result.basr == 1.0
+
+
+def test_ta_aa_exports_validity_and_clean_aa_is_not_zero():
+    images = torch.zeros(6, 3, 32, 32)
+    labels = torch.tensor([0, 0, 1, 1, 2, 2])
+    loader = DataLoader(TensorDataset(images, labels), batch_size=3)
+    plan = AttackPlan.build(
+        seed=0,
+        num_clients=2,
+        config=AttackConfig(
+            attack_type="badnets",
+            target_label=0,
+            malicious_fraction=0.5,
+            attack_start_round=1,
+        ),
+    )
+    ta = evaluate_ta(_AlwaysTarget(), loader, device="cpu")
+    aa = evaluate_aa(
+        _AlwaysTarget(),
+        loader,
+        device="cpu",
+        plan=plan,
+        round_number=1,
+    )
+    clean = evaluate_aa(
+        _AlwaysTarget(),
+        loader,
+        device="cpu",
+        plan=AttackPlan.build(
+            seed=0,
+            num_clients=2,
+            config=AttackConfig(attack_type="none"),
+        ),
+        round_number=1,
+    )
+    assert ta.valid is True
+    assert ta.numerator == 2
+    assert ta.denominator == 6
+    assert aa.valid is True
+    assert aa.numerator == 4
+    assert aa.denominator == 4
+    assert math.isnan(clean.value)
+    assert clean.denominator == 0
+    assert clean.reason == "not_applicable_clean_run"
+
+
+def test_strict_ta_aa_do_not_sanitize_nonfinite_logits():
+    class Nonfinite(nn.Module):
+        def forward(self, x):
+            return torch.full((x.shape[0], 3), float("nan"))
+
+    images = torch.zeros(2, 3, 32, 32)
+    labels = torch.tensor([1, 2])
+    loader = DataLoader(TensorDataset(images, labels), batch_size=2)
+    plan = AttackPlan.build(
+        seed=0,
+        num_clients=1,
+        config=AttackConfig(
+            attack_type="badnets",
+            target_label=0,
+            malicious_fraction=1.0,
+            attack_start_round=1,
+        ),
+    )
+    ta = evaluate_ta(
+        Nonfinite(), loader, device="cpu", strict_numeric_checks=True
+    )
+    aa = evaluate_aa(
+        Nonfinite(),
+        loader,
+        device="cpu",
+        plan=plan,
+        round_number=1,
+        strict_numeric_checks=True,
+    )
+    assert ta.valid is False and math.isnan(ta.value)
+    assert aa.valid is False and math.isnan(aa.value)
+    assert ta.reason == aa.reason == "nonfinite_logits"
+
+
+def test_dba_backdoor_suite_exports_all_local_aa_values():
+    images = torch.zeros(8, 3, 32, 32)
+    labels = torch.tensor([1, 2, 3, 4, 5, 6, 7, 1])
+    loader = DataLoader(TensorDataset(images, labels), batch_size=4)
+    plan = AttackPlan.build(
+        seed=0,
+        num_clients=4,
+        config=AttackConfig(
+            attack_type="dba",
+            target_label=0,
+            malicious_fraction=1.0,
+            attack_start_round=1,
+        ),
+    )
+    result = evaluate_backdoor_suite(
+        _AlwaysTarget(),
+        loader,
+        device="cpu",
+        plan=plan,
+        round_number=1,
+        strict_numeric_checks=True,
+    )
+    assert result["aa_valid"] is True
+    assert result["basr_global"] == 1.0
+    assert all(result[f"basr_local_{part}"] == 1.0 for part in range(1, 5))

@@ -30,6 +30,18 @@ def test_factory_builds_one_server_and_direct_client_teachers():
     assert next(clients[0].parameters()).data_ptr() != next(server.parameters()).data_ptr()
 
 
+def test_factory_defaults_clients_to_the_selected_server_architecture():
+    clients, server = build_models(
+        dataset_name="cifar10",
+        num_clients=2,
+        device="cpu",
+        server_architecture="small_cnn",
+    )
+
+    assert type(clients[0]) is type(server)
+    assert type(clients[1]) is type(server)
+
+
 def test_femnist_keeps_existing_62_class_scope():
     assert dataset_spec("femnist").num_classes == 62
     clients, server = build_models(

@@ -8,7 +8,7 @@ import os
 import random
 import subprocess
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Iterable, List
 
@@ -168,8 +168,10 @@ RUNTIME_EVENT_COLUMNS = (
     "niabd_consensus_deviation", "niabd_memory_eligible",
     "niabd_algorithm_version",
     "niabd_prototype_update_reason", "is_malicious", "attack_active",
+    "attack_plan_active", "attack_source_active", "attack_stats_source_round",
     "poisoned_samples", "eligible_poison_samples", "poisoned_batches",
-    "dba_trigger_part", "attack_stats_missing", "phase", "round_risk",
+    "dba_trigger_part", "attack_stats_missing", "attack_stats_missing_reason",
+    "phase", "round_risk",
     "risk_ema", "consensus_shift", "eligible_ratio",
     "trusted_memory_frozen", "trusted_memory_updated",
     "threshold_update_mode", "reference_trusted_weight",
@@ -194,8 +196,10 @@ BACKDOOR_COLUMNS = (
     "attack_type", "attack_plan_id", "target_label", "topology",
     "num_clients", "partition_scheme", "client_id", "task_id", "packet_id",
     "source_round", "consumed_round", "version_lag", "is_malicious",
-    "attack_active", "poisoned_samples", "eligible_poison_samples",
-    "poisoned_batches", "dba_trigger_part", "attack_stats_missing",
+    "attack_active", "attack_plan_active", "attack_source_active",
+    "attack_stats_source_round", "poisoned_samples",
+    "eligible_poison_samples", "poisoned_batches", "dba_trigger_part",
+    "attack_stats_missing", "attack_stats_missing_reason",
     "admitted", "admission_score", "niabd_anomaly_fraction",
     "niabd_mean_abs_deviation", "niabd_max_abs_deviation",
     "niabd_mean_suppression", "niabd_teacher_memory_score",
@@ -241,6 +245,89 @@ def _parse_int_list(value: str) -> List[int]:
 
 def _parse_str_list(value: str) -> List[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _resolve_attack_rounds(
+    *,
+    attack_type: str,
+    rounds: int,
+    requested_start_round: int,
+    requested_end_round: int,
+) -> tuple[int, int]:
+    """Resolve a valid attack window before constructing an attack plan.
+
+    A clean run has no attack schedule to validate, so its effective window is
+    canonicalized to the configured run.  Active attacks retain explicit
+    bounds and must fit inside the run, making invalid experiment requests
+    fail before data loading or training.
+    """
+
+    total_rounds = int(rounds)
+    if total_rounds < 1:
+        raise ValueError("rounds must be at least 1.")
+    if str(attack_type).lower() == "none":
+        return 1, total_rounds
+    start_round = int(requested_start_round)
+    end_round = (
+        total_rounds
+        if int(requested_end_round) == 0
+        else int(requested_end_round)
+    )
+    if start_round < 1:
+        raise ValueError("attack_start_round must be at least 1.")
+    if end_round < start_round:
+        raise ValueError(
+            "attack_end_round must not be below attack_start_round."
+        )
+    if end_round > total_rounds:
+        raise ValueError(
+            "Active attack window must satisfy attack_end_round <= rounds."
+        )
+    return start_round, end_round
+
+
+def _resolve_client_architectures(
+    *,
+    server_architecture: str,
+    client_architectures: List[str] | None,
+    num_clients: int,
+    runtime: str,
+    process_config: ProcessRuntimeConfig | None,
+) -> List[str]:
+    """Return the one client assignment used by model build and exports."""
+
+    if client_architectures is not None:
+        assignments = [str(value) for value in client_architectures]
+    elif (
+        str(runtime) == PROCESS_RUNTIME
+        and process_config is not None
+        and process_config.client_architectures is not None
+    ):
+        assignments = [str(value) for value in process_config.client_architectures]
+    elif str(runtime) == PROCESS_RUNTIME and process_config is not None:
+        assignments = [str(process_config.client_architecture)] * int(num_clients)
+    else:
+        assignments = [str(server_architecture)] * int(num_clients)
+    if len(assignments) != int(num_clients):
+        raise ValueError(
+            "client_architectures must contain one value per client in every run."
+        )
+    return assignments
+
+
+def _validate_method_aggregation_compatibility(
+    *,
+    enable_vcaa: bool,
+    aggregation_rule: str,
+) -> None:
+    if bool(enable_vcaa) and str(aggregation_rule).lower() not in {
+        "mean-soft-probabilities",
+        "mean-probabilities",
+    }:
+        raise ValueError(
+            "VCAA soft teacher weights require mean probability aggregation; "
+            f"aggregation_rule={aggregation_rule!r} is incompatible."
+        )
 
 
 def set_global_seed(seed: int) -> None:
@@ -375,12 +462,112 @@ def _round_rows(
             "poison_ratio": float(metrics.get("poison_ratio", 0.0)),
             "attack_start_round": int(metrics.get("attack_start_round", -1)),
             "attack_active": int(_metric(metrics, "attack_active", round_idx, 0)),
-            "poisoned_samples": int(_metric(metrics, "poisoned_samples", round_idx, 0)),
-            "eligible_poison_samples": int(
-                _metric(metrics, "eligible_poison_samples", round_idx, 0)
+            "attack_plan_active": int(
+                _metric(metrics, "attack_plan_active", round_idx,
+                        _metric(metrics, "attack_active", round_idx, 0))
+            ),
+            "consumed_attack_active_packets": int(
+                _metric(metrics, "consumed_attack_active_packets", round_idx, 0)
+            ),
+            "poisoned_samples": (
+                int(_metric(metrics, "poisoned_samples", round_idx, 0))
+                if pd.notna(_metric(metrics, "poisoned_samples", round_idx, 0))
+                else np.nan
+            ),
+            "eligible_poison_samples": (
+                int(_metric(metrics, "eligible_poison_samples", round_idx, 0))
+                if pd.notna(_metric(metrics, "eligible_poison_samples", round_idx, 0))
+                else np.nan
             ),
             "attack_stats_missing_count": int(
                 _metric(metrics, "attack_stats_missing_count", round_idx, 0)
+            ),
+            "attack_stats_missing_reason": str(
+                _metric(metrics, "attack_stats_missing_reason", round_idx, "")
+            ),
+            "ta": float(
+                _metric(
+                    metrics,
+                    "ta",
+                    round_idx,
+                    _metric(metrics, "acc_list", round_idx, np.nan),
+                )
+            ),
+            "ta_numerator": int(
+                _metric(metrics, "ta_numerator", round_idx, 0)
+            ),
+            "ta_denominator": int(
+                _metric(metrics, "ta_denominator", round_idx, 0)
+            ),
+            "ta_valid": bool(
+                _metric(
+                    metrics,
+                    "ta_valid",
+                    round_idx,
+                    pd.notna(_metric(metrics, "acc_list", round_idx, np.nan)),
+                )
+            ),
+            "ta_nonfinite_batches": int(
+                _metric(metrics, "ta_nonfinite_batches", round_idx, 0)
+            ),
+            "ta_test_dataset_identity": str(
+                _metric(metrics, "ta_test_dataset_identity", round_idx, "")
+            ),
+            "aa": float(
+                _metric(
+                    metrics,
+                    "aa",
+                    round_idx,
+                    _metric(metrics, "basr_global", round_idx, np.nan),
+                )
+            ),
+            "aa_numerator": int(
+                _metric(
+                    metrics,
+                    "aa_numerator",
+                    round_idx,
+                    _metric(metrics, "basr_global_numerator", round_idx, 0),
+                )
+            ),
+            "aa_denominator": int(
+                _metric(
+                    metrics,
+                    "aa_denominator",
+                    round_idx,
+                    _metric(metrics, "basr_global_denominator", round_idx, 0),
+                )
+            ),
+            "aa_valid": bool(
+                _metric(
+                    metrics,
+                    "aa_valid",
+                    round_idx,
+                    pd.notna(_metric(metrics, "basr_global", round_idx, np.nan)),
+                )
+            ),
+            "aa_nonfinite_batches": int(
+                _metric(metrics, "aa_nonfinite_batches", round_idx, 0)
+            ),
+            "aa_invalid_reason": str(
+                _metric(metrics, "aa_invalid_reason", round_idx, "")
+            ),
+            "aa_target_label": int(
+                _metric(metrics, "aa_target_label", round_idx,
+                        metrics.get("target_label", -1))
+            ),
+            "aa_trigger_type": str(
+                _metric(metrics, "aa_trigger_type", round_idx,
+                        metrics.get("attack_type", "none"))
+            ),
+            "aa_trigger_size": int(
+                _metric(metrics, "aa_trigger_size", round_idx, -1)
+            ),
+            "aa_trigger_value": float(
+                _metric(metrics, "aa_trigger_value", round_idx, np.nan)
+            ),
+            "aa_evaluation_round": int(
+                _metric(metrics, "aa_evaluation_round", round_idx,
+                        round_idx + 1)
             ),
             "basr_global": float(
                 _metric(metrics, "basr_global", round_idx, np.nan)
@@ -932,6 +1119,8 @@ def _summary_row(
         "attack_start_round": last.get("attack_start_round", -1),
         "rounds": len(rows),
         "final_accuracy": last["accuracy"],
+        "final_ta": last.get("ta", last["accuracy"]),
+        "best_ta": max(float(row["ta"]) for row in rows),
         "best_accuracy": max(float(row["accuracy"]) for row in rows),
         "final_loss": last["loss"],
         "wall_clock_time_s": last["wall_clock_time_s"],
@@ -1022,12 +1211,18 @@ def _summary_row(
             not pd.isna(row["max_version_lag"]) for row in rows
         ) else np.nan,
         "final_basr_global": last.get("basr_global", np.nan),
+        "final_aa": last.get("aa", last.get("basr_global", np.nan)),
         "final_basr_local_1": last.get("basr_local_1", np.nan),
         "final_basr_local_2": last.get("basr_local_2", np.nan),
         "final_basr_local_3": last.get("basr_local_3", np.nan),
         "final_basr_local_4": last.get("basr_local_4", np.nan),
-        "total_poisoned_samples": sum(
-            int(row.get("poisoned_samples", 0)) for row in rows
+        "total_poisoned_samples": (
+            sum(int(row["poisoned_samples"]) for row in rows)
+            if all(
+                pd.notna(row.get("poisoned_samples", np.nan))
+                for row in rows
+            )
+            else np.nan
         ),
         "total_attack_stats_missing": sum(
             int(row.get("attack_stats_missing_count", 0)) for row in rows
@@ -1660,6 +1855,38 @@ def run_experiment(
     checkpoint_dir: str = "",
     resume_from_checkpoint: str = "",
 ) -> None:
+    _validate_method_aggregation_compatibility(
+        enable_vcaa=bool(enable_vcaa),
+        aggregation_rule=str(aggregation_rule),
+    )
+    # Normalize the attack window at the API boundary as well as in the CLI.
+    # Programmatic callers must receive the same clean-run and active-attack
+    # validation before any output or data loading is started.
+    attack_config = attack_config or AttackConfig(attack_type="none")
+    attack_start_round, attack_end_round = _resolve_attack_rounds(
+        attack_type=attack_config.attack_type,
+        rounds=int(rounds),
+        requested_start_round=int(attack_config.attack_start_round),
+        requested_end_round=int(attack_config.attack_end_round),
+    )
+    attack_config = replace(
+        attack_config,
+        attack_start_round=attack_start_round,
+        attack_end_round=attack_end_round,
+    )
+    seeds = seeds or [0]
+    num_clients_list = num_clients_list or [6]
+    partition_schemes = partition_schemes or ["iid"]
+    client_architectures_by_num_clients = {
+        str(int(num_clients)): _resolve_client_architectures(
+            server_architecture=str(server_architecture),
+            client_architectures=client_architectures,
+            num_clients=int(num_clients),
+            runtime=str(runtime),
+            process_config=process_config,
+        )
+        for num_clients in num_clients_list
+    }
     os.makedirs(outdir, exist_ok=True)
     schema_path = os.path.join(outdir, "result_schema_v3.json")
     write_schema(schema_path)
@@ -1699,10 +1926,21 @@ def run_experiment(
         "num_clients_list": [int(value) for value in num_clients_list],
         "partition_schemes": [str(value) for value in partition_schemes],
         "private_dataset_size": int(private_dataset_size),
+        "attack_config": attack_config.to_dict(),
         "aggregation_rule": str(aggregation_rule),
         "aggregation_trim_fraction": float(aggregation_trim_fraction),
         "server_architecture": str(server_architecture),
-        "client_architectures": list(client_architectures or []),
+        "client_architectures": list(
+            client_architectures_by_num_clients[str(int(num_clients_list[0]))]
+        ),
+        "client_architecture_resolution": (
+            "explicit"
+            if client_architectures is not None
+            else "server_architecture_fallback"
+        ),
+        "client_architectures_by_num_clients": (
+            client_architectures_by_num_clients
+        ),
         "method": _strategy_name(enable_vcaa, enable_niabd),
         "vcaa_enabled": bool(enable_vcaa),
         "niabd_enabled": bool(enable_niabd),
@@ -1784,10 +2022,6 @@ def run_experiment(
     ):
         _ensure_csv_header(path, schemas[schema_name])
 
-    attack_config = attack_config or AttackConfig(attack_type="none")
-    seeds = seeds or [0]
-    num_clients_list = num_clients_list or [6]
-    partition_schemes = partition_schemes or ["iid"]
     if (
         runtime == "process-semi-async"
         and runtime_trace_out.lower().endswith(".json")
@@ -1806,6 +2040,13 @@ def run_experiment(
         for num_clients in num_clients_list:
             if int(num_clients) <= 0:
                 raise ValueError("Every client count must be positive.")
+            effective_client_architectures = _resolve_client_architectures(
+                server_architecture=str(server_architecture),
+                client_architectures=client_architectures,
+                num_clients=int(num_clients),
+                runtime=str(runtime),
+                process_config=process_config,
+            )
             for partition_scheme in partition_schemes:
                 set_global_seed(seed)
                 run_uid = (
@@ -1943,11 +2184,7 @@ def run_experiment(
                             num_clients=int(num_clients),
                             device=device,
                             server_architecture=str(server_architecture),
-                            client_architectures=(
-                                client_architectures
-                                if client_architectures is not None
-                                else None
-                            ),
+                            client_architectures=effective_client_architectures,
                         )
                     else:
                         assert process_config is not None
@@ -1955,6 +2192,18 @@ def run_experiment(
                             str(server_architecture),
                             dataset_name=dataset_name,
                             device=process_config.server_device,
+                        )
+                    run_process_config = process_config
+                    if runtime == PROCESS_RUNTIME:
+                        assert process_config is not None
+                        run_process_config = replace(
+                            process_config,
+                            client_architecture=(
+                                effective_client_architectures[0]
+                            ),
+                            client_architectures=tuple(
+                                effective_client_architectures
+                            ),
                         )
                     if enable_vcaa:
                         admission_controller = VersionContentAwareAdmission(
@@ -1966,22 +2215,6 @@ def run_experiment(
                                 niabd_config
                             )
                         )
-                    effective_client_architectures = (
-                        list(client_architectures)
-                        if client_architectures is not None
-                        else list(process_config.client_architectures)
-                        if runtime == "process-semi-async"
-                        and process_config is not None
-                        and process_config.client_architectures is not None
-                        else [
-                            str(
-                                process_config.client_architecture
-                                if runtime == "process-semi-async"
-                                and process_config is not None
-                                else server_architecture
-                            )
-                        ] * int(num_clients)
-                    )
                     checkpoint_callback = _make_checkpoint_callback(
                         checkpoint_every_rounds=int(checkpoint_every_rounds),
                         checkpoint_root=os.path.abspath(
@@ -2044,7 +2277,7 @@ def run_experiment(
                             "runtime_events": [],
                         })
                     else:
-                        assert process_config is not None
+                        assert run_process_config is not None
                         assert data_plan is not None
                         assert trace is not None
                         metrics = (
@@ -2053,7 +2286,7 @@ def run_experiment(
                                 server_dataloaders=dataloaders,
                                 data_plan=data_plan,
                                 trace=trace,
-                                config=process_config,
+                                config=run_process_config,
                                 local_epochs=int(epochs),
                                 rounds=int(rounds),
                                 learning_rate=0.01,
@@ -2076,21 +2309,6 @@ def run_experiment(
                                 attack_plan=attack_plan,
                             )
                         )
-                    # Owner-pinned, final-model export for independent evaluation.
-                    # Only numeric state tensors; no pickle or self-reported metrics.
-                    export_path = os.path.join(outdir, "final_student.npz")
-                    export_tmp = export_path + ".tmp"
-                    with open(export_tmp, "wb") as export_handle:
-                        np.savez(
-                            export_handle,
-                            **{
-                                name: value.detach().cpu().numpy()
-                                for name, value in server_model.state_dict().items()
-                            },
-                        )
-                        export_handle.flush()
-                        os.fsync(export_handle.fileno())
-                    os.replace(export_tmp, export_path)
                     strategy = _strategy_name(
                         enable_vcaa,
                         enable_niabd,
@@ -2108,22 +2326,6 @@ def run_experiment(
                             if attack_config.attack_type == "none"
                             else "attacked"
                         )
-                    )
-                    effective_client_architectures = (
-                        list(client_architectures)
-                        if client_architectures is not None
-                        else list(process_config.client_architectures)
-                        if runtime == "process-semi-async"
-                        and process_config is not None
-                        and process_config.client_architectures is not None
-                        else [
-                            str(
-                                process_config.client_architecture
-                                if runtime == "process-semi-async"
-                                and process_config is not None
-                                else server_architecture
-                            )
-                        ] * int(num_clients)
                     )
                     metrics["server_model"] = str(server_architecture)
                     metrics["client_model"] = ",".join(
@@ -2143,11 +2345,7 @@ def run_experiment(
                         if client_models is not None
                         else model_parameter_count(
                             build_model(
-                                str(
-                                    process_config.client_architecture
-                                    if process_config is not None
-                                    else server_architecture
-                                ),
+                                effective_client_architectures[0],
                                 dataset_name=dataset_name,
                                 device="cpu",
                             )
@@ -2737,17 +2935,18 @@ def main() -> None:
     trigger_size = int(args.trigger_size)
     if trigger_size <= 0:
         trigger_size = 8 if args.dataset_name == "tiny-imagenet-200" else 4
-    attack_end_round = (
-        int(args.rounds)
-        if int(args.attack_end_round) == 0
-        else int(args.attack_end_round)
+    attack_start_round, attack_end_round = _resolve_attack_rounds(
+        attack_type=str(args.attack),
+        rounds=int(args.rounds),
+        requested_start_round=int(args.attack_start_round),
+        requested_end_round=int(args.attack_end_round),
     )
     attack_config = AttackConfig(
         attack_type=args.attack,
         target_label=args.target_label,
         malicious_fraction=args.malicious_fraction,
         poison_ratio=args.poison_ratio,
-        attack_start_round=args.attack_start_round,
+        attack_start_round=attack_start_round,
         attack_end_round=attack_end_round,
         poison_interval=args.poison_interval,
         trigger_size=trigger_size,

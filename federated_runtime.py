@@ -13,6 +13,7 @@ import torch.nn as nn
 from attacks import (
     AttackPlan,
     BackdoorBatchPoisoner,
+    evaluate_ta,
     evaluate_backdoor_suite,
     split_defense_diagnostics,
 )
@@ -831,6 +832,24 @@ def run_fedagg_server_client(
         "attack_active": [],
         "poisoned_samples": [],
         "eligible_poison_samples": [],
+        "ta": [],
+        "ta_numerator": [],
+        "ta_denominator": [],
+        "ta_valid": [],
+        "ta_nonfinite_batches": [],
+        "ta_test_dataset_identity": [],
+        "aa": [],
+        "aa_numerator": [],
+        "aa_denominator": [],
+        "aa_valid": [],
+        "aa_nonfinite_batches": [],
+        "aa_invalid_reason": [],
+        "aa_target_label": [],
+        "aa_trigger_type": [],
+        "aa_trigger_size": [],
+        "aa_trigger_value": [],
+        "aa_evaluation_round": [],
+        "aa_test_dataset_identity": [],
         "basr_global": [],
         "basr_global_numerator": [],
         "basr_global_denominator": [],
@@ -1097,13 +1116,24 @@ def run_fedagg_server_client(
             if round_defense_state is not None:
                 defense_controller.restore_state(round_defense_state)
 
-        accuracy, loss, nonfinite_eval = evaluate_with_loss(
+        legacy_accuracy, loss, nonfinite_eval = evaluate_with_loss(
             server.model,
             test_loader,
                 device=device_obj,
                 amp=bool(amp),
                 strict_numeric_checks=bool(strict_numeric_checks),
             )
+        ta_eval = evaluate_ta(
+            server.model,
+            test_loader,
+            device=device_obj,
+            amp=bool(amp),
+            strict_numeric_checks=bool(strict_numeric_checks),
+        )
+        accuracy = float(ta_eval.value)
+        nonfinite_eval = max(
+            int(nonfinite_eval), int(ta_eval.nonfinite_batches)
+        )
         if attack_plan is not None:
             backdoor_eval = evaluate_backdoor_suite(
                 server.model,
@@ -1112,6 +1142,7 @@ def run_fedagg_server_client(
                 plan=attack_plan,
                 round_number=round_number,
                 amp=bool(amp),
+                strict_numeric_checks=bool(strict_numeric_checks),
             )
         else:
             backdoor_eval = {
@@ -1122,6 +1153,9 @@ def run_fedagg_server_client(
                 "basr_local_2": float("nan"),
                 "basr_local_3": float("nan"),
                 "basr_local_4": float("nan"),
+                "aa_valid": False,
+                "aa_nonfinite_batches": 0,
+                "aa_invalid_reason": "not_applicable_clean_run",
             }
         if enable_backdoor_diagnostics:
             if attack_plan is None:
@@ -1146,6 +1180,13 @@ def run_fedagg_server_client(
         wall_clock += round_time
 
         metrics["acc_list"].append(float(accuracy))
+        metrics["ta"].append(float(ta_eval.value))
+        metrics["ta_numerator"].append(int(ta_eval.numerator))
+        metrics["ta_denominator"].append(int(ta_eval.denominator))
+        metrics["ta_valid"].append(bool(ta_eval.valid))
+        metrics["ta_nonfinite_batches"].append(
+            int(ta_eval.nonfinite_batches)
+        )
         metrics["loss_list"].append(float(loss))
         metrics["local_train_time_s"].append(float(local_time))
         metrics["upload_time_s"].append(float(upload_time))
@@ -1411,6 +1452,36 @@ def run_fedagg_server_client(
         )
         metrics["basr_global_denominator"].append(
             int(backdoor_eval["basr_global_denominator"])
+        )
+        metrics["aa"].append(float(backdoor_eval["basr_global"]))
+        metrics["aa_numerator"].append(
+            int(backdoor_eval["basr_global_numerator"])
+        )
+        metrics["aa_denominator"].append(
+            int(backdoor_eval["basr_global_denominator"])
+        )
+        metrics["aa_valid"].append(bool(backdoor_eval.get("aa_valid", False)))
+        metrics["aa_nonfinite_batches"].append(
+            int(backdoor_eval.get("aa_nonfinite_batches", 0))
+        )
+        metrics["aa_invalid_reason"].append(
+            str(backdoor_eval.get("aa_invalid_reason", ""))
+        )
+        metrics["aa_target_label"].append(
+            int(attack_plan.config.target_label) if attack_plan is not None else -1
+        )
+        metrics["aa_trigger_type"].append(
+            str(attack_plan.config.attack_type) if attack_plan is not None else "none"
+        )
+        metrics["aa_trigger_size"].append(
+            int(attack_plan.config.trigger_size) if attack_plan is not None else -1
+        )
+        metrics["aa_trigger_value"].append(
+            float(attack_plan.config.trigger_value) if attack_plan is not None else float("nan")
+        )
+        metrics["aa_evaluation_round"].append(int(round_number))
+        metrics["aa_test_dataset_identity"].append(
+            "test_split"
         )
         for key, value in defense_split.items():
             metrics[key].append(float(value))

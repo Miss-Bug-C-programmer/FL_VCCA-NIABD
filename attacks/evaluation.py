@@ -22,6 +22,18 @@ class BASRResult:
     denominator: int
 
 
+@dataclass(frozen=True)
+class AccuracyResult:
+    """Finite-evaluation result with an explicit validity state."""
+
+    value: float
+    numerator: int
+    denominator: int
+    valid: bool
+    nonfinite_batches: int = 0
+    reason: str = ""
+
+
 def _forward_logits(model, images: torch.Tensor) -> torch.Tensor:
     output = model(images)
     if isinstance(output, (tuple, list)):
@@ -83,18 +95,128 @@ def evaluate_basr(
 ) -> BASRResult:
     """Evaluate backdoor ASR, excluding samples already in the target class."""
 
-    if plan.config.attack_type == "none":
-        return BASRResult(float("nan"), 0, 0)
+    result = evaluate_aa(
+        model,
+        dataloader,
+        device=device,
+        plan=plan,
+        round_number=int(round_number),
+        dba_part=dba_part,
+        amp=bool(amp),
+        strict_numeric_checks=False,
+    )
+    return BASRResult(result.value, result.numerator, result.denominator)
+
+
+def _evaluation_logits(
+    model,
+    images: torch.Tensor,
+    *,
+    device_obj: torch.device,
+    amp_enabled: bool,
+    strict_numeric_checks: bool,
+) -> tuple[torch.Tensor | None, bool]:
+    if amp_enabled:
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            logits = model(images)
+    else:
+        logits = model(images)
+    if isinstance(logits, (tuple, list)):
+        logits = logits[0]
+    finite = bool(torch.isfinite(logits).all().item())
+    if not finite and strict_numeric_checks:
+        return None, False
+    if not finite:
+        logits = torch.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=30.0,
+            neginf=-30.0,
+        ).clamp(-30.0, 30.0)
+    return logits, finite
+
+
+@torch.no_grad()
+def evaluate_ta(
+    model,
+    dataloader,
+    *,
+    device,
+    amp: bool = False,
+    strict_numeric_checks: bool = False,
+) -> AccuracyResult:
+    """Evaluate clean test accuracy without hiding non-finite logits."""
+
     model.eval()
     device_obj = torch.device(device)
     amp_enabled = bool(amp) and device_obj.type == "cuda"
     numerator = 0
     denominator = 0
+    nonfinite_batches = 0
     for batch in dataloader:
         if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-            raise ValueError("BASR evaluation requires labeled test batches.")
+            raise ValueError("TA evaluation requires labeled test batches.")
         images, labels = batch[0], batch[1]
-        keep = labels.long() != int(plan.config.target_label)
+        images = images.to(device_obj, non_blocking=True)
+        labels = labels.to(device_obj, non_blocking=True).long()
+        logits, finite = _evaluation_logits(
+            model,
+            images,
+            device_obj=device_obj,
+            amp_enabled=amp_enabled,
+            strict_numeric_checks=bool(strict_numeric_checks),
+        )
+        if not finite:
+            nonfinite_batches += 1
+        if logits is None:
+            continue
+        numerator += int((logits.argmax(dim=1) == labels).sum().item())
+        denominator += int(labels.numel())
+    valid = denominator > 0 and nonfinite_batches == 0
+    return AccuracyResult(
+        value=(float(numerator) / float(denominator) if denominator else float("nan")),
+        numerator=int(numerator),
+        denominator=int(denominator),
+        valid=bool(valid),
+        nonfinite_batches=int(nonfinite_batches),
+        reason=("nonfinite_logits" if nonfinite_batches else ""),
+    )
+
+
+@torch.no_grad()
+def evaluate_aa(
+    model,
+    dataloader,
+    *,
+    device,
+    plan: AttackPlan,
+    round_number: int,
+    dba_part: int | None = None,
+    amp: bool = False,
+    strict_numeric_checks: bool = False,
+) -> AccuracyResult:
+    """Evaluate trigger AA on non-target test labels only."""
+
+    if plan.config.attack_type == "none":
+        return AccuracyResult(
+            value=float("nan"),
+            numerator=0,
+            denominator=0,
+            valid=False,
+            reason="not_applicable_clean_run",
+        )
+    model.eval()
+    device_obj = torch.device(device)
+    amp_enabled = bool(amp) and device_obj.type == "cuda"
+    numerator = 0
+    denominator = 0
+    nonfinite_batches = 0
+    for batch in dataloader:
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise ValueError("AA evaluation requires labeled test batches.")
+        images, labels = batch[0], batch[1]
+        labels = labels.long()
+        keep = labels != int(plan.config.target_label)
         if not bool(keep.any().item()):
             continue
         images = images[keep].to(device_obj, non_blocking=True)
@@ -104,20 +226,29 @@ def evaluate_basr(
             round_number=int(round_number),
             dba_part=dba_part,
         )
-        if amp_enabled:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits = _forward_logits(model, images)
-        else:
-            logits = _forward_logits(model, images)
-        prediction = logits.argmax(dim=1).detach().cpu()
+        logits, finite = _evaluation_logits(
+            model,
+            images,
+            device_obj=device_obj,
+            amp_enabled=amp_enabled,
+            strict_numeric_checks=bool(strict_numeric_checks),
+        )
+        if not finite:
+            nonfinite_batches += 1
+        if logits is None:
+            continue
         numerator += int(
-            (prediction == int(plan.config.target_label)).sum().item()
+            (logits.argmax(dim=1) == int(plan.config.target_label)).sum().item()
         )
         denominator += int(keep.sum().item())
-    return BASRResult(
-        float(numerator) / float(max(denominator, 1)),
-        int(numerator),
-        int(denominator),
+    valid = denominator > 0 and nonfinite_batches == 0
+    return AccuracyResult(
+        value=(float(numerator) / float(denominator) if denominator else float("nan")),
+        numerator=int(numerator),
+        denominator=int(denominator),
+        valid=bool(valid),
+        nonfinite_batches=int(nonfinite_batches),
+        reason=("nonfinite_logits" if nonfinite_batches else ""),
     )
 
 
@@ -129,6 +260,7 @@ def evaluate_backdoor_suite(
     plan: AttackPlan,
     round_number: int,
     amp: bool = False,
+    strict_numeric_checks: bool = False,
 ) -> dict[str, float | int]:
     """Evaluate the global trigger plus all DBA local triggers when relevant."""
 
@@ -140,10 +272,13 @@ def evaluate_backdoor_suite(
         "basr_local_2": float("nan"),
         "basr_local_3": float("nan"),
         "basr_local_4": float("nan"),
+        "aa_valid": False,
+        "aa_nonfinite_batches": 0,
+        "aa_invalid_reason": "",
     }
     if plan.config.attack_type == "none":
         return result
-    global_result = evaluate_basr(
+    global_result = evaluate_aa(
         model,
         dataloader,
         device=device,
@@ -151,15 +286,19 @@ def evaluate_backdoor_suite(
         round_number=int(round_number),
         dba_part=None,
         amp=bool(amp),
+        strict_numeric_checks=bool(strict_numeric_checks),
     )
     result.update({
-        "basr_global": float(global_result.basr),
+        "basr_global": float(global_result.value),
         "basr_global_numerator": int(global_result.numerator),
         "basr_global_denominator": int(global_result.denominator),
+        "aa_valid": bool(global_result.valid),
+        "aa_nonfinite_batches": int(global_result.nonfinite_batches),
+        "aa_invalid_reason": str(global_result.reason),
     })
     if plan.config.attack_type == "dba":
         for part in range(4):
-            local = evaluate_basr(
+            local = evaluate_aa(
                 model,
                 dataloader,
                 device=device,
@@ -167,8 +306,9 @@ def evaluate_backdoor_suite(
                 round_number=int(round_number),
                 dba_part=part,
                 amp=bool(amp),
+                strict_numeric_checks=bool(strict_numeric_checks),
             )
-            result[f"basr_local_{part + 1}"] = float(local.basr)
+            result[f"basr_local_{part + 1}"] = float(local.value)
     return result
 
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from experiment_runner import (
     PROCESS_ONLY_ROUND_FIELDS,
@@ -9,9 +10,44 @@ from experiment_runner import (
     _defense_rows,
     _round_rows,
     _runtime_event_rows,
+    _resolve_attack_rounds,
+    _validate_method_aggregation_compatibility,
     _standard_csv_columns,
     _summary_row,
 )
+
+
+def test_clean_attack_window_is_valid_for_one_round_with_default_bounds():
+    assert _resolve_attack_rounds(
+        attack_type="none",
+        rounds=1,
+        requested_start_round=15,
+        requested_end_round=0,
+    ) == (1, 1)
+
+
+def test_vcaa_rejects_aggregators_without_soft_weight_support_before_training():
+    with pytest.raises(ValueError, match="VCAA.*weights.*mean probability"):
+        _validate_method_aggregation_compatibility(
+            enable_vcaa=True,
+            aggregation_rule="median-probabilities",
+        )
+
+
+@pytest.mark.parametrize(
+    ("start_round", "end_round"),
+    [(3, 2), (3, 7)],
+)
+def test_active_attack_window_rejects_invalid_bounds_before_training(
+    start_round, end_round
+):
+    with pytest.raises(ValueError, match="attack|window"):
+        _resolve_attack_rounds(
+            attack_type="badnets",
+            rounds=6,
+            requested_start_round=start_round,
+            requested_end_round=end_round,
+        )
 
 
 def _metrics():

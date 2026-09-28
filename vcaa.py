@@ -823,7 +823,13 @@ class VersionContentAwareAdmission:
         history_scores = [
             float(record.components["content_score"])
             for record in records
-            if record.hard_valid and record.content_valid
+            # History calibrates the next round from the hard-valid cohort,
+            # rather than from only the teachers that survived this round's
+            # content gate.  Otherwise an adversarially low but otherwise
+            # well-formed teacher disappears from calibration and the
+            # historical threshold is biased toward the survivors.
+            if record.hard_valid
+            and math.isfinite(float(record.components["content_score"]))
         ]
         if history_scores:
             self._history.append((int(current_round), tuple(history_scores)))

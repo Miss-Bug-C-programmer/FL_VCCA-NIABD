@@ -128,6 +128,25 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("aggregation_algorithm_version", "string", False, ("*",), ("*",), AGGREGATION_ALGORITHM_VERSION, "Probability-space aggregation lineage."),
     MetricSchemaEntry("run_class", "string", False, ("*",), ("*",), "", "formal, smoke, synthetic, or control."),
     MetricSchemaEntry("attack_condition", "string", False, ("*",), ("*",), "none", "clean, attacked, or triggered-no-poison."),
+    MetricSchemaEntry("ta", "number", True, ("*",), ("*",), None, "Clean test accuracy (TA)."),
+    MetricSchemaEntry("ta_numerator", "integer", False, ("*",), ("*",), 0, "Correct clean test predictions."),
+    MetricSchemaEntry("ta_denominator", "integer", False, ("*",), ("*",), 0, "Valid clean test labels evaluated."),
+    MetricSchemaEntry("ta_valid", "boolean", False, ("*",), ("*",), False, "Whether TA has a complete finite evaluation."),
+    MetricSchemaEntry("ta_nonfinite_batches", "integer", False, ("*",), ("*",), 0, "Clean evaluation batches with non-finite logits."),
+    MetricSchemaEntry("ta_test_dataset_identity", "string", True, ("*",), ("*",), None, "Identity of the clean test split."),
+    MetricSchemaEntry("aa", "number", True, ("*",), ("*",), None, "Triggered attack accuracy (AA); not applicable for clean runs."),
+    MetricSchemaEntry("aa_numerator", "integer", False, ("*",), ("*",), 0, "Triggered predictions equal to the target label."),
+    MetricSchemaEntry("aa_denominator", "integer", False, ("*",), ("*",), 0, "Non-target test samples used for AA."),
+    MetricSchemaEntry("aa_valid", "boolean", False, ("*",), ("*",), False, "Whether AA has a complete finite evaluation."),
+    MetricSchemaEntry("aa_nonfinite_batches", "integer", False, ("*",), ("*",), 0, "Triggered evaluation batches with non-finite logits."),
+    MetricSchemaEntry("aa_invalid_reason", "string", True, ("*",), ("*",), None, "Reason AA is invalid or not applicable."),
+    MetricSchemaEntry("aa_target_label", "integer", True, ("*",), ("*",), None, "AA target class."),
+    MetricSchemaEntry("aa_trigger_type", "string", True, ("*",), ("*",), None, "AA trigger construction."),
+    MetricSchemaEntry("aa_trigger_size", "integer", True, ("*",), ("*",), None, "AA trigger size when applicable."),
+    MetricSchemaEntry("aa_trigger_value", "number", True, ("*",), ("*",), None, "AA trigger value when applicable."),
+    MetricSchemaEntry("aa_evaluation_round", "integer", True, ("*",), ("*",), None, "Round at which AA was evaluated."),
+    MetricSchemaEntry("final_ta", "number", True, ("*",), ("*",), None, "Final TA summary alias."),
+    MetricSchemaEntry("final_aa", "number", True, ("*",), ("*",), None, "Final AA summary alias."),
     MetricSchemaEntry("transaction_id", "string", False, ("*",), ("*",), "", "Round transaction identity."),
     MetricSchemaEntry("transaction_status", "string", False, ("*",), ("*",), "committed", "prepare/commit/abort status."),
     MetricSchemaEntry("student_snapshot_sha256", "string", True, ("*",), ("*",), None, "Pre-update student proxy logits identity."),
@@ -189,6 +208,25 @@ OPTIONAL_BACKWARD_COMPAT_COLUMNS = frozenset({
     "optimizer_step_skipped_count",
     "local_optimizer_step_count",
     "distillation_optimizer_step_count",
+    "ta",
+    "ta_numerator",
+    "ta_denominator",
+    "ta_valid",
+    "ta_nonfinite_batches",
+    "ta_test_dataset_identity",
+    "aa",
+    "aa_numerator",
+    "aa_denominator",
+    "aa_valid",
+    "aa_nonfinite_batches",
+    "aa_invalid_reason",
+    "aa_target_label",
+    "aa_trigger_type",
+    "aa_trigger_size",
+    "aa_trigger_value",
+    "aa_evaluation_round",
+    "final_ta",
+    "final_aa",
 })
 
 
@@ -237,6 +275,28 @@ def validate_frame(
         raise ValueError("result schema rejects an empty result frame.")
     if frame["run_uid"].isna().any() or (frame["run_uid"].astype(str).str.strip() == "").any():
         raise ValueError("run_uid must be non-empty for every result row.")
+    if "ta" in frame.columns and "accuracy" in frame.columns:
+        left = pd.to_numeric(frame["ta"], errors="coerce")
+        right = pd.to_numeric(frame["accuracy"], errors="coerce")
+        comparable = left.notna() & right.notna()
+        if comparable.any() and not left[comparable].equals(right[comparable]):
+            if not (left[comparable] - right[comparable]).abs().le(1e-8).all():
+                raise ValueError("TA and accuracy aliases diverge.")
+    if "aa" in frame.columns and "basr_global" in frame.columns:
+        left = pd.to_numeric(frame["aa"], errors="coerce")
+        right = pd.to_numeric(frame["basr_global"], errors="coerce")
+        comparable = left.notna() & right.notna()
+        if comparable.any() and not (left[comparable] - right[comparable]).abs().le(1e-8).all():
+            raise ValueError("AA and basr_global aliases diverge.")
+    for numerator, denominator in (
+        ("ta_numerator", "ta_denominator"),
+        ("aa_numerator", "aa_denominator"),
+    ):
+        if numerator in frame.columns and denominator in frame.columns:
+            num = pd.to_numeric(frame[numerator], errors="coerce")
+            den = pd.to_numeric(frame[denominator], errors="coerce")
+            if (num < 0).any() or (den < 0).any() or (num > den).any():
+                raise ValueError(f"{numerator} must lie in [0, {denominator}].")
     for column in ("result_schema_version", "vcaa_algorithm_version", "niabd_algorithm_version", "aggregation_algorithm_version"):
         if column not in frame.columns:
             raise ValueError(f"missing algorithm lineage column: {column}")

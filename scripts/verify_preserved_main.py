@@ -25,13 +25,28 @@ _AUTH_V3_EXTRA_KEYS = {
 _FORMAL_CONFIG_SHA256 = (
     "7458562ac63faba21497799ea74e98cc7e0a0e21801320386b37704a40e204d9"
 )
+_TEXT_SUFFIXES = {
+    ".cfg",
+    ".ini",
+    ".json",
+    ".md",
+    ".py",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
 
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
+    data = path.read_bytes()
+    # The repository is checked out with platform line endings on Windows,
+    # while the preservation manifests record the Git-text representation.
+    # Keep binary files byte-sensitive and canonicalize only known text files.
+    if path.suffix.lower() in _TEXT_SUFFIXES:
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    digest.update(data)
     return digest.hexdigest()
 
 

@@ -27,6 +27,8 @@ GROUP_COLUMNS = [
 ]
 
 METRIC_COLUMNS = [
+    "final_ta",
+    "final_aa",
     "final_accuracy",
     "best_accuracy",
     "final_loss",
@@ -61,6 +63,12 @@ def summarize(indir: str) -> pd.DataFrame:
             f"No fedagg_run_summary_*.csv files found in {indir!r}."
         )
     frame = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
+    # Historical summaries predate the TA/AA names; aliases are populated
+    # only when the new columns are absent, never by changing their meaning.
+    if "final_ta" not in frame.columns and "final_accuracy" in frame.columns:
+        frame["final_ta"] = frame["final_accuracy"]
+    if "final_aa" not in frame.columns:
+        frame["final_aa"] = frame.get("final_basr_global", float("nan"))
     missing = [
         column
         for column in [*GROUP_COLUMNS, *METRIC_COLUMNS]
