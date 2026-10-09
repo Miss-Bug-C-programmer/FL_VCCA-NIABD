@@ -3,7 +3,7 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=0
 export CODE_DIR="$(pwd)"
-export DATASET_ROOT="$(pwd)/datasets"
+export DATASET_ROOT="$(pwd)/dataset"
 export OUT_ROOT="$(pwd)/results_seed2_arch_badnets_20261009"
 
 mkdir -p "${OUT_ROOT}"
