@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import re
+import sys
 from typing import Iterable
 
 import pandas as pd
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from result_schema import mask_invalid_accuracy_frame
 
 
 TABLE_NAMES = (
@@ -106,7 +109,7 @@ def merge(roots: list[str], outdir: str, *, precedence: str = "error") -> dict[s
         assert kind is not None
         columns: list[str] = []
         for path in paths:
-            frame = pd.read_csv(path)
+            frame = mask_invalid_accuracy_frame(pd.read_csv(path))
             frames.append(frame)
             key_frame = frame.copy()
             for identity_column in ("dataset", "attack_type", "strategy", "seed"):

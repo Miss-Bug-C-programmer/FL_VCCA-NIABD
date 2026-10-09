@@ -41,6 +41,8 @@ class ClientTask:
     upload_delay_s: float
     dropped_attempts: Tuple[int, ...]
     server_logits_packet: Optional[ServerLogitsPacket]
+    client_kd_weight: float = 0.0
+    joint_client_distillation: bool = False
 
     def rpc_metadata(self) -> Dict[str, object]:
         return {
@@ -55,6 +57,8 @@ class ClientTask:
             "distillation_temperature": float(
                 self.distillation_temperature
             ),
+            "client_kd_weight": float(self.client_kd_weight),
+            "joint_client_distillation": bool(self.joint_client_distillation),
             "enable_client_distillation": bool(
                 self.enable_client_distillation
             ),
@@ -250,6 +254,7 @@ class SemiAsyncRoundCoordinator:
         *,
         server_round: int,
         latest_server_packet: Optional[ServerLogitsPacket],
+        client_kd_weight: Optional[float] = None,
     ) -> DispatchSummary:
         selected: List[int] = []
         dispatched: List[int] = []
@@ -278,11 +283,12 @@ class SemiAsyncRoundCoordinator:
                     raise RuntimeError(
                         f"Client {client_id} already has a pending task."
                     )
+                use_reverse = (self.enable_client_distillation and latest_server_packet is not None
+                               and (client_kd_weight is None or client_kd_weight > 0))
                 base_round = (
                     int(latest_server_packet.model_round)
                     if (
-                        self.enable_client_distillation
-                        and latest_server_packet is not None
+                        use_reverse
                     )
                     else int(server_round)
                 )
@@ -305,9 +311,9 @@ class SemiAsyncRoundCoordinator:
                     distillation_temperature=(
                         self.distillation_temperature
                     ),
-                    enable_client_distillation=(
-                        self.enable_client_distillation
-                    ),
+                    enable_client_distillation=bool(use_reverse),
+                    client_kd_weight=float(client_kd_weight or 0.0) if use_reverse else 0.0,
+                    joint_client_distillation=client_kd_weight is not None,
                     compute_slowdown_factor=float(
                         event.compute_slowdown_factor
                     ),
@@ -315,7 +321,7 @@ class SemiAsyncRoundCoordinator:
                     dropped_attempts=tuple(event.dropped_attempts),
                     server_logits_packet=(
                         latest_server_packet
-                        if self.enable_client_distillation
+                        if use_reverse
                         else None
                     ),
                 )

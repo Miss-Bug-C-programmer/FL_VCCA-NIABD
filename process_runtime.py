@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from checkpointing import capture_rng_state, restore_rng_state
+from trainer import TrainingPolicy, ProxyKDBatches, scaler_state_dict, restore_scaler_state
+
 import copy
 from dataclasses import dataclass
 import math
@@ -407,8 +411,15 @@ class _ProcessRpcService:
             return tuple(self._transport_errors)
 
 
-def _restore_client_model(model, snapshot: Dict[str, object], device) -> None:
-    model.load_state_dict(snapshot, strict=True)
+def _restore_client_model(model, state, device, optimizer=None, local_scaler=None, distillation_scaler=None):
+    if "model" in state and "optimizer" in state:
+        model.load_state_dict(state["model"], strict=True)
+        optimizer.load_state_dict(state["optimizer"])
+        restore_scaler_state(local_scaler, state["local_scaler"])
+        restore_scaler_state(distillation_scaler, state["distillation_scaler"])
+        restore_rng_state(state["rng"])
+        return int(state["local_model_version"])
+    model.load_state_dict(state, strict=True)
     model.to(device)
 
 
@@ -539,25 +550,25 @@ def _client_process_main(
 ) -> None:
     """Persistent spawned Client owning model, private data and retries."""
 
-    torch.set_num_threads(int(config.client_torch_threads))
-    torch.manual_seed(int(seed) + 10000 + int(client_id))
-    device = _resolve_process_device(config.client_device)
-    if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "client_device requests CUDA but CUDA is unavailable."
-            )
-        device_count = int(torch.cuda.device_count())
-        assert device.index is not None
-        if not 0 <= int(device.index) < device_count:
-            raise RuntimeError(
-                f"client_device={device} is outside the visible CUDA "
-                f"device range [0, {device_count})."
-            )
-        torch.cuda.set_device(int(device.index))
     dataloaders = None
     active_task_id = ""
     try:
+        torch.set_num_threads(int(config.client_torch_threads))
+        torch.manual_seed(int(seed) + 10000 + int(client_id))
+        device = _resolve_process_device(config.client_device)
+        if device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "client_device requests CUDA but CUDA is unavailable."
+                )
+            device_count = int(torch.cuda.device_count())
+            assert device.index is not None
+            if not 0 <= int(device.index) < device_count:
+                raise RuntimeError(
+                    f"client_device={device} is outside the visible CUDA "
+                    f"device range [0, {device_count})."
+                )
+            torch.cuda.set_device(int(device.index))
         private_loader, proxy_input_loader = (
             build_client_dataloaders_from_plan(
                 data_plan,
@@ -630,7 +641,8 @@ def _client_process_main(
                     raise RuntimeError(
                         f"Missing client checkpoint for rollback task {rollback_task_id}."
                     )
-                _restore_client_model(model, rollback_snapshot, device)
+                local_model_version = _restore_client_model(model, rollback_snapshot, device,
+                    optimizer, local_scaler, distillation_scaler)
                 _send_rollback_ack(
                     host,
                     port,
@@ -650,12 +662,12 @@ def _client_process_main(
                 )
             task, server_packet = _client_task_from_response(response)
             active_task_id = str(task["task_id"])
-            snapshot = {
-                key: value.detach().cpu().clone()
-                if isinstance(value, torch.Tensor)
-                else copy.deepcopy(value)
-                for key, value in model.state_dict().items()
-            }
+            snapshot = {"model": {key: value.detach().cpu().clone() if isinstance(value, torch.Tensor)
+                                      else copy.deepcopy(value) for key, value in model.state_dict().items()},
+                        "optimizer": copy.deepcopy(optimizer.state_dict()),
+                        "local_scaler": copy.deepcopy(scaler_state_dict(local_scaler)),
+                        "distillation_scaler": copy.deepcopy(scaler_state_dict(distillation_scaler)),
+                        "local_model_version": local_model_version, "rng": capture_rng_state()}
             task_snapshots[active_task_id] = snapshot
             source_round = int(task["source_round"])
             numeric_context = {
@@ -667,6 +679,8 @@ def _client_process_main(
             local_numeric_stats: Dict[str, object] = {}
             distillation_numeric_stats: Dict[str, object] = {}
             compute_started_at_s = time.monotonic()
+            proxy_kd_batches = None
+            joint_kd = bool(task.get("joint_client_distillation", False))
             try:
                 if bool(task["enable_client_distillation"]):
                     if server_packet is None:
@@ -679,27 +693,32 @@ def _client_process_main(
                         raise ValueError(
                             "Server logits proxy_version mismatch."
                         )
-                    distill_with_logits(
-                        model,
-                        proxy_input_loader,
-                        server_packet.decode_logits(),
-                        device=device,
-                        lr=max(float(task["learning_rate"]) * 0.2, 1e-4),
-                        epochs=1,
-                        temperature=float(
-                            task["distillation_temperature"]
-                        ),
-                        amp=bool(config.amp),
-                        strict_numeric_checks=bool(
-                            config.strict_numeric_checks
-                        ),
-                        numeric_stats=distillation_numeric_stats,
-                        numeric_context=numeric_context,
-                        scaler=distillation_scaler,
-                        max_consecutive_amp_overflows=int(
-                            config.max_consecutive_amp_overflows
-                        ),
-                    )
+                    if joint_kd:
+                        if float(task.get("client_kd_weight", 0)) <= 0:
+                            raise ValueError("Joint KD task requires a positive frozen weight")
+                        proxy_kd_batches = ProxyKDBatches(proxy_input_loader, server_packet.decode_logits())
+                    else:
+                        distill_with_logits(
+                            model,
+                            proxy_input_loader,
+                            server_packet.decode_logits(),
+                            device=device,
+                            lr=max(float(task["learning_rate"]) * 0.2, 1e-4),
+                            epochs=1,
+                            temperature=float(
+                                task["distillation_temperature"]
+                            ),
+                            amp=bool(config.amp),
+                            strict_numeric_checks=bool(
+                                config.strict_numeric_checks
+                            ),
+                            numeric_stats=distillation_numeric_stats,
+                            numeric_context=numeric_context,
+                            scaler=distillation_scaler,
+                            max_consecutive_amp_overflows=int(
+                                config.max_consecutive_amp_overflows
+                            ),
+                        )
                 if poisoner is not None:
                     poisoner.start_round(source_round)
                 local_train(
@@ -716,6 +735,9 @@ def _client_process_main(
                     optimizer=optimizer,
                     batch_transform=poisoner,
                     round_number=source_round,
+                    proxy_kd_batches=proxy_kd_batches,
+                    client_kd_weight=float(task.get("client_kd_weight", 0.0)) if joint_kd else 0.0,
+                    distill_temperature=float(task["distillation_temperature"]),
                     numeric_context=numeric_context,
                     scaler=local_scaler,
                     max_consecutive_amp_overflows=int(
@@ -757,7 +779,7 @@ def _client_process_main(
                     raise RuntimeError(
                         "Client model became non-finite after local update."
                 )
-                local_model_version += 1
+                local_model_version += int(local_numeric_stats.get("optimizer_step_count", 0) > 0)
                 inference_started = time.monotonic()
                 logits = predict_logits(
                     model,
@@ -774,7 +796,8 @@ def _client_process_main(
                         "Client proxy inference produced non-finite logits."
                     )
             except Exception:
-                _restore_client_model(model, snapshot, device)
+                local_model_version = _restore_client_model(model, snapshot, device,
+                    optimizer, local_scaler, distillation_scaler)
                 raise
 
             actual_compute_time_s = (
@@ -1410,6 +1433,11 @@ def _initialize_metrics(
         "aa_valid": [],
         "aa_nonfinite_batches": [],
         "aa_invalid_reason": [],
+        "clean_target_rate": [],
+        "clean_target_numerator": [],
+        "clean_target_denominator": [],
+        "clean_target_valid": [],
+        "trigger_lift": [],
         "aa_target_label": [],
         "aa_trigger_type": [],
         "aa_trigger_size": [],
@@ -1450,6 +1478,7 @@ def run_fedagg_server_client_process_async(
     clean_ce_weight: float = 0.05,
     checkpoint_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
     attack_plan: Optional[AttackPlan] = None,
+    training_policy: Optional[TrainingPolicy] = None,
 ) -> Dict[str, object]:
     """Run real persistent Client processes through localhost TCP RPC."""
 
@@ -1476,6 +1505,7 @@ def run_fedagg_server_client_process_async(
         device=torch.device(config.server_device),
         amp=bool(config.amp),
         strict_numeric_checks=bool(config.strict_numeric_checks),
+        training_policy=training_policy,
     )
     initial_logits = server.student_proxy_logits()
     if initial_logits.ndim != 2:
@@ -1529,12 +1559,14 @@ def run_fedagg_server_client_process_async(
         attack_plan=attack_plan,
         aggregation_rule=str(aggregation_rule),
     )
-    latest_server_packet = ServerLogitsPacket.from_logits(
-        model_round=0,
-        query_id=data_plan.proxy_version,
-        proxy_version=data_plan.proxy_version,
-        logits=initial_logits,
-    )
+    latest_server_packet = None
+    if training_policy is None:
+        latest_server_packet = ServerLogitsPacket.from_logits(
+            model_round=0,
+            query_id=data_plan.proxy_version,
+            proxy_version=data_plan.proxy_version,
+            logits=initial_logits,
+        )
     reference_times: List[float] = []
     attack_stats_cache: Dict[str, Dict[str, object]] = {}
     wall_start = time.monotonic()
@@ -1573,9 +1605,12 @@ def run_fedagg_server_client_process_async(
                 and hasattr(defense_controller, "snapshot_state")
                 else None
             )
+            round_training_state = server.snapshot_training_state() if training_policy else None
+            round_training_rng = capture_rng_state() if training_policy else None
             dispatch = coordinator.dispatch_round(
                 server_round=server_round,
                 latest_server_packet=latest_server_packet,
+                client_kd_weight=server.publication_weight if training_policy else None,
             )
             dispatched_count = len(dispatch.dispatched_clients)
             quorum_required = (
@@ -1939,17 +1974,28 @@ def run_fedagg_server_client_process_async(
             )
             aggregation_time = time.monotonic() - aggregation_started
             distill_started = time.monotonic()
-            server_updated = server.train_from_teacher_probabilities(
-                aggregate,
-                learning_rate=max(float(learning_rate) * 0.2, 1e-4),
-                temperature=float(distill_temperature),
-                clean_ce_weight=float(
-                    defense_controller.clean_ce_weight()
-                    if defense_controller is not None
-                    and hasattr(defense_controller, "clean_ce_weight")
-                    else clean_ce_weight
-                ),
-            )
+            try:
+                server_updated = server.train_from_teacher_probabilities(
+                    aggregate,
+                    learning_rate=max(float(learning_rate) * 0.2, 1e-4),
+                    temperature=float(distill_temperature),
+                    clean_ce_weight=float(
+                        defense_controller.clean_ce_weight()
+                        if defense_controller is not None
+                        and hasattr(defense_controller, "clean_ce_weight")
+                        else clean_ce_weight
+                    ),
+                )
+            except Exception:
+                if training_policy is not None:
+                    _restore_model(server.model, round_server_snapshot, torch.device(config.server_device))
+                    server.restore_training_state(round_training_state)
+                    if round_admission_state is not None:
+                        admission_controller.restore_state(round_admission_state)
+                    if round_defense_state is not None:
+                        defense_controller.restore_state(round_defense_state)
+                    restore_rng_state(round_training_rng)
+                raise
             distill_time = time.monotonic() - distill_started
             rollback = 0
             if not _model_is_finite(server.model):
@@ -1964,12 +2010,26 @@ def run_fedagg_server_client_process_async(
                     defense_controller.restore_state(round_defense_state)
                 rollback = 1
                 server_updated = False
-            latest_server_packet = ServerLogitsPacket.from_logits(
-                model_round=server_round,
-                query_id=data_plan.proxy_version,
-                proxy_version=data_plan.proxy_version,
-                logits=server.student_proxy_logits(),
-            )
+            if training_policy is not None:
+                if rollback:
+                    server.restore_training_state(round_training_state)
+                    restore_rng_state(round_training_rng)
+                diagnostic = server.commit_publication(update_valid=bool(server_updated and not rollback),
+                    current_round=server_round, query_id=data_plan.proxy_version,
+                    proxy_version=data_plan.proxy_version, enable_reverse=enable_client_distillation)
+                diagnostic["client_optimizer_steps"] = sum(int(event["local_optimizer_step_count"]) for event in round_events)
+                diagnostic["client_kd_optimizer_steps"] = sum(int(event["local_optimizer_step_count"]) for event in round_events
+                    if coordinator.task_registry[str(event["task_id"])].task.client_kd_weight > 0)
+                metrics.setdefault("training_diagnostics", []).append(diagnostic)
+                print("[Training] " + json.dumps(diagnostic, sort_keys=True))
+                latest_server_packet = server.published_packet
+            else:
+                latest_server_packet = ServerLogitsPacket.from_logits(
+                    model_round=server_round,
+                    query_id=data_plan.proxy_version,
+                    proxy_version=data_plan.proxy_version,
+                    logits=server.student_proxy_logits(),
+                )
             legacy_accuracy, loss, nonfinite_eval = evaluate_with_loss(
                 server.model,
                 test_loader,
@@ -2010,6 +2070,11 @@ def run_fedagg_server_client_process_async(
                     "aa_valid": False,
                     "aa_nonfinite_batches": 0,
                     "aa_invalid_reason": "not_applicable_clean_run",
+                    "clean_target_rate": _nan(),
+                    "clean_target_numerator": 0,
+                    "clean_target_denominator": 0,
+                    "clean_target_valid": False,
+                    "trigger_lift": _nan(),
                 }
             round_time = time.monotonic() - round_started
             version_lags = [
@@ -2077,8 +2142,11 @@ def run_fedagg_server_client_process_async(
                     event["wire_bytes"] for event in round_events
                 )),
                 "server_broadcast_bytes": int(
-                    latest_server_packet.payload_bytes
-                    * len(dispatch.dispatched_clients)
+                    sum(entry.task.server_logits_packet.payload_bytes
+                        for entry in coordinator.task_registry.values()
+                        if entry.task.source_round == server_round and entry.task.server_logits_packet is not None)
+                    if training_policy is not None else
+                    latest_server_packet.payload_bytes * len(dispatch.dispatched_clients)
                 ),
                 "server_client_distillations": len(
                     admitted_ids
@@ -2087,9 +2155,12 @@ def run_fedagg_server_client_process_async(
                     admitted_ids
                 ),
                 "client_reverse_distillations": sum(
+                    int(event["local_optimizer_step_count"]) > 0 and
+                    coordinator.task_registry[str(event["task_id"])].task.client_kd_weight > 0
+                    for event in round_events
+                ) if training_policy is not None else sum(
                     1 for event in round_events
-                    if int(event["base_server_round"]) >= 0
-                    and enable_client_distillation
+                    if int(event["base_server_round"]) >= 0 and enable_client_distillation
                 ),
                 "server_update_applied": int(server_updated),
                 "teachers_admitted": int(
@@ -2345,6 +2416,11 @@ def run_fedagg_server_client_process_async(
                 "aa_invalid_reason": str(
                     backdoor_eval.get("aa_invalid_reason", "")
                 ),
+                "clean_target_rate": float(backdoor_eval["clean_target_rate"]),
+                "clean_target_numerator": int(backdoor_eval["clean_target_numerator"]),
+                "clean_target_denominator": int(backdoor_eval["clean_target_denominator"]),
+                "clean_target_valid": bool(backdoor_eval["clean_target_valid"]),
+                "trigger_lift": float(backdoor_eval["trigger_lift"]),
                 "aa_target_label": (
                     int(attack_plan.config.target_label)
                     if attack_plan is not None else -1
@@ -2527,6 +2603,8 @@ def run_fedagg_server_client_process_async(
                 for event in round_events
             ])
             metrics["runtime_events"].extend(round_events)
+            if training_policy is not None:
+                metrics["_training_state"] = {"server": server.snapshot_training_state(), "process_resume_supported": False}
             if checkpoint_callback is not None:
                 checkpoint_callback(int(server_round), metrics)
             print(

@@ -1,6 +1,13 @@
 # FedAgg Server-Client with VCAA and NIABD
 
-## NIABD v2 production semantics
+## NIABD v7 production semantics
+
+`niabd.py` is the single active NIABD implementation in this directory. It
+identifies itself as `niabd-v7-information-and-risk-correlated-purification`;
+earlier versions remain experimental comparisons, not runtime options. The
+result schema, run manifest, and checkpoints obtain the active version from
+the implementation. A checkpoint from a different NIABD version cannot be
+resumed as v7.
 
 The production implementation uses a proxy-conditioned class-response
 prototype. For teacher logits `Z[k,p,c]`, the persistent memory is
@@ -17,7 +24,14 @@ robust-standardized and combined by their maximum. The legacy
 `amax(P,C)` bound. A single finite outlier therefore receives continuous
 suppression without freezing every teacher. Memory and threshold updates use
 the pre-purification state and only safe memory-eligible raw logits; freeze
-rounds never absorb all teachers or potentiate thresholds.
+rounds never absorb all teachers or potentiate thresholds. The controller
+increases historical-reference trust and continuous purification while still
+in NORMAL when historical anomaly risk and current-cohort disagreement
+corroborate each other. During NORMAL and RECOVERY, the correction for each
+proxy response is also weighted by its class-predictive information. Once
+the observable state becomes SUSPICIOUS, full historical correction applies.
+Phase transitions, student reference, and memory eligibility/update remain
+active in every state.
 
 New CLI controls are:
 
@@ -31,8 +45,8 @@ New CLI controls are:
 --niabd-threshold-exposure-quantile
 ```
 
-Results identify `niabd-v2-proxy-conditioned-robust-memory` and
-`fedagg-results-v2`. Round and teacher-defense CSVs include the update reason,
+Results identify `niabd-v7-information-and-risk-correlated-purification` and
+`fedagg-results-v3`. Round and teacher-defense CSVs include the update reason,
 robust teacher metrics, freeze streak, effective memory weight, eligible
 observations, and memory-update rounds. Formal result collection is fail-closed
 and keeps runtime, algorithm version, and result schema in its grouping key:
@@ -50,6 +64,20 @@ The complete CUDA/CoreX procedure is documented in
 `GPU_VALIDATION_RUNBOOK.md`. CPU tests, synthetic logits tests, preservation
 checks, and the 240-job dry-run are validation evidence only; formal CUDA
 training remains unverified until executed on the target device.
+
+## VCAA v9 proxy information calibration
+
+VCAA keeps its version, timestamp, and age validity checks. Its historical
+content gate and relative content weights operate when the current proxy
+teacher cohort has resolvable class-predictive information, or when an
+informative recent history already calibrates that gate. With near-uniform
+proxy responses and no informative history, freshness-valid teachers receive
+uniform content reliability instead of being separated by tiny entropy
+differences. Empty history slots age out old content evidence by round.
+
+This calibration prevents unsupported content rejection; it does not identify
+a backdoor whose behavior differs only on inputs absent from the proxy set.
+The active version is `vcaa-v9-proxy-information-calibrated-content`.
 
 当前分支采用服务器—客户端联邦蒸馏结构：
 
@@ -1172,3 +1200,34 @@ CODEX_LOCAL_ITERATION_PROMPT.md
 ```
 
 Codex 必须在这个完整仓库中增量修改，禁止重建一个精简项目替换现有系统。
+
+## TA/AA 无效评估防护（ta-aa-validity-v1）
+
+此加固只改变评估结果的有效性处理、导出和统计，不改变攻击、VCAA、NIABD、
+聚合目标或 student 更新。正常有限评估的 TA/AA 和旧别名保持原数值。
+
+- 任意评估批次出现 NaN/Inf，整次对应 TA/AA 的 `value` 为 NaN、`valid=False`，
+  严格与非严格模式均不允许将部分或净化后的预测比例作为效果指标。
+  分子、分母及非有限批次数仍保留为诊断；无效时它们不是完整测试集的有效估计。
+- clean/no-trigger 的 AA 不适用；空测试集或没有非目标类样本也没有可报告值。
+  这些情况不填 0，也不回填其他轮次的结果。
+- 逐轮 `ta/accuracy`、`aa/basr_global` 同步置为空值；最终轮无效时
+  `final_ta/final_accuracy`、`final_aa/final_basr_global` 同样为空。
+  `best_ta/best_accuracy` 仅使用有效轮次，全无效时为空。
+- 最终汇总追加 `final_ta_valid`、`final_aa_valid`、对应的分子/分母、
+  `*_nonfinite_batches`、`*_invalid_reason`，以及 `ta_valid_rounds/aa_valid_rounds`。
+  攻击窗口的均值与峰值只使用可报告 AA；窗口缺失无效轮次时不报告完整窗口 AUC。
+- `summarize_results.py`、统计/配对比较、主结果收集及结果合并均二次屏蔽
+  显式无效的有限值。统计保留总运行数，另记录实际观察数 `*_n` 或
+  `ta_observations/aa_observations`；不会把无效评估当成 0 或删除整行的其他诊断。
+- v3 校验器拒绝“显式无效但仍有有限效果值”、有效性与失败证据矛盾及别名
+  缺失状态不一致的记录。
+
+结果 schema 保持 `fedagg-results-v3`，新增字段为可选、追加兼容项，另用
+`evaluation_metric_policy_version=ta-aa-validity-v1` 标记本次策略变化。
+历史源 CSV 不会被改写；旧字段别名仍可读取。历史记录若没有有效性或失败证据，
+只能按历史兼容方式读取，不能据此认证其评估有效；要确认须重新评估或补充独立证据。
+合并输出会屏蔽已知无效值，但原历史文件不变。
+
+定向 CPU 回归：`python -B -m pytest -q -p no:cacheprovider tests/test_evaluation_validity.py`。
+Windows 上请另指定全新的 `--basetemp`。CPU 回归不构成正式 TA/AA 防御效用结论。

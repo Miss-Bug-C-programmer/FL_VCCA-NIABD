@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from result_schema import mask_invalid_accuracy_frame
 try:
     from scipy import stats
 except ImportError:  # pragma: no cover - lightweight research environment
@@ -54,7 +57,7 @@ def main() -> None:
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--out", default="statistics.csv")
     args = parser.parse_args()
-    frame = pd.read_csv(args.summary)
+    frame = mask_invalid_accuracy_frame(pd.read_csv(args.summary))
     if args.metric not in frame.columns:
         raise SystemExit(f"missing metric: {args.metric}")
     values = pd.to_numeric(frame[args.metric], errors="coerce").to_numpy()

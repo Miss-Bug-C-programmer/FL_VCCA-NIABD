@@ -9,13 +9,102 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
+from niabd import NIABD_ALGORITHM_VERSION
+from vcaa import VCAA_ALGORITHM_VERSION
+
 
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
-VCAA_ALGORITHM_VERSION = "vcaa-v5-lineage-content-admission-runtime-age"
-NIABD_ALGORITHM_VERSION = (
-    "niabd-v3-trusted-memory-recovery-controller"
-)
+EVALUATION_METRIC_POLICY_VERSION = "ta-aa-validity-v1"
 AGGREGATION_ALGORITHM_VERSION = "aggregation-v1-probability-space"
+
+# Only effect values/aliases are masked. Counts, reasons, and input files stay
+# intact so partial evaluations remain auditable, not usable observations.
+_ACCURACY_VALUE_GROUPS = (
+    ("ta", ("ta", "accuracy")),
+    ("aa", ("aa", "basr_global")),
+    ("final_ta", ("final_ta", "final_accuracy")),
+    ("final_aa", ("final_aa", "final_basr_global")),
+    ("best_ta", ("best_ta", "best_accuracy")),
+)
+
+
+def _validity_claim(value) -> Optional[bool]:
+    if value is None or pd.isna(value):
+        return None
+    return str(value).strip().lower() in {"true", "1", "1.0"}
+
+
+def _invalid_accuracy_record(row: Mapping, stem: str, columns: Sequence[str]) -> bool:
+    claim = _validity_claim(row.get(f"{stem}_valid"))
+    if claim is False:
+        return True
+    counter = row.get(f"{stem}_nonfinite_batches")
+    if counter is not None and not pd.isna(counter):
+        if not math.isfinite(float(counter)) or float(counter) != 0.0:
+            return True
+    reason = row.get(f"{stem}_invalid_reason")
+    if reason is not None and not pd.isna(reason) and str(reason).strip():
+        return True
+    for column in columns:
+        if column not in row:
+            continue
+        value = row[column]
+        if value is None or pd.isna(value):
+            if claim is True:
+                return True
+        else:
+            try:
+                if not math.isfinite(float(value)):
+                    return True
+            except (TypeError, ValueError):
+                return True
+    return False
+
+
+def mask_invalid_accuracy_record(row: Mapping) -> dict:
+    """Fail closed on known invalid metrics, retaining legacy unknown status."""
+    result = dict(row)
+    for stem, columns in _ACCURACY_VALUE_GROUPS:
+        if _invalid_accuracy_record(row, stem, columns):
+            for column in columns:
+                if column in result:
+                    result[column] = float("nan")
+    return result
+
+
+def mask_invalid_accuracy_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a masked copy; never overwrite historical source records."""
+    result = frame.copy()
+    if not any(column in frame.columns for _, columns in _ACCURACY_VALUE_GROUPS for column in columns):
+        return result
+    records = [mask_invalid_accuracy_record(row) for row in frame.to_dict("records")]
+    for _, columns in _ACCURACY_VALUE_GROUPS:
+        for column in columns:
+            if column in result.columns:
+                result[column] = [row[column] for row in records]
+    return result
+
+
+def validate_accuracy_metrics(frame: pd.DataFrame) -> None:
+    """Reject a finite invalid metric, including legacy alias escape routes."""
+    for row in frame.to_dict("records"):
+        masked = mask_invalid_accuracy_record(row)
+        for stem, columns in _ACCURACY_VALUE_GROUPS:
+            for column in columns:
+                if column in row and pd.notna(row[column]) and pd.isna(masked[column]):
+                    raise ValueError(f"invalid {stem.upper()} must have a missing value: {column}")
+            if all(column in row for column in columns):
+                left, right = (row[column] for column in columns)
+                if pd.isna(left) != pd.isna(right) or (
+                    pd.notna(left) and not math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-8)
+                ):
+                    raise ValueError(f"{stem.upper()} aliases diverge.")
+            if _validity_claim(row.get(f"{stem}_valid")) is True:
+                if _invalid_accuracy_record(row, stem, columns):
+                    raise ValueError(f"{stem.upper()} validity contradicts its evaluation evidence.")
+                denominator = row.get(f"{stem}_denominator")
+                if denominator is not None and (pd.isna(denominator) or float(denominator) <= 0):
+                    raise ValueError(f"valid {stem.upper()} requires a positive denominator.")
 
 VCAA_V5_ROUND_COLUMNS = frozenset({
     "vcaa_freshness_valid_teachers",
@@ -133,6 +222,7 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("ta_denominator", "integer", False, ("*",), ("*",), 0, "Valid clean test labels evaluated."),
     MetricSchemaEntry("ta_valid", "boolean", False, ("*",), ("*",), False, "Whether TA has a complete finite evaluation."),
     MetricSchemaEntry("ta_nonfinite_batches", "integer", False, ("*",), ("*",), 0, "Clean evaluation batches with non-finite logits."),
+    MetricSchemaEntry("ta_invalid_reason", "string", True, ("*",), ("*",), None, "Reason TA is invalid."),
     MetricSchemaEntry("ta_test_dataset_identity", "string", True, ("*",), ("*",), None, "Identity of the clean test split."),
     MetricSchemaEntry("aa", "number", True, ("*",), ("*",), None, "Triggered attack accuracy (AA); not applicable for clean runs."),
     MetricSchemaEntry("aa_numerator", "integer", False, ("*",), ("*",), 0, "Triggered predictions equal to the target label."),
@@ -140,6 +230,11 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("aa_valid", "boolean", False, ("*",), ("*",), False, "Whether AA has a complete finite evaluation."),
     MetricSchemaEntry("aa_nonfinite_batches", "integer", False, ("*",), ("*",), 0, "Triggered evaluation batches with non-finite logits."),
     MetricSchemaEntry("aa_invalid_reason", "string", True, ("*",), ("*",), None, "Reason AA is invalid or not applicable."),
+    MetricSchemaEntry("clean_target_rate", "number", True, ("*",), ("*",), None, "Target predictions on non-target clean test images, without a trigger."),
+    MetricSchemaEntry("clean_target_numerator", "integer", True, ("*",), ("*",), None, "Clean non-target images predicted as the attack target."),
+    MetricSchemaEntry("clean_target_denominator", "integer", True, ("*",), ("*",), None, "Non-target clean images evaluated for target prediction."),
+    MetricSchemaEntry("clean_target_valid", "boolean", True, ("*",), ("*",), None, "Whether the clean target prediction diagnostic is complete and finite."),
+    MetricSchemaEntry("trigger_lift", "number", True, ("*",), ("*",), None, "AA minus clean target prediction rate on the same non-target test population."),
     MetricSchemaEntry("aa_target_label", "integer", True, ("*",), ("*",), None, "AA target class."),
     MetricSchemaEntry("aa_trigger_type", "string", True, ("*",), ("*",), None, "AA trigger construction."),
     MetricSchemaEntry("aa_trigger_size", "integer", True, ("*",), ("*",), None, "AA trigger size when applicable."),
@@ -147,6 +242,19 @@ SCHEMA_ENTRIES: tuple[MetricSchemaEntry, ...] = (
     MetricSchemaEntry("aa_evaluation_round", "integer", True, ("*",), ("*",), None, "Round at which AA was evaluated."),
     MetricSchemaEntry("final_ta", "number", True, ("*",), ("*",), None, "Final TA summary alias."),
     MetricSchemaEntry("final_aa", "number", True, ("*",), ("*",), None, "Final AA summary alias."),
+    MetricSchemaEntry("evaluation_metric_policy_version", "string", True, ("*",), ("*",), None, "Append-only TA/AA validity policy; legacy absence is unknown."),
+    MetricSchemaEntry("final_ta_valid", "boolean", True, ("*",), ("*",), None, "Validity of the actual final-round TA, not the last valid round."),
+    MetricSchemaEntry("final_aa_valid", "boolean", True, ("*",), ("*",), None, "Validity of the actual final-round AA."),
+    MetricSchemaEntry("final_ta_numerator", "integer", True, ("*",), ("*",), None, "Final TA diagnostic numerator."),
+    MetricSchemaEntry("final_ta_denominator", "integer", True, ("*",), ("*",), None, "Final TA diagnostic denominator."),
+    MetricSchemaEntry("final_aa_numerator", "integer", True, ("*",), ("*",), None, "Final AA diagnostic numerator."),
+    MetricSchemaEntry("final_aa_denominator", "integer", True, ("*",), ("*",), None, "Final AA diagnostic denominator."),
+    MetricSchemaEntry("final_ta_nonfinite_batches", "integer", True, ("*",), ("*",), None, "Final TA non-finite batch count."),
+    MetricSchemaEntry("final_aa_nonfinite_batches", "integer", True, ("*",), ("*",), None, "Final AA non-finite batch count."),
+    MetricSchemaEntry("final_ta_invalid_reason", "string", True, ("*",), ("*",), None, "Final TA invalidity reason."),
+    MetricSchemaEntry("final_aa_invalid_reason", "string", True, ("*",), ("*",), None, "Final AA invalidity or non-applicability reason."),
+    MetricSchemaEntry("ta_valid_rounds", "integer", True, ("*",), ("*",), None, "Rounds with reportable TA."),
+    MetricSchemaEntry("aa_valid_rounds", "integer", True, ("*",), ("*",), None, "Rounds with reportable AA."),
     MetricSchemaEntry("transaction_id", "string", False, ("*",), ("*",), "", "Round transaction identity."),
     MetricSchemaEntry("transaction_status", "string", False, ("*",), ("*",), "committed", "prepare/commit/abort status."),
     MetricSchemaEntry("student_snapshot_sha256", "string", True, ("*",), ("*",), None, "Pre-update student proxy logits identity."),
@@ -220,6 +328,11 @@ OPTIONAL_BACKWARD_COMPAT_COLUMNS = frozenset({
     "aa_valid",
     "aa_nonfinite_batches",
     "aa_invalid_reason",
+    "clean_target_rate",
+    "clean_target_numerator",
+    "clean_target_denominator",
+    "clean_target_valid",
+    "trigger_lift",
     "aa_target_label",
     "aa_trigger_type",
     "aa_trigger_size",
@@ -227,12 +340,27 @@ OPTIONAL_BACKWARD_COMPAT_COLUMNS = frozenset({
     "aa_evaluation_round",
     "final_ta",
     "final_aa",
+    "ta_invalid_reason",
+    "evaluation_metric_policy_version",
+    "final_ta_valid",
+    "final_aa_valid",
+    "final_ta_numerator",
+    "final_ta_denominator",
+    "final_aa_numerator",
+    "final_aa_denominator",
+    "final_ta_nonfinite_batches",
+    "final_aa_nonfinite_batches",
+    "final_ta_invalid_reason",
+    "final_aa_invalid_reason",
+    "ta_valid_rounds",
+    "aa_valid_rounds",
 })
 
 
 def schema_dict() -> dict:
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
+        "evaluation_metric_policy_version": EVALUATION_METRIC_POLICY_VERSION,
         "entries": [asdict(entry) for entry in SCHEMA_ENTRIES],
     }
 
@@ -275,6 +403,7 @@ def validate_frame(
         raise ValueError("result schema rejects an empty result frame.")
     if frame["run_uid"].isna().any() or (frame["run_uid"].astype(str).str.strip() == "").any():
         raise ValueError("run_uid must be non-empty for every result row.")
+    validate_accuracy_metrics(frame)
     if "ta" in frame.columns and "accuracy" in frame.columns:
         left = pd.to_numeric(frame["ta"], errors="coerce")
         right = pd.to_numeric(frame["accuracy"], errors="coerce")

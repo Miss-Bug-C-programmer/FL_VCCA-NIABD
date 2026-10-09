@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, log
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -11,7 +11,7 @@ from defense import DefenseResult, TeacherDefenseRecord
 from numeric_integrity import require_finite_tensor
 
 
-NIABD_ALGORITHM_VERSION = "niabd-v3-trusted-memory-recovery-controller"
+NIABD_ALGORITHM_VERSION = "niabd-v8-adaptive-recovery"
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
 _ROBUST_MAD_SCALE = 1.4826
 
@@ -60,7 +60,7 @@ class NIABDConfig:
     reference_clip_z: float = 2.0
     normal_memory_lr: Optional[float] = None
     suspicious_memory_lr: float = 0.0
-    recovery_memory_lr: float = 0.20
+    recovery_memory_lr: float = 0.02
     clean_ce_weight_normal: float = 0.05
     clean_ce_weight_suspicious: float = 0.10
     clean_ce_weight_recovery: float = 0.20
@@ -454,7 +454,9 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "eligible": eligible,
         }
 
-    def _warmup_candidates(self, stacked: torch.Tensor) -> Tuple[torch.Tensor, str]:
+    def _warmup_candidates(
+        self, stacked: torch.Tensor, *, trim_for_recovery: bool = False
+    ) -> Tuple[torch.Tensor, str]:
         count = int(stacked.shape[0])
         required = max(
             int(self.config.minimum_consensus_teachers),
@@ -468,9 +470,24 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         mask = distance <= float(self.config.benign_deviation_limit)
         if int(mask.sum().item()) < required:
             return mask, "freeze_no_safe_candidate"
+        if trim_for_recovery and int(mask.sum().item()) > required:
+            # A historical-memory fallback must not silently promote every
+            # current teacher into trusted memory. Retain the most coherent
+            # configured majority; boundary ties retain all equally supported
+            # teachers rather than selecting by client ID.
+            ranked = torch.argsort(
+                torch.where(mask, distance, torch.full_like(distance, float("inf")))
+            )
+            boundary = distance[ranked[required - 1]]
+            mask = mask & (
+                (distance < boundary)
+                | torch.isclose(distance, boundary, rtol=1e-5, atol=1e-6)
+            )
         return mask, "warmup_robust_update"
 
-    def _transition(self, risk: float, recovery_risk: float) -> None:
+    def _transition(
+        self, risk: float, recovery_risk: float, *, student_supports_drift: bool = False
+    ) -> None:
         beta = float(self.config.risk_ema_beta)
         self._risk_ema = beta * float(risk) + (1.0 - beta) * self._risk_ema
         self._recovery_risk_ema = (
@@ -485,7 +502,15 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             else:
                 self._suspicious_rounds = 0
             if self._suspicious_rounds >= int(self.config.onset_patience):
-                self._phase = self.SUSPICIOUS
+                # A compact current cohort corroborated by the independent
+                # student is collective drift, rather than evidence of an
+                # outlier faction. Recovery keeps memory updates clipped.
+                self._phase = (
+                    self.RECOVERY
+                    if self._recovery_risk_ema <= float(self.config.risk_off)
+                    and student_supports_drift
+                    else self.SUSPICIOUS
+                )
                 self._suspicious_rounds = 0
         elif self._phase == self.SUSPICIOUS:
             self._stable_rounds = 0
@@ -509,7 +534,10 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 self._phase = self.SUSPICIOUS
                 self._suspicious_rounds = 0
                 self._stable_rounds = 0
-            elif self._recovery_risk_ema <= float(self.config.risk_off):
+            elif (
+                self._recovery_risk_ema <= float(self.config.risk_off)
+                and self._risk_ema <= float(self.config.risk_off)
+            ):
                 self._stable_rounds += 1
             else:
                 self._stable_rounds = 0
@@ -517,7 +545,13 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 self._phase = self.NORMAL
                 self._stable_rounds = 0
 
-    def _safe_reference(self, current_consensus: torch.Tensor, student: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    def _safe_reference(
+        self,
+        current_consensus: torch.Tensor,
+        student: torch.Tensor,
+        *,
+        preemptive_strength: float = 0.0,
+    ) -> Tuple[torch.Tensor, float]:
         assert self._trusted_mean is not None and self._trusted_variance is not None
         std = torch.sqrt(self._trusted_variance).clamp_min(float(self.config.minimum_standard_deviation))
         delta = (current_consensus - self._trusted_mean).clamp(
@@ -526,16 +560,42 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         )
         safe_consensus = self._trusted_mean + delta
         alpha = {
-            self.NORMAL: 0.50,
+            self.NORMAL: 0.50 + 0.35 * float(preemptive_strength),
             self.SUSPICIOUS: 0.85,
-            self.RECOVERY: 0.25,
+            # Recovery adapts trusted memory without dropping the protection
+            # used when the controller first detected the shift.  As clipped
+            # memory catches up, ``memory_excess`` shrinks and purification
+            # decays naturally instead of changing discontinuously by phase.
+            self.RECOVERY: 0.85,
         }[self._phase]
         reference = alpha * self._trusted_mean + (1.0 - alpha) * safe_consensus
         if self.config.reference_source == "student":
-            reference = 0.75 * reference + 0.25 * student
+            # The student is another observable response, not trusted memory.
+            # Bound its residual by the same historical scale as consensus.
+            # The prototype mode consumes the student independently in the
+            # state transition and recovery-memory authorization below.  Do
+            # not also write the student's current logits into the purification
+            # destination: that would feed an already learned trigger bias back
+            # into every accepted teacher.
+            student_delta = (student - self._trusted_mean).clamp(
+                min=-float(self.config.reference_clip_z) * std,
+                max=float(self.config.reference_clip_z) * std,
+            )
+            safe_student = self._trusted_mean + student_delta
+            student_weight = 0.25
+            reference = (
+                (1.0 - student_weight) * reference
+                + student_weight * safe_student
+            )
         return reference, float(alpha)
 
-    def _update_memory(self, stacked: torch.Tensor, eligible: torch.Tensor) -> bool:
+    def _update_memory(
+        self,
+        stacked: torch.Tensor,
+        eligible: torch.Tensor,
+        *,
+        student: Optional[torch.Tensor] = None,
+    ) -> bool:
         assert self._trusted_mean is not None and self._trusted_variance is not None
         if not bool(eligible.any().item()) or self._phase == self.SUSPICIOUS:
             return False
@@ -545,6 +605,31 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             min=self._trusted_mean - float(self.config.memory_clip_z) * std,
             max=self._trusted_mean + float(self.config.memory_clip_z) * std,
         )
+        if self._phase == self.RECOVERY:
+            if student is None:
+                return False
+            # A compact teacher cohort alone cannot authorize trusted-memory
+            # drift: the same cohort may contain coordinated, clean-proxy
+            # responses.  The student is expected to lag the teachers, so
+            # requiring it to cross the midpoint between historical memory and
+            # the new center makes recovery self-locking.  Instead, require its
+            # full standardized response to move in the same direction as the
+            # robust center.  Directional support allows a lagging student to
+            # authorize a small update without requiring it to have already
+            # crossed an arbitrary fraction of the teacher drift.  The update
+            # below remains clipped and uses the lower RECOVERY learning rate.
+            center_memory_response = (
+                (center - self._trusted_mean) / (std + self.config.epsilon)
+            ).reshape(-1)
+            student_memory_response = (
+                (student - self._trusted_mean) / (std + self.config.epsilon)
+            ).reshape(-1)
+            direction_alignment = torch.dot(
+                center_memory_response,
+                student_memory_response,
+            )
+            if not bool((direction_alignment > 0.0).item()):
+                return False
         eta = (
             float(self.config.effective_normal_memory_lr)
             if self._phase == self.NORMAL
@@ -878,21 +963,76 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         median_consensus_deviation = float(
             torch.median(consensus_teacher_deviation).item()
         )
+        # Recovery asks whether the current cohort contains the configured
+        # compact majority, rather than whether it has no more than the much
+        # smaller historical-memory anomaly budget.  Reusing
+        # ``maximum_memory_anomaly_fraction`` here made two ordinary non-IID
+        # outliers in a 20-client cohort sufficient to prevent recovery
+        # forever.  The memory gate below still excludes those outliers; this
+        # risk only decides whether a clipped majority update may begin.
+        allowed_outlier_fraction = max(
+            1.0 - float(self.config.consensus_recovery_fraction),
+            1.0 / float(reference_stacked.shape[0]),
+        )
+        outlier_excess = max(
+            0.0,
+            consensus_outlier_fraction - allowed_outlier_fraction,
+        ) / max(allowed_outlier_fraction, self.config.epsilon)
+        median_excess = max(
+            0.0,
+            median_consensus_deviation
+            - float(self.config.benign_deviation_limit),
+        ) / float(self.config.benign_deviation_limit)
         self._recovery_risk = float(
             max(
                 0.0,
-                consensus_outlier_fraction
-                / max(
-                    float(self.config.maximum_memory_anomaly_fraction),
-                    self.config.epsilon,
-                ),
-                median_consensus_deviation
-                / float(self.config.benign_deviation_limit),
+                outlier_excess,
+                median_excess,
             )
         )
-        self._transition(self._round_risk, self._recovery_risk)
+        student_consensus_distance = float(
+            torch.quantile(
+                ((student - current_consensus).abs() / (std + self.config.epsilon))
+                .reshape(-1),
+                0.95,
+            ).item()
+        )
+        student_memory_distance = float(
+            torch.quantile(
+                ((student - previous_mean).abs() / (std + self.config.epsilon))
+                .reshape(-1),
+                0.95,
+            ).item()
+        )
+        student_supports_drift = (
+            student_consensus_distance
+            <= student_memory_distance + float(self.config.epsilon)
+        )
+        self._transition(
+            self._round_risk,
+            self._recovery_risk,
+            student_supports_drift=student_supports_drift,
+        )
 
-        reference, alpha = self._safe_reference(current_consensus, student)
+        # The state transition needs sustained evidence, but purification can
+        # react continuously to a strong current-cohort outlier faction. Both
+        # historical risk and present-cohort disagreement must corroborate the
+        # change; common benign drift alone contributes no protection boost.
+        preemptive_strength = 0.0
+        if self._phase == self.NORMAL:
+            corroborated_risk = min(self._round_risk, self._recovery_risk)
+            preemptive_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    corroborated_risk / float(self.config.risk_on) - 1.0,
+                ),
+            )
+        reference, alpha = self._safe_reference(
+            current_consensus,
+            student,
+            preemptive_strength=preemptive_strength,
+        )
         self._reference_trusted_weight = float(alpha)
 
         action_abs_deviation = reference_abs_deviation.index_select(
@@ -911,11 +1051,64 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             action_consensus_z
             - float(self.config.consensus_purification_threshold)
         )
-        # Purification now requires independent evidence from both temporal
-        # memory and current-cohort disagreement.  This preserves common benign
-        # representation drift instead of pulling every teacher back toward a
-        # frozen prototype.
-        purification_excess = torch.minimum(memory_excess, consensus_excess)
+        # Historical neuron excess still gates every correction.  Corroborate
+        # it at either the neuron or teacher level: a dispersed current cohort
+        # must not veto an anomaly already detected by the full-reference
+        # robust teacher score.  Common drift has no teacher-score excess.
+        teacher_excess = torch.relu(
+            action_metrics["teacher_memory_score"]
+            - float(self.config.teacher_score_beta)
+        ).view(-1, 1, 1)
+        corroborating_excess = torch.maximum(consensus_excess, teacher_excess)
+        purification_excess = torch.minimum(memory_excess, corroborating_excess)
+        if self._phase == self.SUSPICIOUS:
+            # A coordinated shift can agree with its own current consensus.
+            # Once the observable controller protects historical memory, that
+            # consensus must not veto correction of historical neuron excess.
+            # Use the existing phase trust; RECOVERY retains consensus-led
+            # drift adaptation and the original clipped memory update path.
+            purification_excess = torch.maximum(
+                purification_excess, float(alpha) * memory_excess
+            )
+        elif self._phase == self.RECOVERY:
+            # RECOVERY differs from SUSPICIOUS through clipped memory updates,
+            # not by abruptly disabling continuous purification.  A moderate
+            # historical correction protects the server while the reference
+            # moves toward the compact current majority.
+            purification_excess = torch.maximum(
+                purification_excess, float(alpha) * memory_excess
+            )
+        elif preemptive_strength > 0.0:
+            purification_excess = torch.maximum(
+                purification_excess,
+                float(alpha) * preemptive_strength * memory_excess,
+            )
+        if int(action_stacked.shape[-1]) > 1:
+            # A logit deviation on a nearly uniform proxy response provides
+            # little evidence of a class-level prediction change. Preserve
+            # strong, localized anomaly correction while avoiding large
+            # corrections to weakly informative non-IID teacher responses.
+            log_probabilities = torch.log_softmax(action_stacked, dim=-1)
+            probabilities = log_probabilities.exp()
+            normalized_information = (
+                1.0
+                + (probabilities * log_probabilities).sum(dim=-1)
+                / log(float(action_stacked.shape[-1]))
+            ).clamp(0.0, 1.0)
+            information_weight = normalized_information.sqrt().unsqueeze(-1)
+            protection_level = (
+                1.0
+                if self._phase == self.SUSPICIOUS
+                else float(alpha)
+                if self._phase == self.RECOVERY
+                else preemptive_strength
+                if self._phase == self.NORMAL
+                else 0.0
+            )
+            purification_excess = purification_excess * (
+                information_weight
+                + (1.0 - information_weight) * float(protection_level)
+            )
         weights = torch.exp(
             -(purification_excess.square())
             / (2.0 * float(self.config.transition_smoothness) ** 2)
@@ -935,7 +1128,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         consensus_recovery = False
         if insufficient_consensus:
             recovery_candidates, recovery_reason = self._warmup_candidates(
-                reference_stacked
+                reference_stacked, trim_for_recovery=True
             )
             required = max(
                 int(self.config.minimum_consensus_teachers),
@@ -949,12 +1142,21 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             if (
                 recovery_reason == "warmup_robust_update"
                 and int(recovery_candidates.sum().item()) >= required
+                and self._recovery_risk_ema <= float(self.config.risk_off)
             ):
+                # In RECOVERY this mask is only a proposal. _update_memory
+                # additionally requires the independently trained student's
+                # standardized response to support the same drift direction,
+                # and applies the lower recovery learning rate.
                 update_mask = recovery_candidates
-                consensus_recovery = True
+                consensus_recovery = self._phase == self.NORMAL
             else:
                 update_mask = torch.zeros_like(reference_eligible)
-        memory_updated = self._update_memory(reference_stacked, update_mask)
+        memory_updated = self._update_memory(
+            reference_stacked,
+            update_mask,
+            student=student,
+        )
         if memory_updated:
             self._consecutive_frozen_rounds = 0
         else:
@@ -981,7 +1183,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 else "suspicious_memory_frozen"
             ),
             self.RECOVERY: (
-                "recovery_clipped_update"
+                "recovery_student_corroborated_update"
                 if memory_updated
                 else "recovery_no_safe_candidate"
             ),
@@ -1012,6 +1214,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 "niabd_action_teachers": int(action_stacked.shape[0]),
                 "niabd_recovery_risk": float(self._recovery_risk),
                 "niabd_recovery_risk_ema": float(self._recovery_risk_ema),
+                "niabd_student_supports_drift": bool(student_supports_drift),
             }
         )
         return DefenseResult(

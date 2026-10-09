@@ -91,6 +91,7 @@ def build_checkpoint_payload(
     coordinator_state: Optional[dict] = None,
     manifest_identity: Optional[dict] = None,
     metrics_state: Optional[dict] = None,
+    training_state: Optional[dict] = None,
 ) -> dict:
     if int(current_round) < 0 or int(current_round) > int(expected_rounds):
         raise ValueError("Checkpoint current_round is outside expected range.")
@@ -115,6 +116,7 @@ def build_checkpoint_payload(
         "coordinator_state": coordinator_state,
         "manifest_identity": manifest_identity,
         "metrics_state": metrics_state,
+        "training_state": training_state,
         "algorithm_versions": {
             "vcaa_algorithm_version": (
                 VCAA_ALGORITHM_VERSION if admission_controller is not None else "none"

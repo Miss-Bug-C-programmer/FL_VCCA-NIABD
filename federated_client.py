@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import copy
 import time
 
 import torch
@@ -9,7 +11,8 @@ import torch.nn as nn
 from attacks import AttackPlan
 from attacks.evaluation import apply_evaluation_trigger
 from logits_transport import ClientLogitsPacket, ServerLogitsPacket
-from trainer import distill_with_logits, local_train, predict_logits
+from trainer import ProxyKDBatches, distill_with_logits, local_train, predict_logits, scaler_state_dict, restore_scaler_state
+from device_utils import make_grad_scaler, use_amp_for_device
 
 
 class FederatedClient:
@@ -24,6 +27,7 @@ class FederatedClient:
         device,
         amp: bool = False,
         strict_numeric_checks: bool = False,
+        joint_distillation: bool = False,
     ) -> None:
         self.client_id = int(client_id)
         self.model = model
@@ -32,6 +36,36 @@ class FederatedClient:
         self.amp = bool(amp)
         self.strict_numeric_checks = bool(strict_numeric_checks)
         self.model_round = 0
+        self.local_optimizer = torch.optim.SGD(model.parameters(), lr=0.01) if joint_distillation else None
+        self.local_scaler = (make_grad_scaler(device, enabled=self.amp and use_amp_for_device(device))
+                             if joint_distillation else None)
+        self.teacher_packet, self.proxy_loader = None, None
+        self.kd_weight, self.kd_temperature = 0.0, 2.0
+        self.last_numeric_stats = {}
+
+    def cache_server_teacher(self, packet, weight, proxy_loader, temperature):
+        if not math.isfinite(weight) or weight < 0 or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Invalid reverse-distillation policy")
+        if weight > 0 and packet is None:
+            raise ValueError("Positive KD weight requires a packet")
+        self.teacher_packet = packet if weight > 0 else None
+        self.kd_weight = float(weight) if packet is not None else 0.0
+        self.proxy_loader, self.kd_temperature = proxy_loader, float(temperature)
+
+    def snapshot_training_state(self):
+        generator = getattr(self.train_loader, "generator", None)
+        return copy.deepcopy({"model_round": self.model_round,
+            "optimizer": self.local_optimizer.state_dict(), "scaler": scaler_state_dict(self.local_scaler),
+            "packet": self.teacher_packet, "weight": self.kd_weight, "temperature": self.kd_temperature,
+            "loader_rng": generator.get_state() if generator is not None else None})
+
+    def restore_training_state(self, state, proxy_loader):
+        self.model_round = int(state["model_round"])
+        self.local_optimizer.load_state_dict(state["optimizer"])
+        restore_scaler_state(self.local_scaler, state["scaler"])
+        self.cache_server_teacher(state["packet"], state["weight"], proxy_loader, state["temperature"])
+        if state.get("loader_rng") is not None:
+            self.train_loader.generator.set_state(state["loader_rng"])
 
     def train_local(
         self,
@@ -41,6 +75,8 @@ class FederatedClient:
         batch_transform=None,
         round_number: int = 0,
     ) -> None:
+        self.last_numeric_stats = {}
+        batches = (ProxyKDBatches(self.proxy_loader, self.teacher_packet.decode_logits()) if self.kd_weight > 0 else None)
         local_train(
             self.model,
             self.train_loader,
@@ -51,14 +87,17 @@ class FederatedClient:
             strict_numeric_checks=self.strict_numeric_checks,
             batch_transform=batch_transform,
             round_number=int(round_number),
+            optimizer=self.local_optimizer, scaler=self.local_scaler, numeric_stats=self.last_numeric_stats,
+            proxy_kd_batches=batches, client_kd_weight=self.kd_weight, distill_temperature=self.kd_temperature,
         )
-        self.model_round += 1
+        self.model_round += int(self.last_numeric_stats.get("optimizer_step_count", 0) > 0)
 
     def upload_proxy_logits(
         self,
         proxy_loader,
         *,
         query_id: str,
+        source_round: int | None = None,
     ) -> ClientLogitsPacket:
         """Run the real local model and serialize its proxy logits for upload."""
 
@@ -74,11 +113,12 @@ class FederatedClient:
             generated_at_s=float(time.monotonic()),
             query_id=query_id,
             logits=logits,
-            source_round=self.model_round,
+            source_round=(self.model_round if source_round is None else int(source_round)),
             # ``model_round`` is the version after this local update; the
             # update was based on the server/student version immediately
             # before it.  Keeping these distinct makes lineage auditable.
-            base_server_round=max(0, self.model_round - 1),
+            base_server_round=(max(0, self.model_round - 1) if source_round is None else
+                               (self.teacher_packet.model_round if self.teacher_packet else int(source_round))),
             local_model_version=self.model_round,
         )
 

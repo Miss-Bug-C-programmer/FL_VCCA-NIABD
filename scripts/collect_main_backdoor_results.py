@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import pandas as pd
 
-from compute_statistics import _ci
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.compute_statistics import _ci
+from result_schema import mask_invalid_accuracy_frame
 
 
 def main() -> None:
@@ -27,7 +30,7 @@ def main() -> None:
     files = sorted(root.glob("**/fedagg_run_summary_*.csv"))
     if not files:
         raise FileNotFoundError(f"No run summary CSV files found under {root}.")
-    frames = [pd.read_csv(path) for path in files]
+    frames = [mask_invalid_accuracy_frame(pd.read_csv(path)) for path in files]
     dataframe = pd.concat(frames, ignore_index=True)
     required = {
         "dataset",
@@ -92,6 +95,8 @@ def main() -> None:
 
     table = grouped.agg(
         runs=("seed", "count"),
+        ta_observations=("final_accuracy", "count"),
+        aa_observations=("final_basr_global", "count"),
         clean_acc_mean=("final_accuracy", "mean"),
         clean_acc_std=("final_accuracy", "std"),
         basr_mean=("final_basr_global", "mean"),

@@ -1,4 +1,9 @@
 import contextlib
+import math
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Iterator
+from torch.utils.data import SequentialSampler
 
 import torch
 import torch.nn as nn
@@ -128,6 +133,124 @@ def _raise_if_amp_overflow_streak_exceeded(
     )
 
 
+@dataclass(frozen=True)
+class TrainingPolicy:
+    server_lr: float = 0.01
+    server_momentum: float = 0.9
+    server_epochs: int = 5
+    maximum_clean_ce_weight: float = 0.20
+    maximum_tracking_kl: float = 0.05
+    client_kd_max_weight: float = 0.1
+    reverse_warmup_updates: int = 10
+    reverse_ramp_updates: int = 10
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.maximum_tracking_kl) or self.maximum_tracking_kl <= 0:
+            raise ValueError("maximum_tracking_kl must be finite and positive")
+        if not math.isfinite(self.server_lr) or self.server_lr <= 0:
+            raise ValueError("server_lr must be finite and positive")
+        if not math.isfinite(self.maximum_clean_ce_weight) or self.maximum_clean_ce_weight < 0:
+            raise ValueError("maximum_clean_ce_weight must be finite and nonnegative")
+        if not 0 <= self.server_momentum < 1:
+            raise ValueError("server_momentum must be in [0, 1)")
+        if not math.isfinite(self.client_kd_max_weight) or self.client_kd_max_weight < 0:
+            raise ValueError("client_kd_max_weight must be finite and nonnegative")
+        for name in ("server_epochs", "reverse_warmup_updates", "reverse_ramp_updates"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if self.server_epochs < 1:
+            raise ValueError("server_epochs must be positive")
+
+
+@contextmanager
+def proxy_bn_eval(model: nn.Module) -> Iterator[None]:
+    """Use local running statistics for the proxy forward, retaining gradients.
+
+    This is not no_grad(). Convolution, classifier, and BN affine parameters
+    remain trainable. All BN training flags are restored even after exceptions.
+    The caller runs model.train() for normal private-data training.
+    """
+    kinds = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)
+    layers = [m for m in model.modules() if isinstance(m, kinds)]
+    if any(not m.track_running_stats for m in layers):
+        raise ValueError("This policy requires BN track_running_stats=True")
+    modes = [(layer, layer.training) for layer in layers]
+    try:
+        for layer in layers:
+            layer.eval()
+        yield
+    finally:
+        for layer, was_training in modes:
+            layer.train(was_training)
+
+
+class ProxyKDBatches:
+    """Cycle canonical proxy inputs with frozen, row-aligned teacher logits."""
+    def __init__(self, loader, logits):
+        if not isinstance(loader.sampler, SequentialSampler) or loader.drop_last:
+            raise ValueError("Proxy KD requires a sequential, complete loader")
+        self.targets = logits.detach().cpu().float().clone()
+        if self.targets.ndim != 2 or len(self.targets) != len(loader.dataset) or not len(self.targets):
+            raise ValueError("Proxy KD targets must match the nonempty dataset")
+        require_finite_tensor(self.targets, phase="training", metric="proxy_kd_targets")
+        self.loader, self.cursor, self.iterator = loader, 0, iter(loader)
+
+    def next(self):
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            if self.cursor != len(self.targets):
+                raise ValueError("Proxy KD loader did not consume all target rows")
+            self.cursor, self.iterator = 0, iter(self.loader)
+            batch = next(self.iterator)
+        images = batch[0] if isinstance(batch, (tuple, list)) else batch
+        end = self.cursor + len(images)
+        if end > len(self.targets):
+            raise ValueError("Proxy KD batch exceeds target rows")
+        target, self.cursor = self.targets[self.cursor:end], end
+        return images, target
+
+
+def _proxy_kd_loss(model, batches, device, temperature, strict, context):
+    images, target = batches.next()
+    images, target = images.to(device), target.to(device)
+    if strict:
+        require_finite_tensor(images, phase="training", metric="proxy_kd_inputs", context=context)
+        require_finite_tensor(target, phase="training", metric="proxy_kd_raw_targets", context=context)
+    with proxy_bn_eval(model):
+        logits = model(images)
+    if isinstance(logits, (tuple, list)):
+        logits = logits[0]
+    if logits.shape != target.shape:
+        raise ValueError("Proxy KD student/target shape mismatch")
+    if strict:
+        require_finite_tensor(logits, phase="training", metric="proxy_kd_logits", context=context)
+    logits = torch.nan_to_num(logits.float(), nan=0., posinf=30., neginf=-30.).clamp(-30., 30.)
+    target = torch.nan_to_num(target.float(), nan=0., posinf=30., neginf=-30.).clamp(-30., 30.)
+    return F.kl_div(F.log_softmax(logits / temperature, dim=1),
+                    F.softmax(target / temperature, dim=1), reduction="batchmean") * temperature ** 2
+
+
+def scaler_state_dict(scaler):
+    """The repository's disabled scaler is stateless, not an AMP checkpoint."""
+    from device_utils import _NullGradScaler
+    if isinstance(scaler, _NullGradScaler):
+        return {"kind": "disabled"}
+    return {"kind": "amp", "state": scaler.state_dict()}
+
+
+def restore_scaler_state(scaler, state):
+    from device_utils import _NullGradScaler
+    if isinstance(scaler, _NullGradScaler):
+        if state != {"kind": "disabled"}:
+            raise ValueError("Disabled scaler checkpoint mismatch")
+    else:
+        if state.get("kind") != "amp":
+            raise ValueError("AMP scaler checkpoint mismatch")
+        scaler.load_state_dict(state["state"])
+
+
 def local_train(
     model,
     dataloader,
@@ -145,6 +268,7 @@ def local_train(
     numeric_context=None,
     scaler=None,
     max_consecutive_amp_overflows=DEFAULT_MAX_CONSECUTIVE_AMP_OVERFLOWS,
+    proxy_kd_batches=None, client_kd_weight=0.0, distill_temperature=2.0,
 ):
     """Train one local client model.
 
@@ -161,6 +285,12 @@ def local_train(
         if scaler is None
         else scaler
     )
+    if not math.isfinite(client_kd_weight) or client_kd_weight < 0:
+        raise ValueError("client_kd_weight must be finite and nonnegative")
+    if not math.isfinite(distill_temperature) or distill_temperature <= 0:
+        raise ValueError("distill_temperature must be finite and positive")
+    if client_kd_weight > 0 and proxy_kd_batches is None:
+        raise ValueError("Positive KD weight requires aligned proxy batches")
     model.train()
     if bool(strict_numeric_checks):
         initial_context = dict(numeric_context or {})
@@ -224,6 +354,12 @@ def local_train(
                         context=context,
                     )
                 loss = loss_fn(output, labels)
+                kd_active = float(client_kd_weight) > 0
+                if kd_active:
+                    kd = _proxy_kd_loss(model, proxy_kd_batches, device, float(distill_temperature),
+                                        bool(strict_numeric_checks), context)
+                    loss = loss.float() + float(client_kd_weight) * kd
+                    _increment_stat(numeric_stats, "proxy_kd_batch_count")
 
             should_check = _should_run_numeric_check(step, strict_numeric_checks, numeric_check_interval)
             if should_check and (not torch.isfinite(loss).item()):
@@ -359,6 +495,8 @@ def local_train(
                 optimizer.step()
             consecutive_amp_overflows = 0
             _increment_stat(numeric_stats, "optimizer_step_count")
+            if kd_active:
+                _increment_stat(numeric_stats, "client_kd_optimizer_step_count")
             if bool(strict_numeric_checks):
                 for name, param in model.named_parameters():
                     require_finite_tensor(
@@ -433,6 +571,7 @@ def distill_with_logits(
     numeric_context=None,
     scaler=None,
     max_consecutive_amp_overflows=DEFAULT_MAX_CONSECUTIVE_AMP_OVERFLOWS,
+    optimizer=None,
 ):
     device = normalize_device(device)
     amp_enabled = bool(amp) and use_amp_for_device(device)
@@ -444,7 +583,13 @@ def distill_with_logits(
         else scaler
     )
     model.train()
-    optimizer = torch.optim.SGD(model.parameters(), lr=float(lr))
+    if optimizer is None:
+        optimizer = torch.optim.SGD(model.parameters(), lr=float(lr))
+    else:
+        if {id(p) for g in optimizer.param_groups for p in g["params"]} != {id(p) for p in model.parameters()}:
+            raise ValueError("Distillation optimizer must own this model")
+        for group in optimizer.param_groups:
+            group["lr"] = float(lr)
     T = float(temperature)
     step = 0
     consecutive_amp_overflows = 0

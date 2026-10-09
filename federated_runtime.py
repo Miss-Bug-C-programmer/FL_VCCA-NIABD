@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import statistics
 import time
@@ -17,7 +18,8 @@ from attacks import (
     evaluate_backdoor_suite,
     split_defense_diagnostics,
 )
-from checkpointing import restore_checkpoint
+from checkpointing import restore_checkpoint, capture_rng_state, restore_rng_state
+from trainer import TrainingPolicy
 from admission import (
     AdmissionDecision,
     TeacherAdmissionController,
@@ -615,6 +617,7 @@ def run_fedagg_server_client(
     backdoor_diagnostics_dataset: str = "",
     checkpoint_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
     resume_payload: Optional[dict] = None,
+    training_policy: Optional[TrainingPolicy] = None,
 ) -> Dict[str, object]:
     """Train real clients through serialized proxy-logits knowledge exchange.
 
@@ -654,6 +657,7 @@ def run_fedagg_server_client(
             device=device_obj,
             amp=bool(amp),
             strict_numeric_checks=bool(strict_numeric_checks),
+            joint_distillation=training_policy is not None,
         )
         for client_id, (model, loader) in enumerate(
             zip(client_models, client_loaders)
@@ -665,6 +669,7 @@ def run_fedagg_server_client(
         device=device_obj,
         amp=bool(amp),
         strict_numeric_checks=bool(strict_numeric_checks),
+        training_policy=training_policy,
     )
     if attack_plan is not None and int(attack_plan.num_clients) != len(clients):
         raise ValueError(
@@ -844,6 +849,11 @@ def run_fedagg_server_client(
         "aa_valid": [],
         "aa_nonfinite_batches": [],
         "aa_invalid_reason": [],
+        "clean_target_rate": [],
+        "clean_target_numerator": [],
+        "clean_target_denominator": [],
+        "clean_target_valid": [],
+        "trigger_lift": [],
         "aa_target_label": [],
         "aa_trigger_type": [],
         "aa_trigger_size": [],
@@ -869,6 +879,8 @@ def run_fedagg_server_client(
 
     start_round_index = 0
     if resume_payload is not None:
+        if training_policy is not None and not isinstance(resume_payload.get("training_state"), dict):
+            raise ValueError("Balanced resume requires saved training state")
         restore_checkpoint(
             resume_payload,
             server_model=server_model,
@@ -876,6 +888,13 @@ def run_fedagg_server_client(
             admission_controller=admission_controller,
             defense_controller=defense_controller,
         )
+        if training_policy is not None:
+            training_state = resume_payload["training_state"]
+            server.restore_training_state(training_state["server"])
+            if len(training_state["clients"]) != len(clients):
+                raise ValueError("Training-state client count mismatch")
+            for client, state in zip(clients, training_state["clients"]):
+                client.restore_training_state(state, proxy_loader)
         saved_metrics = resume_payload.get("metrics_state")
         if not isinstance(saved_metrics, dict):
             raise ValueError("Checkpoint metrics_state is required for resume.")
@@ -910,6 +929,9 @@ def run_fedagg_server_client(
             else None
         )
 
+        round_training_state = (server.snapshot_training_state() if training_policy else None)
+        round_client_training = ([client.snapshot_training_state() for client in clients] if training_policy else None)
+        round_training_rng = capture_rng_state() if training_policy else None
         local_start = time.perf_counter()
         backdoor_records = []
         for client in clients:
@@ -954,6 +976,7 @@ def run_fedagg_server_client(
                 client.upload_proxy_logits(
                     proxy_loader,
                     query_id=query_id,
+                source_round=round_number if training_policy else None,
                 )
             )
         knowledge_by_client = server.receive_client_uploads(
@@ -1070,20 +1093,34 @@ def run_fedagg_server_client(
             trim_fraction=float(aggregation_trim_fraction),
             weights=aggregation_weights,
         )
-        server_updated = server.train_from_teacher_probabilities(
-            aggregated_probabilities,
-            learning_rate=distill_lr,
-            temperature=float(distill_temperature),
-            clean_ce_weight=float(
-                defense_controller.clean_ce_weight()
-                if defense_controller is not None
-                and hasattr(defense_controller, "clean_ce_weight")
-                else clean_ce_weight
-            ),
-        )
+        try:
+            server_updated = server.train_from_teacher_probabilities(
+                aggregated_probabilities,
+                learning_rate=distill_lr,
+                temperature=float(distill_temperature),
+                clean_ce_weight=float(
+                    defense_controller.clean_ce_weight()
+                    if defense_controller is not None
+                    and hasattr(defense_controller, "clean_ce_weight")
+                    else clean_ce_weight
+                ),
+            )
+        except Exception:
+            if training_policy is not None:
+                _restore_model(server.model, round_server_state, device_obj)
+                server.restore_training_state(round_training_state)
+                for client, model_state, state in zip(clients, round_client_states, round_client_training):
+                    _restore_model(client.model, model_state, device_obj)
+                    client.restore_training_state(state, proxy_loader)
+                if round_admission_state is not None:
+                    admission_controller.restore_state(round_admission_state)
+                if round_defense_state is not None:
+                    defense_controller.restore_state(round_defense_state)
+                restore_rng_state(round_training_rng)
+            raise
         broadcast_bytes = 0
         reverse_distillations = 0
-        if enable_client_distillation:
+        if enable_client_distillation and training_policy is None:
             broadcast = server.build_server_broadcast(
                 current_round=round_number,
                 query_id=query_id,
@@ -1115,6 +1152,26 @@ def run_fedagg_server_client(
                 admission_controller.restore_state(round_admission_state)
             if round_defense_state is not None:
                 defense_controller.restore_state(round_defense_state)
+
+        if training_policy is not None:
+            if rollback:
+                server.restore_training_state(round_training_state)
+                for client, state in zip(clients, round_client_training):
+                    client.restore_training_state(state, proxy_loader)
+                restore_rng_state(round_training_rng)
+                server_updated = False
+            diagnostic = server.commit_publication(update_valid=bool(server_updated and not rollback),
+                current_round=round_number, query_id=query_id, enable_reverse=enable_client_distillation)
+            for client in clients:
+                client.cache_server_teacher(server.published_packet, server.publication_weight,
+                                            proxy_loader, float(distill_temperature))
+            broadcast_bytes = (server.published_packet.payload_bytes * len(clients) if server.published_packet else 0)
+            reverse_distillations = sum(int(client.last_numeric_stats.get("client_kd_optimizer_step_count", 0) > 0)
+                                       for client in clients) if not rollback else 0
+            diagnostic["client_optimizer_steps"] = sum(int(client.last_numeric_stats.get("optimizer_step_count", 0)) for client in clients)
+            diagnostic["client_kd_optimizer_steps"] = sum(int(client.last_numeric_stats.get("client_kd_optimizer_step_count", 0)) for client in clients)
+            metrics.setdefault("training_diagnostics", []).append(diagnostic)
+            print("[Training] " + json.dumps(diagnostic, sort_keys=True))
 
         legacy_accuracy, loss, nonfinite_eval = evaluate_with_loss(
             server.model,
@@ -1156,6 +1213,11 @@ def run_fedagg_server_client(
                 "aa_valid": False,
                 "aa_nonfinite_batches": 0,
                 "aa_invalid_reason": "not_applicable_clean_run",
+                "clean_target_rate": float("nan"),
+                "clean_target_numerator": 0,
+                "clean_target_denominator": 0,
+                "clean_target_valid": False,
+                "trigger_lift": float("nan"),
             }
         if enable_backdoor_diagnostics:
             if attack_plan is None:
@@ -1467,6 +1529,11 @@ def run_fedagg_server_client(
         metrics["aa_invalid_reason"].append(
             str(backdoor_eval.get("aa_invalid_reason", ""))
         )
+        for key in ("clean_target_rate", "trigger_lift"):
+            metrics[key].append(float(backdoor_eval[key]))
+        for key in ("clean_target_numerator", "clean_target_denominator"):
+            metrics[key].append(int(backdoor_eval[key]))
+        metrics["clean_target_valid"].append(bool(backdoor_eval["clean_target_valid"]))
         metrics["aa_target_label"].append(
             int(attack_plan.config.target_label) if attack_plan is not None else -1
         )
@@ -1487,6 +1554,9 @@ def run_fedagg_server_client(
             metrics[key].append(float(value))
         metrics["backdoor_client_records"].append(backdoor_records)
 
+        if training_policy is not None:
+            metrics["_training_state"] = {"server": server.snapshot_training_state(),
+                                          "clients": [client.snapshot_training_state() for client in clients]}
         if checkpoint_callback is not None:
             checkpoint_callback(int(round_number), metrics)
 

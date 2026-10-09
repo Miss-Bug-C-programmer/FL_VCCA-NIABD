@@ -24,7 +24,7 @@ class BASRResult:
 
 @dataclass(frozen=True)
 class AccuracyResult:
-    """Finite-evaluation result with an explicit validity state."""
+    """Invalid evaluations have a NaN value; their counts are diagnostic only."""
 
     value: float
     numerator: int
@@ -174,12 +174,12 @@ def evaluate_ta(
         denominator += int(labels.numel())
     valid = denominator > 0 and nonfinite_batches == 0
     return AccuracyResult(
-        value=(float(numerator) / float(denominator) if denominator else float("nan")),
+        value=(float(numerator) / float(denominator) if valid else float("nan")),
         numerator=int(numerator),
         denominator=int(denominator),
         valid=bool(valid),
         nonfinite_batches=int(nonfinite_batches),
-        reason=("nonfinite_logits" if nonfinite_batches else ""),
+        reason=("nonfinite_logits" if nonfinite_batches else "" if valid else "empty_test_set"),
     )
 
 
@@ -243,12 +243,62 @@ def evaluate_aa(
         denominator += int(keep.sum().item())
     valid = denominator > 0 and nonfinite_batches == 0
     return AccuracyResult(
-        value=(float(numerator) / float(denominator) if denominator else float("nan")),
+        value=(float(numerator) / float(denominator) if valid else float("nan")),
         numerator=int(numerator),
         denominator=int(denominator),
         valid=bool(valid),
         nonfinite_batches=int(nonfinite_batches),
-        reason=("nonfinite_logits" if nonfinite_batches else ""),
+        reason=("nonfinite_logits" if nonfinite_batches else "" if valid else "no_eligible_samples"),
+    )
+
+
+@torch.no_grad()
+def evaluate_clean_target_rate(
+    model,
+    dataloader,
+    *,
+    device,
+    target_label: int,
+    amp: bool = False,
+    strict_numeric_checks: bool = False,
+) -> AccuracyResult:
+    """Target predictions on the same non-target test population, without a trigger."""
+
+    model.eval()
+    device_obj = torch.device(device)
+    amp_enabled = bool(amp) and device_obj.type == "cuda"
+    numerator = 0
+    denominator = 0
+    nonfinite_batches = 0
+    for batch in dataloader:
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise ValueError("Clean target-rate evaluation requires labeled test batches.")
+        images, labels = batch[0], batch[1].long()
+        keep = labels != int(target_label)
+        if not bool(keep.any().item()):
+            continue
+        images = images[keep].to(device_obj, non_blocking=True)
+        logits, finite = _evaluation_logits(
+            model,
+            images,
+            device_obj=device_obj,
+            amp_enabled=amp_enabled,
+            strict_numeric_checks=bool(strict_numeric_checks),
+        )
+        if not finite:
+            nonfinite_batches += 1
+        if logits is None:
+            continue
+        numerator += int((logits.argmax(dim=1) == int(target_label)).sum().item())
+        denominator += int(keep.sum().item())
+    valid = denominator > 0 and nonfinite_batches == 0
+    return AccuracyResult(
+        value=(float(numerator) / float(denominator) if valid else float("nan")),
+        numerator=int(numerator),
+        denominator=int(denominator),
+        valid=bool(valid),
+        nonfinite_batches=int(nonfinite_batches),
+        reason=("nonfinite_logits" if nonfinite_batches else "" if valid else "no_eligible_samples"),
     )
 
 
@@ -275,8 +325,20 @@ def evaluate_backdoor_suite(
         "aa_valid": False,
         "aa_nonfinite_batches": 0,
         "aa_invalid_reason": "",
+        "clean_target_rate": float("nan"),
+        "clean_target_numerator": 0,
+        "clean_target_denominator": 0,
+        "clean_target_valid": False,
+        "trigger_lift": float("nan"),
     }
     if plan.config.attack_type == "none":
+        result["aa_invalid_reason"] = "not_applicable_clean_run"
+        return result
+    # Round metrics measure the attacked model after poisoning has begun.
+    # Pre-onset triggered diagnostics are available through evaluate_aa, but
+    # must not be presented as FL attack-phase AA or cause test-trigger work.
+    if int(round_number) < int(plan.config.attack_start_round):
+        result["aa_invalid_reason"] = "attack_not_started"
         return result
     global_result = evaluate_aa(
         model,
@@ -295,6 +357,27 @@ def evaluate_backdoor_suite(
         "aa_valid": bool(global_result.valid),
         "aa_nonfinite_batches": int(global_result.nonfinite_batches),
         "aa_invalid_reason": str(global_result.reason),
+    })
+    clean_result = evaluate_clean_target_rate(
+        model,
+        dataloader,
+        device=device,
+        target_label=int(plan.config.target_label),
+        amp=bool(amp),
+        strict_numeric_checks=bool(strict_numeric_checks),
+    )
+    result.update({
+        "clean_target_rate": float(clean_result.value),
+        "clean_target_numerator": int(clean_result.numerator),
+        "clean_target_denominator": int(clean_result.denominator),
+        "clean_target_valid": bool(clean_result.valid),
+        "trigger_lift": (
+            float(global_result.value - clean_result.value)
+            if global_result.valid
+            and clean_result.valid
+            and global_result.denominator == clean_result.denominator
+            else float("nan")
+        ),
     })
     if plan.config.attack_type == "dba":
         for part in range(4):

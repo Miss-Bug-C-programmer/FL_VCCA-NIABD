@@ -18,7 +18,7 @@ from admission import (
 from numeric_integrity import require_finite_tensor
 
 
-VCAA_ALGORITHM_VERSION = "vcaa-v5-lineage-content-admission-runtime-age"
+VCAA_ALGORITHM_VERSION = "vcaa-v9-proxy-information-calibrated-content"
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
 _ROBUST_MAD_SCALE = 1.4826
 
@@ -42,6 +42,8 @@ class VCAAConfig:
     accuracy_weight: float = 0.5
     entropy_weight: float = 0.25
     divergence_weight: float = 0.25
+    student_agreement_weight: float = 0.0
+    student_agreement_scale: float = 0.10
     accuracy_scale: float = 1.0
     entropy_scale: Optional[float] = None
     divergence_scale: float = 1.0
@@ -87,6 +89,12 @@ class VCAAConfig:
             raise ValueError("VCAA content weights must be non-negative.")
         if not math.isclose(sum(weights), 1.0, abs_tol=1e-6):
             raise ValueError("VCAA content weights must sum to 1.")
+        if not 0.0 <= float(self.student_agreement_weight) < 1.0:
+            raise ValueError("student_agreement_weight must be in [0, 1).")
+        if not math.isfinite(float(self.student_agreement_scale)) or float(
+            self.student_agreement_scale
+        ) <= 0.0:
+            raise ValueError("student_agreement_scale must be finite and positive.")
         if float(self.accuracy_scale) <= 0.0:
             raise ValueError("accuracy_scale must be positive.")
         if self.entropy_scale is not None and float(self.entropy_scale) <= 0.0:
@@ -190,9 +198,11 @@ class VersionContentAwareAdmission:
         config: Optional[VCAAConfig] = None,
         *,
         clock=time.monotonic,
+        synchronous_cohort: bool = False,
     ) -> None:
         self.config = config or VCAAConfig()
         self._clock = clock
+        self._synchronous_cohort = bool(synchronous_cohort)
         self._history: Deque[Tuple[int, Tuple[float, ...]]] = deque(
             maxlen=int(self.config.history_window_rounds)
         )
@@ -258,6 +268,7 @@ class VersionContentAwareAdmission:
             ],
             "algorithm_version": self.algorithm_version,
             "result_schema_version": self.result_schema_version,
+            "synchronous_cohort": self._synchronous_cohort,
             "effective_age_half_life_s": float(self._effective_age_half_life_s),
             "effective_max_knowledge_age_s": float(
                 self._effective_max_knowledge_age_s
@@ -271,6 +282,8 @@ class VersionContentAwareAdmission:
     def restore_state(self, state: dict) -> None:
         if str(state.get("algorithm_version")) != self.algorithm_version:
             raise ValueError("VCAA snapshot algorithm version mismatch.")
+        if bool(state.get("synchronous_cohort")) != self._synchronous_cohort:
+            raise ValueError("VCAA snapshot runtime mode mismatch.")
         history = state.get("history")
         if not isinstance(history, list):
             raise ValueError("VCAA snapshot history is invalid.")
@@ -377,8 +390,15 @@ class VersionContentAwareAdmission:
                     timestamp_reason = "invalid_timestamp_order"
 
             age_valid = bool(timestamp_valid)
+            validity_age = (
+                transport_age
+                if self._synchronous_cohort
+                and raw_lag == 0
+                and math.isfinite(transport_age)
+                else knowledge_age
+            )
             if math.isfinite(knowledge_age):
-                if knowledge_age > float(self._effective_max_knowledge_age_s) + float(
+                if validity_age > float(self._effective_max_knowledge_age_s) + float(
                     self.config.epsilon
                 ):
                     age_valid = False
@@ -404,8 +424,15 @@ class VersionContentAwareAdmission:
                 if raw_lag >= 0
                 else 0.0
             )
+            # In a synchronous round all current-round packets are consumed
+            # together. Their different queue ages reflect upload order, not
+            # different model versions. Keep real age for validity and audit,
+            # but do not make upload order a soft aggregation signal.
+            weighting_age_score = (
+                1.0 if self._synchronous_cohort and raw_lag == 0 else age_score
+            )
             freshness_score = (
-                version_lag_score * age_score
+                version_lag_score * weighting_age_score
                 if absolute_valid and age_valid
                 else 0.0
             )
@@ -418,6 +445,10 @@ class VersionContentAwareAdmission:
                         version_lag_score if absolute_valid else 0.0
                     ),
                     "age_score": float(age_score if age_valid else 0.0),
+                    "validity_age_seconds": float(validity_age),
+                    "weighting_age_score": float(
+                        weighting_age_score if age_valid else 0.0
+                    ),
                     "freshness_score": float(freshness_score),
                     "age_seconds": float(knowledge_age),
                     "knowledge_age_s": float(knowledge_age),
@@ -516,6 +547,14 @@ class VersionContentAwareAdmission:
         ).sum(dim=2).clamp_min(0.0).mean(dim=1)
         predictions = teacher_probabilities.argmax(dim=2)
         accuracy = (predictions == labels.view(1, -1)).float().mean(dim=1)
+        student_accuracy = float(
+            (student.argmax(dim=1) == labels).float().mean().item()
+        )
+        teacher_accuracy_center = float(torch.median(accuracy).item())
+        student_agreement_active = (
+            student_accuracy > 1.0 / float(student.shape[1])
+            and student_accuracy >= teacher_accuracy_center
+        )
         entropy_normalized = torch.exp(
             -((entropies - entropy_center).abs() / entropy_scale)
         )
@@ -530,6 +569,14 @@ class VersionContentAwareAdmission:
                     / entropy_scale
                 ),
                 "mean_kl": float(student_kl[index].item()),
+                "student_proxy_accuracy": student_accuracy,
+                "student_agreement_active": student_agreement_active,
+                "student_agreement_term": float(
+                    torch.exp(
+                        -student_kl[index]
+                        / float(self.config.student_agreement_scale)
+                    ).item()
+                ),
                 "consensus_divergence": float(js[index].item()),
                 "num_classes": float(num_classes),
                 "accuracy_term": float(
@@ -559,6 +606,38 @@ class VersionContentAwareAdmission:
         if not math.isfinite(float(score)):
             raise ValueError("VCAA content score must be finite.")
         return max(0.0, min(1.0, float(score)))
+
+    @staticmethod
+    def _content_is_resolved(
+        content_stats: Sequence[Dict[str, float]],
+        *,
+        proxy_count: int,
+        num_classes: int,
+    ) -> bool:
+        """Require cohort proxy responses to carry resolvable class information.
+
+        A near-uniform cohort can have a well-defined rank and MAD while its
+        class predictions are effectively uninformative. In that situation a
+        historical content gate preferentially drops harmless non-IID drift.
+        Compare the cohort median entropy deficit with the finite-proxy
+        resolution 1/sqrt(P); neither attack identity nor test data is used.
+        """
+
+        if not content_stats or num_classes < 2 or proxy_count < 1:
+            return False
+        maximum_entropy = math.log(float(num_classes))
+        normalized_information = statistics.median(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (maximum_entropy - float(item["mean_entropy"]))
+                    / maximum_entropy,
+                ),
+            )
+            for item in content_stats
+        )
+        return normalized_information > 1.0 / math.sqrt(float(proxy_count))
 
     @staticmethod
     def _robust_scale(values: Sequence[float]) -> float:
@@ -693,12 +772,25 @@ class VersionContentAwareAdmission:
         threshold, gate_active, threshold_source, history_observations = (
             self._historical_threshold(int(current_round))
         )
+        content_resolved = self._content_is_resolved(
+            valid_content,
+            proxy_count=int(student_logits.shape[0]),
+            num_classes=int(student_logits.shape[1]),
+        )
+        if valid_content and not content_resolved and not gate_active:
+            threshold = float("nan")
+            gate_active = False
+            threshold_source = "insufficient_proxy_information"
+        content_calibrated = bool(content_resolved or gate_active)
         warmup = int(current_round) <= int(self.config.warmup_rounds)
         empty_content = {
             "proxy_accuracy": float("nan"),
             "mean_entropy": float("nan"),
             "entropy_deviation": float("nan"),
             "mean_kl": float("nan"),
+            "student_proxy_accuracy": float("nan"),
+            "student_agreement_active": False,
+            "student_agreement_term": float("nan"),
             "consensus_divergence": float("nan"),
             "num_classes": float("nan"),
             "accuracy_term": float("nan"),
@@ -718,13 +810,18 @@ class VersionContentAwareAdmission:
                 else float("nan")
             )
             if hard_valid:
-                reliability, score_z, weighting_mode = self._content_reliability(
-                    score=content_score,
-                    center=content_center,
-                    scale=content_scale,
-                    warmup=warmup,
-                    cohort_size=len(valid_content),
-                )
+                if content_calibrated:
+                    reliability, score_z, weighting_mode = self._content_reliability(
+                        score=content_score,
+                        center=content_center,
+                        scale=content_scale,
+                        warmup=warmup,
+                        cohort_size=len(valid_content),
+                    )
+                else:
+                    reliability = 1.0
+                    score_z = 0.0
+                    weighting_mode = "insufficient_proxy_information_uniform"
                 if gate_active:
                     content_valid = content_score >= float(threshold) - float(
                         self.config.epsilon
@@ -736,12 +833,28 @@ class VersionContentAwareAdmission:
                     content_valid = True
                     content_rejection_reason = f"gate_inactive_{threshold_source}"
                 freshness = float(version["freshness_score"])
+                # Student agreement is a bounded corroborating weight, never
+                # an admission gate: a weak or drifting student must not
+                # remove non-IID teachers from either VCAA or NIABD's cohort.
+                student_weight_factor = 1.0
+                if (
+                    not warmup
+                    and len(valid_content) >= int(self.config.minimum_content_cohort_size)
+                    and bool(content_stats.get("student_agreement_active", False))
+                ):
+                    student_weight = float(self.config.student_agreement_weight)
+                    student_weight_factor = (
+                        1.0 - student_weight
+                        + student_weight
+                        * float(content_stats["student_agreement_term"])
+                    )
                 raw_weight = (
                     freshness
                     * (
                         float(self.config.version_weight)
                         + (1.0 - float(self.config.version_weight)) * reliability
                     )
+                    * student_weight_factor
                     if content_valid
                     else 0.0
                 )
@@ -753,6 +866,7 @@ class VersionContentAwareAdmission:
                     str(weighting_mode),
                 )
             else:
+                student_weight_factor = float("nan")
                 reliability = float("nan")
                 score_z = float("nan")
                 weighting_mode = "hard_invalid"
@@ -778,6 +892,7 @@ class VersionContentAwareAdmission:
                 "content_threshold_source": str(threshold_source),
                 "content_history_observations": int(history_observations),
                 "vcaa_content_reliability": float(reliability),
+                "vcaa_student_weight_factor": float(student_weight_factor),
                 "vcaa_aggregation_weight": float(raw_weight),
                 "normalized_aggregation_weight": 0.0,
                 "effective_weight_ratio_to_uniform": 0.0,
@@ -832,7 +947,15 @@ class VersionContentAwareAdmission:
             and math.isfinite(float(record.components["content_score"]))
         ]
         if history_scores:
-            self._history.append((int(current_round), tuple(history_scores)))
+            # Empty slots age out a formerly informative history in *rounds*,
+            # rather than keeping its admission threshold indefinitely while
+            # the current cohort has no resolvable proxy information.
+            self._history.append(
+                (
+                    int(current_round),
+                    tuple(history_scores) if content_resolved else (),
+                )
+            )
         total_weight = sum(raw_weights.values())
         normalized_weights: Dict[int, float] = {}
         if raw_weights:

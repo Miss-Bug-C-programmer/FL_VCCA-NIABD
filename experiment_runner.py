@@ -38,6 +38,7 @@ from model_factory import build_model, build_models, dataset_spec
 from model_factory import architecture_assignment_hash, model_parameter_count
 from method_switches import resolve_method_switches, strategy_name
 from federated_runtime import run_fedagg_server_client
+from trainer import TrainingPolicy
 from niabd import NIABDConfig, NeuroInspiredAdaptiveBackdoorDefense
 from process_runtime import (
     ProcessRuntimeConfig,
@@ -51,9 +52,11 @@ from runtime_trace import (
 from vcaa import VCAAConfig, VersionContentAwareAdmission
 from result_schema import (
     AGGREGATION_ALGORITHM_VERSION,
+    EVALUATION_METRIC_POLICY_VERSION,
     NIABD_ALGORITHM_VERSION,
     RESULT_SCHEMA_VERSION,
     VCAA_ALGORITHM_VERSION,
+    mask_invalid_accuracy_record,
     write_schema,
 )
 
@@ -395,7 +398,7 @@ def _round_rows(
         )
         if row_schema_version in {None, "", "nan"}:
             row_schema_version = lineage["result_schema_version"]
-        yield {
+        row = {
             "run_uid": run_uid,
             "dataset": dataset_name,
             "seed": int(seed),
@@ -499,16 +502,20 @@ def _round_rows(
             "ta_denominator": int(
                 _metric(metrics, "ta_denominator", round_idx, 0)
             ),
-            "ta_valid": bool(
-                _metric(
+            "ta_valid": _metric(
                     metrics,
                     "ta_valid",
                     round_idx,
                     pd.notna(_metric(metrics, "acc_list", round_idx, np.nan)),
-                )
             ),
             "ta_nonfinite_batches": int(
                 _metric(metrics, "ta_nonfinite_batches", round_idx, 0)
+            ),
+            "ta_invalid_reason": str(
+                _metric(metrics, "ta_invalid_reason", round_idx,
+                        "nonfinite_logits" if _metric(metrics, "ta_nonfinite_batches", round_idx, 0)
+                        else "empty_test_set" if _metric(metrics, "ta_valid", round_idx, True) is False
+                        else "")
             ),
             "ta_test_dataset_identity": str(
                 _metric(metrics, "ta_test_dataset_identity", round_idx, "")
@@ -537,19 +544,32 @@ def _round_rows(
                     _metric(metrics, "basr_global_denominator", round_idx, 0),
                 )
             ),
-            "aa_valid": bool(
-                _metric(
+            "aa_valid": _metric(
                     metrics,
                     "aa_valid",
                     round_idx,
                     pd.notna(_metric(metrics, "basr_global", round_idx, np.nan)),
-                )
             ),
             "aa_nonfinite_batches": int(
                 _metric(metrics, "aa_nonfinite_batches", round_idx, 0)
             ),
             "aa_invalid_reason": str(
                 _metric(metrics, "aa_invalid_reason", round_idx, "")
+            ),
+            "clean_target_rate": float(
+                _metric(metrics, "clean_target_rate", round_idx, np.nan)
+            ),
+            "clean_target_numerator": int(
+                _metric(metrics, "clean_target_numerator", round_idx, 0)
+            ),
+            "clean_target_denominator": int(
+                _metric(metrics, "clean_target_denominator", round_idx, 0)
+            ),
+            "clean_target_valid": bool(
+                _metric(metrics, "clean_target_valid", round_idx, False)
+            ),
+            "trigger_lift": float(
+                _metric(metrics, "trigger_lift", round_idx, np.nan)
             ),
             "aa_target_label": int(
                 _metric(metrics, "aa_target_label", round_idx,
@@ -1046,6 +1066,8 @@ def _round_rows(
                 )
             ),
         }
+        row["evaluation_metric_policy_version"] = EVALUATION_METRIC_POLICY_VERSION
+        yield mask_invalid_accuracy_record(row)
 
 
 def _summary_row(
@@ -1054,8 +1076,13 @@ def _summary_row(
 ) -> dict:
     if not rows:
         raise ValueError("Cannot summarize an empty run.")
+    rows = [mask_invalid_accuracy_record(row) for row in rows]
     last = rows[-1]
     is_process = str(last["runtime"]).lower() == PROCESS_RUNTIME
+
+    def best_finite(key: str):
+        values = [float(row[key]) for row in rows if pd.notna(row.get(key))]
+        return max(values) if values else np.nan
 
     def process_total(keys: str | tuple[str, ...]):
         if not is_process:
@@ -1120,8 +1147,8 @@ def _summary_row(
         "rounds": len(rows),
         "final_accuracy": last["accuracy"],
         "final_ta": last.get("ta", last["accuracy"]),
-        "best_ta": max(float(row["ta"]) for row in rows),
-        "best_accuracy": max(float(row["accuracy"]) for row in rows),
+        "best_ta": best_finite("ta"),
+        "best_accuracy": best_finite("accuracy"),
         "final_loss": last["loss"],
         "wall_clock_time_s": last["wall_clock_time_s"],
         "total_client_upload_bytes": sum(
@@ -1259,8 +1286,9 @@ def _summary_row(
         )
         peak_index = int(np.argmax(attack_values))
         contiguous = bool(
-            len(attack_rounds) == 1
-            or np.all(np.diff(attack_rounds.astype(int)) == 1)
+            len(attack_rows) == sum(int(row.get("attack_active", 0)) == 1 for row in rows)
+            and (len(attack_rounds) == 1
+                 or np.all(np.diff(attack_rounds.astype(int)) == 1))
         )
         summary.update({
             "peak_attack_window_basr": float(attack_values[peak_index]),
@@ -1373,6 +1401,19 @@ def _summary_row(
         "git_dirty": last.get("git_dirty", "unavailable"),
         "config_sha256": last.get("config_sha256", ""),
         "runtime_profile_sha256": last.get("runtime_profile_sha256", ""),
+        "evaluation_metric_policy_version": EVALUATION_METRIC_POLICY_VERSION,
+        "final_ta_valid": bool(pd.notna(last.get("ta", last["accuracy"]))),
+        "final_ta_numerator": last.get("ta_numerator", 0),
+        "final_ta_denominator": last.get("ta_denominator", 0),
+        "final_ta_nonfinite_batches": last.get("ta_nonfinite_batches", 0),
+        "final_ta_invalid_reason": last.get("ta_invalid_reason", ""),
+        "final_aa_valid": bool(pd.notna(last.get("aa", last.get("basr_global", np.nan)))),
+        "final_aa_numerator": last.get("aa_numerator", 0),
+        "final_aa_denominator": last.get("aa_denominator", 0),
+        "final_aa_nonfinite_batches": last.get("aa_nonfinite_batches", 0),
+        "final_aa_invalid_reason": last.get("aa_invalid_reason", ""),
+        "ta_valid_rounds": sum(pd.notna(row.get("ta", row["accuracy"])) for row in rows),
+        "aa_valid_rounds": sum(pd.notna(row.get("aa", row.get("basr_global", np.nan))) for row in rows),
     })
     return summary
 
@@ -1791,6 +1832,7 @@ def _make_checkpoint_callback(
             },
             manifest_identity={"manifest_sha256": str(config_hash)},
             metrics_state=current_metrics,
+            training_state=current_metrics.get("_training_state"),
         )
         checkpoint_sha256 = save_checkpoint_atomic(payload, checkpoint_path)
         current_metrics.setdefault("checkpoint_path", []).append(
@@ -1854,6 +1896,7 @@ def run_experiment(
     checkpoint_every_rounds: int = 0,
     checkpoint_dir: str = "",
     resume_from_checkpoint: str = "",
+    training_policy: TrainingPolicy | None = None,
 ) -> None:
     _validate_method_aggregation_compatibility(
         enable_vcaa=bool(enable_vcaa),
@@ -1949,10 +1992,15 @@ def run_experiment(
         "vcaa_algorithm_version": (
             VCAA_ALGORITHM_VERSION if enable_vcaa else "none"
         ),
+        "niabd_algorithm_version": (
+            NIABD_ALGORITHM_VERSION if enable_niabd else "none"
+        ),
         "vcaa_config": asdict(vcaa_config) if enable_vcaa else None,
         "age_scale_mode": str(vcaa_config.age_scale_mode) if enable_vcaa else "none",
         "freshness_runtime_semantics": (
-            "server-observed-generated-received-consumed-lineage"
+            "synchronous-cohort-transport-age-validity"
+            if runtime == "sync"
+            else "server-observed-generated-received-consumed-lineage"
         ),
         "amp_enabled": bool(amp),
         "max_consecutive_amp_overflows": int(
@@ -1960,7 +2008,9 @@ def run_experiment(
             if process_config is not None
             else 8
         ),
-        "formal_config_unchanged": True,
+        "formal_config_unchanged": training_policy is None,
+        "training_policy_version": "fedagg-training-balanced-v2" if training_policy else "legacy",
+        "training_policy": asdict(training_policy) if training_policy else None,
     }
     manifest_bytes = json.dumps(
         manifest, sort_keys=True, ensure_ascii=False
@@ -2207,7 +2257,8 @@ def run_experiment(
                         )
                     if enable_vcaa:
                         admission_controller = VersionContentAwareAdmission(
-                            vcaa_config
+                            vcaa_config,
+                            synchronous_cohort=(runtime == "sync"),
                         )
                     if enable_niabd:
                         defense_controller = (
@@ -2269,6 +2320,7 @@ def run_experiment(
                                 enable_backdoor_diagnostics
                             ),
                             backdoor_diagnostics_dataset=dataset_name,
+                            training_policy=training_policy,
                         )
                         metrics.update({
                             "runtime": "sync",
@@ -2307,8 +2359,13 @@ def run_experiment(
                                 clean_ce_weight=float(clean_ce_weight),
                                 checkpoint_callback=checkpoint_callback,
                                 attack_plan=attack_plan,
+                                training_policy=training_policy,
                             )
                         )
+                    if training_policy is not None:
+                        Path(outdir, f"{run_uid}_training_diagnostics.json").write_text(
+                            json.dumps({"policy": asdict(training_policy), "rounds": metrics.get("training_diagnostics", [])},
+                                       ensure_ascii=False, indent=2), encoding="utf-8")
                     strategy = _strategy_name(
                         enable_vcaa,
                         enable_niabd,
@@ -2730,6 +2787,8 @@ def main() -> None:
         type=float,
         default=0.25,
     )
+    parser.add_argument("--vcaa-student-agreement-weight", type=float, default=0.0)
+    parser.add_argument("--vcaa-student-agreement-scale", type=float, default=0.10)
     parser.add_argument("--vcaa-accuracy-scale", type=float, default=1.0)
     parser.add_argument(
         "--vcaa-entropy-scale",
@@ -2793,7 +2852,7 @@ def main() -> None:
     parser.add_argument(
         "--niabd-warmup-rounds",
         type=int,
-        default=1,
+        default=5,
     )
     parser.add_argument(
         "--niabd-min-standard-deviation",
@@ -2875,7 +2934,7 @@ def main() -> None:
     parser.add_argument("--niabd-reference-clip-z", type=float, default=2.0)
     parser.add_argument("--niabd-normal-memory-lr", type=float, default=0.0)
     parser.add_argument("--niabd-suspicious-memory-lr", type=float, default=0.0)
-    parser.add_argument("--niabd-recovery-memory-lr", type=float, default=0.20)
+    parser.add_argument("--niabd-recovery-memory-lr", type=float, default=0.02)
     parser.add_argument("--niabd-clean-ce-weight-normal", type=float, default=0.05)
     parser.add_argument("--niabd-clean-ce-weight-suspicious", type=float, default=0.10)
     parser.add_argument("--niabd-clean-ce-weight-recovery", type=float, default=0.20)
@@ -2923,7 +2982,22 @@ def main() -> None:
     parser.add_argument("--checkpoint-every-rounds", type=int, default=0)
     parser.add_argument("--checkpoint-dir", default="")
     parser.add_argument("--resume-from-checkpoint", default="")
+    parser.add_argument("--training-policy", choices=["legacy", "balanced"], default="balanced")
+    parser.add_argument("--server-distill-lr", type=float, default=0.01)
+    parser.add_argument("--server-distill-momentum", type=float, default=0.9)
+    parser.add_argument("--server-distill-epochs", type=int, default=5)
+    parser.add_argument("--maximum-clean-ce-weight", type=float, default=0.20)
+    parser.add_argument("--client-kd-weight", type=float, default=0.1)
+    parser.add_argument("--client-kd-warmup-updates", type=int, default=10)
+    parser.add_argument("--client-kd-ramp-updates", type=int, default=10)
+    parser.add_argument("--maximum-tracking-kl", type=float, default=0.05)
     args = parser.parse_args()
+    training_policy = (TrainingPolicy(server_lr=args.server_distill_lr,
+        server_momentum=args.server_distill_momentum, server_epochs=args.server_distill_epochs,
+        maximum_clean_ce_weight=args.maximum_clean_ce_weight,
+        client_kd_max_weight=args.client_kd_weight, reverse_warmup_updates=args.client_kd_warmup_updates,
+        reverse_ramp_updates=args.client_kd_ramp_updates, maximum_tracking_kl=args.maximum_tracking_kl)
+        if args.training_policy == "balanced" else None)
 
     switches = resolve_method_switches(
         args.method,
@@ -3054,6 +3128,8 @@ def main() -> None:
         accuracy_weight=args.vcaa_accuracy_weight,
         entropy_weight=args.vcaa_entropy_weight,
         divergence_weight=args.vcaa_divergence_weight,
+        student_agreement_weight=args.vcaa_student_agreement_weight,
+        student_agreement_scale=args.vcaa_student_agreement_scale,
         accuracy_scale=args.vcaa_accuracy_scale,
         entropy_scale=(
             None
@@ -3163,6 +3239,7 @@ def main() -> None:
         aggregation_rule=args.aggregation_rule,
         aggregation_trim_fraction=args.aggregation_trim_fraction,
         clean_ce_weight=args.clean_ce_weight,
+        training_policy=training_policy,
         server_architecture=args.server_architecture,
         client_architectures=(
             _parse_str_list(args.client_architectures)

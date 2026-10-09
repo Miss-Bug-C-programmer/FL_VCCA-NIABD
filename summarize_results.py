@@ -6,6 +6,8 @@ import os
 
 import pandas as pd
 
+from result_schema import mask_invalid_accuracy_frame
+
 
 GROUP_COLUMNS = [
     "dataset",
@@ -62,13 +64,16 @@ def summarize(indir: str) -> pd.DataFrame:
         raise FileNotFoundError(
             f"No fedagg_run_summary_*.csv files found in {indir!r}."
         )
-    frame = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
-    # Historical summaries predate the TA/AA names; aliases are populated
-    # only when the new columns are absent, never by changing their meaning.
-    if "final_ta" not in frame.columns and "final_accuracy" in frame.columns:
-        frame["final_ta"] = frame["final_accuracy"]
-    if "final_aa" not in frame.columns:
-        frame["final_aa"] = frame.get("final_basr_global", float("nan"))
+    frames = []
+    for path in paths:
+        source = pd.read_csv(path)
+        # Resolve aliases per file before concatenating old/new schema rows.
+        if "final_ta" not in source.columns and "final_accuracy" in source.columns:
+            source["final_ta"] = source["final_accuracy"]
+        if "final_aa" not in source.columns:
+            source["final_aa"] = source.get("final_basr_global", float("nan"))
+        frames.append(mask_invalid_accuracy_frame(source))
+    frame = pd.concat(frames, ignore_index=True)
     missing = [
         column
         for column in [*GROUP_COLUMNS, *METRIC_COLUMNS]
@@ -85,6 +90,7 @@ def summarize(indir: str) -> pd.DataFrame:
         for metric in METRIC_COLUMNS:
             values = pd.to_numeric(group[metric], errors="coerce")
             observed = values.dropna()
+            row[f"{metric}_n"] = int(len(observed))
             row[f"{metric}_mean"] = (
                 float(observed.mean()) if not observed.empty else float("nan")
             )

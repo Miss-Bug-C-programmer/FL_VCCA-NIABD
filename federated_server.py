@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import time
+import copy
+import math
+from dataclasses import asdict
+import torch.nn.functional as F
 from dataclasses import replace
 from typing import Dict, Optional, Sequence
 
@@ -15,7 +19,9 @@ from admission import (
 )
 from defense import DefenseResult, KnowledgeDefenseController
 from logits_transport import ClientLogitsPacket, ServerLogitsPacket
-from trainer import distill_with_logits, predict_logits
+from trainer import TrainingPolicy, distill_with_logits, predict_logits, scaler_state_dict, restore_scaler_state
+from device_utils import make_grad_scaler, use_amp_for_device
+from numeric_integrity import require_finite_tensor
 from robust_aggregation import aggregate_probabilities
 
 
@@ -30,18 +36,88 @@ class FederatedServer:
         device,
         amp: bool = False,
         strict_numeric_checks: bool = False,
+        training_policy: Optional[TrainingPolicy] = None,
     ) -> None:
         self.model = model
         self.proxy_loader = proxy_loader
         self.device = device
         self.amp = bool(amp)
         self.strict_numeric_checks = bool(strict_numeric_checks)
+        self.training_policy = training_policy
+        self.distill_optimizer = (torch.optim.SGD(model.parameters(), lr=training_policy.server_lr,
+                                                 momentum=training_policy.server_momentum)
+                                  if training_policy else None)
+        self.distill_scaler = (make_grad_scaler(device, enabled=self.amp and use_amp_for_device(device))
+                              if training_policy else None)
+        self.effective_updates = 0
+        self.published_packet, self.publication_weight = None, 0.0
+        self.last_training_diagnostics = {}
         self._proxy_labels = self._collect_proxy_labels(proxy_loader)
         # The admission decision and defense are sequential stages of one
         # server round.  Cache only the hard-valid calibration cohort for that
         # same round; it is never an aggregation authorization.
         self._defense_reference_round: Optional[int] = None
         self._defense_reference_ids: tuple[int, ...] = ()
+
+    def snapshot_training_state(self):
+        return copy.deepcopy({"version": "fedagg-training-balanced-v1",
+            "policy": asdict(self.training_policy) if self.training_policy else None,
+            "optimizer": self.distill_optimizer.state_dict() if self.distill_optimizer else None,
+            "scaler": scaler_state_dict(self.distill_scaler) if self.distill_scaler else None,
+            "effective_updates": self.effective_updates, "packet": self.published_packet,
+            "weight": self.publication_weight})
+
+    def restore_training_state(self, state):
+        if state.get("version") != "fedagg-training-balanced-v1" or state.get("policy") != asdict(self.training_policy):
+            raise ValueError("Balanced training checkpoint policy mismatch")
+        self.distill_optimizer.load_state_dict(state["optimizer"])
+        restore_scaler_state(self.distill_scaler, state["scaler"])
+        self.effective_updates = int(state["effective_updates"])
+        self.published_packet, self.publication_weight = state["packet"], float(state["weight"])
+
+    def _tracking_statistics(self, target, temperature):
+        logits, q = self.student_proxy_logits().float(), target.detach().cpu().float()
+        require_finite_tensor(q, phase="training", metric="tracking_target")
+        if logits.shape != q.shape or bool((q < 0).any()) or bool((q.sum(1) <= 0).any()):
+            raise ValueError("Tracking requires aligned, valid probabilities")
+        q = q / q.sum(1, keepdim=True)
+        kl = float(F.kl_div(F.log_softmax(logits / temperature, dim=1), q, reduction="batchmean").clamp_min(0))
+        entropy = float(-(q * q.clamp_min(1e-12).log()).sum(1).mean())
+        return {"kl": kl, "teacher_information": math.log(q.shape[1]) - entropy,
+                "teacher_predicted_classes": int(q.argmax(1).unique().numel()),
+                "student_predicted_classes": int(logits.argmax(1).unique().numel())}
+
+    def commit_publication(self, *, update_valid, current_round, query_id, proxy_version="", enable_reverse=True):
+        self.published_packet, self.publication_weight = None, 0.0
+        if update_valid:
+            self.effective_updates += 1
+        row = dict(self.last_training_diagnostics)
+        row.update(round=int(current_round), committed=bool(update_valid),
+                   effective_updates=self.effective_updates, allow_reverse=False,
+                   kd_weight=0.0, publication_model_round=None)
+        policy = self.training_policy
+        reason = "reverse_disabled" if update_valid and not enable_reverse else "no_valid_update"
+        if update_valid and enable_reverse:
+            if self.effective_updates <= policy.reverse_warmup_updates:
+                reason = "warmup"
+            elif row["teacher_information"] <= 1e-4 or min(row["teacher_predicted_classes"], row["student_predicted_classes"]) < 2:
+                reason = "uninformative_or_collapsed"
+            elif row["tracking_kl_after"] > policy.maximum_tracking_kl or row["tracking_kl_after"] > row["tracking_kl_before"] + 1e-6:
+                reason = "student_not_tracking"
+            else:
+                fraction = (1.0 if policy.reverse_ramp_updates == 0 else
+                            min(1.0, (self.effective_updates - policy.reverse_warmup_updates) / policy.reverse_ramp_updates))
+                self.publication_weight = policy.client_kd_max_weight * fraction
+                reason = "ready" if self.publication_weight > 0 else "reverse_disabled"
+                if self.publication_weight > 0:
+                    self.published_packet = ServerLogitsPacket.from_logits(
+                        model_round=int(current_round), query_id=str(query_id),
+                        proxy_version=str(proxy_version), logits=self.student_proxy_logits())
+                    row.update(allow_reverse=True, kd_weight=self.publication_weight,
+                               publication_model_round=int(current_round))
+        row["reason"] = reason
+        self.last_training_diagnostics = row
+        return row
 
     @staticmethod
     def _collect_proxy_labels(proxy_loader) -> torch.Tensor:
@@ -284,29 +360,68 @@ class FederatedServer:
         return True
 
     def train_from_teacher_probabilities(
-        self,
-        target_probabilities: Optional[torch.Tensor],
-        *,
-        learning_rate: float,
-        temperature: float,
-        clean_ce_weight: float = 0.0,
+        self, target_probabilities: Optional[torch.Tensor], *, learning_rate: float,
+        temperature: float, clean_ce_weight: float = 0.0,
     ) -> bool:
+        self.last_training_diagnostics = {"optimizer_steps": 0, "tracking_kl_before": None,
+                                          "tracking_kl_after": None}
         if target_probabilities is None:
             return False
-        distill_with_logits(
-            self.model,
-            self.proxy_loader,
-            target_probabilities,
-            device=self.device,
-            lr=float(learning_rate),
-            epochs=1,
-            temperature=float(temperature),
-            amp=self.amp,
-            strict_numeric_checks=self.strict_numeric_checks,
-            targets_are_probabilities=True,
-            clean_ce_weight=float(clean_ce_weight),
-        )
-        return True
+        target, stats = target_probabilities.detach().clone(), {}
+        effective_clean_ce_weight = float(clean_ce_weight)
+        if self.training_policy is not None and int(target.shape[1]) > 1:
+            # Uniform soft targets have little class information. Preserve KD,
+            # and increase the existing labeled-proxy CE anchor only in
+            # proportion to the information missing from this round's target.
+            probabilities = target.float().clamp_min(1e-12)
+            probabilities = probabilities / probabilities.sum(
+                dim=1, keepdim=True
+            ).clamp_min(1e-12)
+            maximum_information = math.log(int(target.shape[1]))
+            information = maximum_information + float(
+                (probabilities * probabilities.log()).sum(dim=1).mean().item()
+            )
+            information_fraction = max(
+                0.0, min(1.0, information / maximum_information)
+            )
+            ceiling = max(
+                effective_clean_ce_weight,
+                float(self.training_policy.maximum_clean_ce_weight),
+            )
+            effective_clean_ce_weight += (
+                ceiling - effective_clean_ce_weight
+            ) * (1.0 - information_fraction)
+            self.last_training_diagnostics[
+                "teacher_information_before_training"
+            ] = information
+        self.last_training_diagnostics[
+            "effective_clean_ce_weight"
+        ] = effective_clean_ce_weight
+        state = self.snapshot_training_state() if self.training_policy else None
+        model_state = copy.deepcopy(self.model.state_dict()) if self.training_policy else None
+        before = self._tracking_statistics(target, temperature) if self.training_policy else None
+        try:
+            distill_with_logits(self.model, self.proxy_loader, target, device=self.device,
+                lr=(self.training_policy.server_lr if self.training_policy else float(learning_rate)),
+                epochs=(self.training_policy.server_epochs if self.training_policy else 1),
+                temperature=float(temperature), amp=self.amp, strict_numeric_checks=self.strict_numeric_checks,
+                targets_are_probabilities=True, clean_ce_weight=effective_clean_ce_weight,
+                optimizer=self.distill_optimizer, scaler=self.distill_scaler, numeric_stats=stats)
+            if self.training_policy:
+                if int(stats.get("optimizer_step_count", 0)) == 0:
+                    # Skipped AMP steps may still update BN buffers during forward.
+                    # Preserve the scaler backoff, but do not commit a new model.
+                    self.model.load_state_dict(model_state, strict=True)
+                after = self._tracking_statistics(target, temperature)
+                self.last_training_diagnostics.update(tracking_kl_before=before["kl"], tracking_kl_after=after["kl"],
+                    **{k: v for k, v in after.items() if k != "kl"})
+        except Exception:
+            if state is not None:
+                self.model.load_state_dict(model_state, strict=True)
+                self.restore_training_state(state)
+            raise
+        self.last_training_diagnostics.update(optimizer_steps=int(stats.get("optimizer_step_count", 0)), numeric_stats=stats)
+        return int(stats.get("optimizer_step_count", 0)) > 0
 
     def build_server_broadcast(
         self,
