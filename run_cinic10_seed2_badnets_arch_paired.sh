@@ -7,7 +7,7 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=0
 export CODE_DIR="$(pwd)"
-export DATASET_ROOT="$(pwd)/dataset"
+export DATASET_ROOT="$(pwd)/dataset/CINIC-10"
 
 export ATTACK="${ATTACK:-badnets}"
 case "${ATTACK}" in
