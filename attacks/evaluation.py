@@ -59,6 +59,7 @@ def apply_evaluation_trigger(
             images,
             size=int(config.trigger_size),
             value=float(config.trigger_value),
+            dataset_name=plan.dataset_name,
         )
     if config.attack_type == "dba":
         return apply_dba(
@@ -66,9 +67,14 @@ def apply_evaluation_trigger(
             size=int(config.trigger_size),
             part=dba_part,
             value=float(config.trigger_value),
+            dataset_name=plan.dataset_name,
         )
     if config.attack_type == "blend":
-        return apply_blend(images, alpha=float(config.blend_alpha))
+        return apply_blend(
+            images,
+            alpha=float(config.blend_alpha),
+            dataset_name=plan.dataset_name,
+        )
     if config.attack_type == "dynamic":
         return apply_dynamic(
             images,
@@ -76,6 +82,7 @@ def apply_evaluation_trigger(
             round_number=int(round_number),
             attack_start_round=int(config.attack_start_round),
             period=int(config.dynamic_period),
+            dataset_name=plan.dataset_name,
         )
     if config.attack_type == "none":
         return images

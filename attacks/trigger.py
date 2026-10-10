@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from dataset_metadata import dataset_normalization
+
 
 def _require_image_batch(images: torch.Tensor) -> None:
     if not torch.is_tensor(images) or images.ndim != 4:
@@ -36,20 +38,64 @@ def _patch_bounds(
     return slice(y0, y0 + size), slice(x0, x0 + size)
 
 
+def _channel_values_from_raw(
+    images: torch.Tensor,
+    *,
+    value: float,
+    dataset_name: str,
+) -> torch.Tensor:
+    normalization = dataset_normalization(dataset_name)
+    channels = int(images.shape[1])
+    if len(normalization.mean) != channels or len(normalization.std) != channels:
+        raise ValueError(
+            "Dataset normalization channels do not match the image batch."
+        )
+    mean = images.new_tensor(normalization.mean).view(1, channels, 1, 1)
+    std = images.new_tensor(normalization.std).view(1, channels, 1, 1)
+    return (images.new_tensor(float(value)) - mean) / std
+
+
+def _normalized_raw_bounds(
+    images: torch.Tensor,
+    *,
+    dataset_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    low = _channel_values_from_raw(
+        images,
+        value=0.0,
+        dataset_name=dataset_name,
+    )
+    high = _channel_values_from_raw(
+        images,
+        value=1.0,
+        dataset_name=dataset_name,
+    )
+    return low, high
+
+
 def apply_badnets(
     images: torch.Tensor,
     *,
     size: int,
     value: float = 1.0,
     location: str = "bottom-right",
+    dataset_name: str = "cifar10",
 ) -> torch.Tensor:
-    """Apply a fixed visible square patch in normalized image space."""
+    """Apply a fixed visible square patch with dataset-correct semantics."""
 
     _require_image_batch(images)
     output = images.clone()
     _, _, height, width = output.shape
     ys, xs = _patch_bounds(height, width, size, location)
-    output[:, :, ys, xs] = float(value)
+    normalization = dataset_normalization(dataset_name)
+    if normalization.raw_space_triggers:
+        output[:, :, ys, xs] = _channel_values_from_raw(
+            output,
+            value=float(value),
+            dataset_name=dataset_name,
+        )
+    else:
+        output[:, :, ys, xs] = float(value)
     return output
 
 
@@ -81,6 +127,7 @@ def apply_dba(
     size: int,
     part: int | None,
     value: float = 1.0,
+    dataset_name: str = "cifar10",
 ) -> torch.Tensor:
     """Apply one DBA local trigger, or all four for the global test trigger."""
 
@@ -94,16 +141,27 @@ def apply_dba(
         if trigger_part not in range(4):
             raise ValueError("DBA trigger part must be one of 0,1,2,3.")
         y0, x0 = origins[trigger_part]
+        patch_value: float | torch.Tensor = float(value)
+        if dataset_normalization(dataset_name).raw_space_triggers:
+            patch_value = _channel_values_from_raw(
+                output,
+                value=float(value),
+                dataset_name=dataset_name,
+            )
         output[
             :,
             :,
             y0 : y0 + local_size,
             x0 : x0 + local_size,
-        ] = float(value)
+        ] = patch_value
     return output
 
 
-def blend_pattern_like(images: torch.Tensor) -> torch.Tensor:
+def blend_pattern_like(
+    images: torch.Tensor,
+    *,
+    dataset_name: str = "cifar10",
+) -> torch.Tensor:
     """Deterministic checker pattern in the same normalized range as inputs."""
 
     _require_image_batch(images)
@@ -112,20 +170,35 @@ def blend_pattern_like(images: torch.Tensor) -> torch.Tensor:
     xx = torch.arange(width, device=images.device).view(1, width)
     cell = max(2, min(height, width) // 8)
     checker = ((xx // cell + yy // cell) % 2).to(images.dtype)
-    checker = checker * 2.0 - 1.0
-    return checker.view(1, 1, height, width).expand(
+    checker = checker.view(1, 1, height, width).expand(
         1, channels, height, width
     )
+    normalization = dataset_normalization(dataset_name)
+    if normalization.raw_space_triggers:
+        mean = images.new_tensor(normalization.mean).view(1, channels, 1, 1)
+        std = images.new_tensor(normalization.std).view(1, channels, 1, 1)
+        return (checker - mean) / std
+    return checker * 2.0 - 1.0
 
 
-def apply_blend(images: torch.Tensor, *, alpha: float) -> torch.Tensor:
+def apply_blend(
+    images: torch.Tensor,
+    *,
+    alpha: float,
+    dataset_name: str = "cifar10",
+) -> torch.Tensor:
     _require_image_batch(images)
     if not 0.0 < float(alpha) <= 1.0:
         raise ValueError("Blend alpha must be in (0, 1].")
-    pattern = blend_pattern_like(images)
-    return (
-        (1.0 - float(alpha)) * images + float(alpha) * pattern
-    ).clamp(-1.0, 1.0)
+    pattern = blend_pattern_like(images, dataset_name=dataset_name)
+    output = (1.0 - float(alpha)) * images + float(alpha) * pattern
+    if dataset_normalization(dataset_name).raw_space_triggers:
+        low, high = _normalized_raw_bounds(
+            images,
+            dataset_name=dataset_name,
+        )
+        return torch.maximum(torch.minimum(output, high), low)
+    return output.clamp(-1.0, 1.0)
 
 
 def dynamic_state(
@@ -154,6 +227,7 @@ def apply_dynamic(
     round_number: int,
     attack_start_round: int,
     period: int,
+    dataset_name: str = "cifar10",
 ) -> torch.Tensor:
     location, value, size_scale = dynamic_state(
         round_number,
@@ -166,4 +240,5 @@ def apply_dynamic(
         size=dynamic_size,
         value=value,
         location=location,
+        dataset_name=dataset_name,
     )

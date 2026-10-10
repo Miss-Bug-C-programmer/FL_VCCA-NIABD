@@ -101,6 +101,8 @@ class ProcessRuntimeConfig:
     client_num_workers: int = 0
     client_torch_threads: int = 1
     client_pin_memory: bool = False
+    client_optimizer_momentum: float = 0.0
+    client_optimizer_weight_decay: float = 0.0
     loader_mp_context: Optional[str] = None
     server_architecture: str = "resnet18"
     client_architecture: str = "resnet18"
@@ -154,6 +156,10 @@ class ProcessRuntimeConfig:
             raise ValueError("poll_interval_s must be positive.")
         if int(self.max_message_bytes) <= 0:
             raise ValueError("max_message_bytes must be positive.")
+        if not 0.0 <= float(self.client_optimizer_momentum) < 1.0:
+            raise ValueError("client_optimizer_momentum must be in [0, 1).")
+        if float(self.client_optimizer_weight_decay) < 0.0:
+            raise ValueError("client_optimizer_weight_decay must be nonnegative.")
         if int(self.client_torch_threads) <= 0:
             raise ValueError("client_torch_threads must be positive.")
         if int(self.max_consecutive_amp_overflows) < 1:
@@ -593,7 +599,12 @@ def _client_process_main(
             dataset_name=dataset_name,
             device=device,
         )
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=0.01,
+            momentum=float(config.client_optimizer_momentum),
+            weight_decay=float(config.client_optimizer_weight_decay),
+        )
         local_scaler = make_grad_scaler(
             device,
             enabled=bool(config.amp),
@@ -721,12 +732,21 @@ def _client_process_main(
                         )
                 if poisoner is not None:
                     poisoner.start_round(source_round)
+                effective_local_epochs = int(task["local_epochs"])
+                if (
+                    poisoner is not None
+                    and attack_plan is not None
+                    and attack_plan.active_for(client_id, source_round)
+                ):
+                    effective_local_epochs *= int(
+                        attack_plan.config.malicious_local_epoch_multiplier
+                    )
                 local_train(
                     model,
                     private_loader,
                     device=device,
                     lr=float(task["learning_rate"]),
-                    epochs=int(task["local_epochs"]),
+                    epochs=effective_local_epochs,
                     amp=bool(config.amp),
                     strict_numeric_checks=bool(
                         config.strict_numeric_checks

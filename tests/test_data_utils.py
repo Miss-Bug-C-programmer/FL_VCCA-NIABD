@@ -104,8 +104,9 @@ def test_private_dataset_size_uses_a_deterministic_real_split(tmp_path):
     try:
         assert first["split_sizes"] == second["split_sizes"]
         assert first["split_sizes"]["proxy"] == 4
-        assert first["split_sizes"]["train"] == 14
+        assert first["split_sizes"]["train"] == 20
         assert first["split_sizes"]["val"] == 2
+        assert sum(first["split_sizes"][key] for key in ("train", "proxy", "val")) == 26
     finally:
         cleanup_dataloaders(first)
         cleanup_dataloaders(second)

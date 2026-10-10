@@ -79,6 +79,20 @@ This calibration prevents unsupported content rejection; it does not identify
 a backdoor whose behavior differs only on inputs absent from the proxy set.
 The active version is `vcaa-v9-proxy-information-calibrated-content`.
 
+## CINIC-10 data and trigger semantics
+
+CINIC-10 uses the official channel statistics shipped with the dataset:
+`mean=(0.47889522, 0.47227842, 0.43047404)` and
+`std=(0.24205776, 0.23828046, 0.25874835)`. Its BadNets, DBA, blend, and
+dynamic triggers are defined in raw pixel space and then mapped through that
+normalization. This keeps a configured white patch white instead of silently
+turning `trigger_value=1.0` into a dataset-dependent mid-intensity patch.
+
+Attack plans for CINIC-10 persist `dataset_name=cinic10`, and plan reuse across
+datasets fails closed. Existing CIFAR-10 transforms, trigger tensors, and plan
+JSON identities retain their previous behavior. These dataset adaptations do
+not alter VCAA admission, NIABD purification, aggregation, or distillation.
+
 当前分支采用服务器—客户端联邦蒸馏结构：
 
 - 中心服务器维护 ResNet-18 全局学生模型。

@@ -9,6 +9,7 @@ from data_utils import (
     _dirichlet_label_partition,
     _load_dataset_pair,
 )
+from dataset_metadata import dataset_normalization
 
 
 def _write_rgb(path: Path, size: int = 32) -> None:
@@ -47,6 +48,17 @@ def test_cinic10_imagefolder_loader_requires_and_reads_ten_classes(tmp_path):
     image, label = train[0]
     assert tuple(image.shape) == (3, 32, 32)
     assert isinstance(label, int)
+    normalization = dataset_normalization("cinic10")
+    expected_black = np.asarray(
+        [-mean / std for mean, std in zip(normalization.mean, normalization.std)],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(
+        image[:, 0, 0].numpy(),
+        expected_black,
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_tiny_imagenet_official_validation_annotations_are_parsed(tmp_path):

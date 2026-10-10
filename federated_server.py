@@ -60,7 +60,7 @@ class FederatedServer:
         self._defense_reference_ids: tuple[int, ...] = ()
 
     def snapshot_training_state(self):
-        return copy.deepcopy({"version": "fedagg-training-balanced-v1",
+        return copy.deepcopy({"version": "fedagg-training-balanced-v3",
             "policy": asdict(self.training_policy) if self.training_policy else None,
             "optimizer": self.distill_optimizer.state_dict() if self.distill_optimizer else None,
             "scaler": scaler_state_dict(self.distill_scaler) if self.distill_scaler else None,
@@ -68,7 +68,7 @@ class FederatedServer:
             "weight": self.publication_weight})
 
     def restore_training_state(self, state):
-        if state.get("version") != "fedagg-training-balanced-v1" or state.get("policy") != asdict(self.training_policy):
+        if state.get("version") != "fedagg-training-balanced-v3" or state.get("policy") != asdict(self.training_policy):
             raise ValueError("Balanced training checkpoint policy mismatch")
         self.distill_optimizer.load_state_dict(state["optimizer"])
         restore_scaler_state(self.distill_scaler, state["scaler"])

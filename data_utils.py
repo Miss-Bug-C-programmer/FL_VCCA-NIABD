@@ -13,6 +13,8 @@ from torchvision import datasets, transforms
 from PIL import Image
 import torch.nn.functional as F
 
+from dataset_metadata import dataset_normalization
+
 
 class TensorImageDataset(torch.utils.data.Dataset):
     """Simple tensor-backed image dataset with torchvision-like targets field."""
@@ -380,18 +382,47 @@ def _split_indices(
     indices = list(range(total_size))
     rng = random.Random(int(seed) + 701)
     rng.shuffle(indices)
-    if private_dataset_size is not None and int(private_dataset_size) > 0:
-        indices = indices[:min(int(private_dataset_size), total_size)]
-    pool_size = len(indices)
+    requested_private = (
+        min(int(private_dataset_size), int(total_size))
+        if private_dataset_size is not None and int(private_dataset_size) > 0
+        else None
+    )
+    # ``private_dataset_size`` is the final client-training budget.  The old
+    # implementation truncated a joint pool first and then removed proxy and
+    # validation rows from it, so requesting 2,000 private samples produced
+    # only 1,544 client samples with the standard CIFAR smoke settings.
+    # Reserve disjoint auxiliary rows in addition to the requested private
+    # budget.  This keeps the flag's public meaning independent of proxy size.
+    reference_size = (
+        requested_private if requested_private is not None else int(total_size)
+    )
     if proxy_dataset_size is not None and int(proxy_dataset_size) > 0:
-        proxy_n = min(int(proxy_dataset_size), pool_size)
+        proxy_n = min(int(proxy_dataset_size), int(total_size))
     else:
-        proxy_n = int(round(pool_size * max(0.0, float(proxy_ratio))))
-    remaining = pool_size - proxy_n
-    val_n = min(remaining, int(round(pool_size * max(0.0, float(val_ratio)))))
+        proxy_n = int(
+            round(reference_size * max(0.0, float(proxy_ratio)))
+        )
+    proxy_n = min(proxy_n, int(total_size))
+    desired_val_n = int(
+        round(reference_size * max(0.0, float(val_ratio)))
+    )
+    if requested_private is None:
+        remaining = int(total_size) - proxy_n
+        val_n = min(remaining, desired_val_n)
+        train_n = remaining - val_n
+    else:
+        # Preserve the requested private budget whenever the dataset has
+        # enough rows.  When it does not, auxiliary splits shrink before the
+        # private budget; all returned indices remain disjoint.
+        train_n = min(requested_private, int(total_size) - proxy_n)
+        val_n = min(
+            desired_val_n,
+            max(0, int(total_size) - proxy_n - train_n),
+        )
     proxy_idx = indices[:proxy_n]
     val_idx = indices[proxy_n: proxy_n + val_n]
-    train_idx = indices[proxy_n + val_n:]
+    train_start = proxy_n + val_n
+    train_idx = indices[train_start: train_start + train_n]
     if len(train_idx) <= 0:
         raise ValueError('Split produced empty train_idx; reduce proxy/val split.')
     return train_idx, proxy_idx, val_idx
@@ -453,16 +484,17 @@ def cleanup_dataloaders(dataloaders: Optional[Dict[str, Any]]) -> None:
             _shutdown_dataloader(value)
 
 
-def _default_transform():
+def _default_transform(dataset_name: str = "cifar10"):
+    normalization = dataset_normalization(dataset_name)
     return transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        transforms.Normalize(normalization.mean, normalization.std),
     ])
 
 
 def _load_dataset_pair(dataset_path: str, dataset_name: str):
-    transform = _default_transform()
     name = str(dataset_name).lower()
+    transform = _default_transform(name)
     if name == 'cifar10':
         trainset = datasets.CIFAR10(
             root=dataset_path,
@@ -598,7 +630,7 @@ def build_federated_data_plan(
         quantity_skew_alpha=float(quantity_skew_alpha),
         dirichlet_alpha=float(dirichlet_alpha),
     )
-    transform_identity = "tensor-normalize-0.5-v1"
+    transform_identity = dataset_normalization(dataset_name).transform_identity
     return FederatedDataPlan(
         dataset_path=os.path.abspath(dataset_path),
         dataset_name=str(dataset_name).lower(),

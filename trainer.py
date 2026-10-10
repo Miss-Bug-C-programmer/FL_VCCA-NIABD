@@ -140,6 +140,9 @@ class TrainingPolicy:
     server_epochs: int = 5
     maximum_clean_ce_weight: float = 0.20
     maximum_tracking_kl: float = 0.05
+    client_lr: float = 0.01
+    client_momentum: float = 0.9
+    client_weight_decay: float = 5e-4
     client_kd_max_weight: float = 0.1
     reverse_warmup_updates: int = 10
     reverse_ramp_updates: int = 10
@@ -149,13 +152,23 @@ class TrainingPolicy:
             raise ValueError("maximum_tracking_kl must be finite and positive")
         if not math.isfinite(self.server_lr) or self.server_lr <= 0:
             raise ValueError("server_lr must be finite and positive")
+        if not math.isfinite(self.client_lr) or self.client_lr <= 0:
+            raise ValueError("client_lr must be finite and positive")
+        if not 0 <= self.client_momentum < 1:
+            raise ValueError("client_momentum must be in [0, 1)")
+        if not math.isfinite(self.client_weight_decay) or self.client_weight_decay < 0:
+            raise ValueError("client_weight_decay must be finite and nonnegative")
         if not math.isfinite(self.maximum_clean_ce_weight) or self.maximum_clean_ce_weight < 0:
             raise ValueError("maximum_clean_ce_weight must be finite and nonnegative")
         if not 0 <= self.server_momentum < 1:
             raise ValueError("server_momentum must be in [0, 1)")
         if not math.isfinite(self.client_kd_max_weight) or self.client_kd_max_weight < 0:
             raise ValueError("client_kd_max_weight must be finite and nonnegative")
-        for name in ("server_epochs", "reverse_warmup_updates", "reverse_ramp_updates"):
+        for name in (
+            "server_epochs",
+            "reverse_warmup_updates",
+            "reverse_ramp_updates",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")

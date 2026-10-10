@@ -2009,7 +2009,7 @@ def run_experiment(
             else 8
         ),
         "formal_config_unchanged": training_policy is None,
-        "training_policy_version": "fedagg-training-balanced-v2" if training_policy else "legacy",
+        "training_policy_version": "fedagg-training-balanced-v3" if training_policy else "legacy",
         "training_policy": asdict(training_policy) if training_policy else None,
     }
     manifest_bytes = json.dumps(
@@ -2216,7 +2216,19 @@ def run_experiment(
                     seed=int(seed),
                     num_clients=int(num_clients),
                     config=attack_config,
+                    dataset_name=dataset_name,
                     plan_path=(attack_plan_path or None),
+                    client_sample_counts=(
+                        [
+                            int(item["num_samples"])
+                            for item in dataloaders["partition_stats"]
+                        ]
+                        if runtime == "sync"
+                        else [
+                            len(indices)
+                            for indices in data_plan.client_indices
+                        ]
+                    ),
                 )
                 attack_plan_file = os.path.join(
                     outdir,
@@ -2295,7 +2307,11 @@ def run_experiment(
                             device=device,
                             local_epochs=int(epochs),
                             rounds=int(rounds),
-                            learning_rate=0.01,
+                            learning_rate=(
+                                training_policy.client_lr
+                                if training_policy is not None
+                                else 0.01
+                            ),
                             distill_temperature=float(
                                 distill_temperature
                             ),
@@ -2341,7 +2357,11 @@ def run_experiment(
                                 config=run_process_config,
                                 local_epochs=int(epochs),
                                 rounds=int(rounds),
-                                learning_rate=0.01,
+                                learning_rate=(
+                                    training_policy.client_lr
+                                    if training_policy is not None
+                                    else 0.01
+                                ),
                                 distill_temperature=float(
                                     distill_temperature
                                 ),
@@ -2587,8 +2607,9 @@ def main() -> None:
         type=int,
         default=0,
         help=(
-            "Optional deterministic real-dataset subset size for smoke/control "
-            "runs; 0 uses the complete private training split."
+            "Final deterministic client-private training sample budget; proxy "
+            "and validation rows are reserved separately. 0 uses the complete "
+            "private training split."
         ),
     )
     parser.add_argument("--distill-temperature", type=float, default=2.0)
@@ -2695,7 +2716,25 @@ def main() -> None:
     )
     parser.add_argument("--target-label", type=int, default=0)
     parser.add_argument("--malicious-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--malicious-selection",
+        choices=["uniform", "data-balanced"],
+        default="data-balanced",
+        help=(
+            "Choose attackers uniformly by client ID or deterministically "
+            "balance their private-sample mass without using labels or metrics."
+        ),
+    )
     parser.add_argument("--poison-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--malicious-local-epoch-multiplier",
+        type=int,
+        default=1,
+        help=(
+            "Explicit strong-attacker local epoch multiplier during active "
+            "poisoning rounds; benign training is unchanged."
+        ),
+    )
     parser.add_argument("--attack-start-round", type=int, default=15)
     parser.add_argument(
         "--attack-end-round",
@@ -2710,7 +2749,15 @@ def main() -> None:
         default=0,
         help="0 selects 4 for 32x32 datasets and 8 for Tiny-ImageNet-200.",
     )
-    parser.add_argument("--trigger-value", type=float, default=1.0)
+    parser.add_argument(
+        "--trigger-value",
+        type=float,
+        default=1.0,
+        help=(
+            "Patch intensity. CINIC-10 interprets this in raw pixel space "
+            "[0,1]; existing CIFAR runs retain normalized-space semantics."
+        ),
+    )
     parser.add_argument("--blend-alpha", type=float, default=0.2)
     parser.add_argument("--dynamic-period", type=int, default=10)
     parser.add_argument(
@@ -2987,6 +3034,9 @@ def main() -> None:
     parser.add_argument("--server-distill-momentum", type=float, default=0.9)
     parser.add_argument("--server-distill-epochs", type=int, default=5)
     parser.add_argument("--maximum-clean-ce-weight", type=float, default=0.20)
+    parser.add_argument("--client-learning-rate", type=float, default=0.01)
+    parser.add_argument("--client-momentum", type=float, default=0.9)
+    parser.add_argument("--client-weight-decay", type=float, default=5e-4)
     parser.add_argument("--client-kd-weight", type=float, default=0.1)
     parser.add_argument("--client-kd-warmup-updates", type=int, default=10)
     parser.add_argument("--client-kd-ramp-updates", type=int, default=10)
@@ -2995,6 +3045,8 @@ def main() -> None:
     training_policy = (TrainingPolicy(server_lr=args.server_distill_lr,
         server_momentum=args.server_distill_momentum, server_epochs=args.server_distill_epochs,
         maximum_clean_ce_weight=args.maximum_clean_ce_weight,
+        client_lr=args.client_learning_rate, client_momentum=args.client_momentum,
+        client_weight_decay=args.client_weight_decay,
         client_kd_max_weight=args.client_kd_weight, reverse_warmup_updates=args.client_kd_warmup_updates,
         reverse_ramp_updates=args.client_kd_ramp_updates, maximum_tracking_kl=args.maximum_tracking_kl)
         if args.training_policy == "balanced" else None)
@@ -3019,7 +3071,11 @@ def main() -> None:
         attack_type=args.attack,
         target_label=args.target_label,
         malicious_fraction=args.malicious_fraction,
+        malicious_selection=args.malicious_selection,
         poison_ratio=args.poison_ratio,
+        malicious_local_epoch_multiplier=(
+            args.malicious_local_epoch_multiplier
+        ),
         attack_start_round=attack_start_round,
         attack_end_round=attack_end_round,
         poison_interval=args.poison_interval,
@@ -3087,6 +3143,8 @@ def main() -> None:
         client_pin_memory=bool(
             args.pin_memory and supports_pin_memory(client_device)
         ),
+        client_optimizer_momentum=args.client_momentum,
+        client_optimizer_weight_decay=args.client_weight_decay,
         loader_mp_context=(
             None
             if str(args.loader_mp_context).lower() == "none"

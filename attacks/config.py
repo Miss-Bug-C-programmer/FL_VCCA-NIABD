@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 
 
 SUPPORTED_ATTACKS = ("none", "badnets", "dba", "blend", "dynamic")
+SUPPORTED_MALICIOUS_SELECTIONS = ("uniform", "data-balanced")
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,9 @@ class AttackConfig:
     attack_type: str = "none"
     target_label: int = 0
     malicious_fraction: float = 0.20
+    malicious_selection: str = "uniform"
     poison_ratio: float = 0.20
+    malicious_local_epoch_multiplier: int = 1
     attack_start_round: int = 15
     attack_end_round: int = 10**9
     poison_interval: int = 1
@@ -39,8 +42,18 @@ class AttackConfig:
             raise ValueError("target_label must be non-negative.")
         if not 0.0 <= float(self.malicious_fraction) <= 1.0:
             raise ValueError("malicious_fraction must be in [0, 1].")
+        selection = str(self.malicious_selection).lower()
+        object.__setattr__(self, "malicious_selection", selection)
+        if selection not in SUPPORTED_MALICIOUS_SELECTIONS:
+            raise ValueError(
+                "malicious_selection must be 'uniform' or 'data-balanced'."
+            )
         if not 0.0 <= float(self.poison_ratio) <= 1.0:
             raise ValueError("poison_ratio must be in [0, 1].")
+        if int(self.malicious_local_epoch_multiplier) < 1:
+            raise ValueError(
+                "malicious_local_epoch_multiplier must be at least 1."
+            )
         if int(self.attack_start_round) < 1:
             raise ValueError("attack_start_round must be at least 1.")
         if int(self.attack_end_round) < int(self.attack_start_round):

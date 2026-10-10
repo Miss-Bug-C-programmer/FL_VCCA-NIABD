@@ -658,6 +658,21 @@ def run_fedagg_server_client(
             amp=bool(amp),
             strict_numeric_checks=bool(strict_numeric_checks),
             joint_distillation=training_policy is not None,
+            learning_rate=(
+                training_policy.client_lr
+                if training_policy is not None
+                else float(learning_rate)
+            ),
+            momentum=(
+                training_policy.client_momentum
+                if training_policy is not None
+                else 0.0
+            ),
+            weight_decay=(
+                training_policy.client_weight_decay
+                if training_policy is not None
+                else 0.0
+            ),
         )
         for client_id, (model, loader) in enumerate(
             zip(client_models, client_loaders)
@@ -938,8 +953,17 @@ def run_fedagg_server_client(
             poisoner = poisoners.get(int(client.client_id))
             if poisoner is not None:
                 poisoner.start_round(round_number)
+            effective_local_epochs = int(local_epochs)
+            if (
+                poisoner is not None
+                and attack_plan is not None
+                and attack_plan.active_for(client.client_id, round_number)
+            ):
+                effective_local_epochs *= int(
+                    attack_plan.config.malicious_local_epoch_multiplier
+                )
             client.train_local(
-                epochs=int(local_epochs),
+                epochs=effective_local_epochs,
                 learning_rate=float(learning_rate),
                 batch_transform=poisoner,
                 round_number=round_number,

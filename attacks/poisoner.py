@@ -122,6 +122,7 @@ class BackdoorBatchPoisoner:
                 selected,
                 size=size,
                 value=float(config.trigger_value),
+                dataset_name=self.plan.dataset_name,
             )
         elif config.attack_type == "dba":
             selected = apply_dba(
@@ -129,11 +130,13 @@ class BackdoorBatchPoisoner:
                 size=size,
                 part=self.plan.dba_part(self.client_id),
                 value=float(config.trigger_value),
+                dataset_name=self.plan.dataset_name,
             )
         elif config.attack_type == "blend":
             selected = apply_blend(
                 selected,
                 alpha=float(config.blend_alpha),
+                dataset_name=self.plan.dataset_name,
             )
         elif config.attack_type == "dynamic":
             selected = apply_dynamic(
@@ -142,6 +145,7 @@ class BackdoorBatchPoisoner:
                 round_number=round_number,
                 attack_start_round=int(config.attack_start_round),
                 period=int(config.dynamic_period),
+                dataset_name=self.plan.dataset_name,
             )
         else:
             raise ValueError(

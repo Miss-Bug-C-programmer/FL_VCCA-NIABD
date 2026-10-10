@@ -28,6 +28,9 @@ class FederatedClient:
         amp: bool = False,
         strict_numeric_checks: bool = False,
         joint_distillation: bool = False,
+        learning_rate: float = 0.01,
+        momentum: float = 0.0,
+        weight_decay: float = 0.0,
     ) -> None:
         self.client_id = int(client_id)
         self.model = model
@@ -36,7 +39,16 @@ class FederatedClient:
         self.amp = bool(amp)
         self.strict_numeric_checks = bool(strict_numeric_checks)
         self.model_round = 0
-        self.local_optimizer = torch.optim.SGD(model.parameters(), lr=0.01) if joint_distillation else None
+        self.local_optimizer = (
+            torch.optim.SGD(
+                model.parameters(),
+                lr=float(learning_rate),
+                momentum=float(momentum),
+                weight_decay=float(weight_decay),
+            )
+            if joint_distillation
+            else None
+        )
         self.local_scaler = (make_grad_scaler(device, enabled=self.amp and use_amp_for_device(device))
                              if joint_distillation else None)
         self.teacher_packet, self.proxy_loader = None, None

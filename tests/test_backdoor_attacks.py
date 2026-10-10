@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import pytest
 from torch.utils.data import DataLoader, TensorDataset
 
 from attacks import (
@@ -21,6 +22,7 @@ from attacks.trigger import (
     apply_dba,
     apply_dynamic,
 )
+from dataset_metadata import dataset_normalization
 
 
 def test_attack_plan_is_deterministic_and_strategy_independent():
@@ -42,6 +44,108 @@ def test_badnets_trigger_changes_only_expected_patch():
     assert out.shape == images.shape
     changed = (out != images).sum().item()
     assert changed == 2 * 3 * 4 * 4
+
+
+def test_cinic_badnets_white_patch_uses_official_channel_normalization():
+    images = torch.zeros(1, 3, 32, 32)
+    out = apply_badnets(
+        images,
+        size=4,
+        value=1.0,
+        dataset_name="cinic10",
+    )
+    expected = torch.tensor(
+        [2.1528118, 2.2147079, 2.2010806],
+        dtype=out.dtype,
+    )
+    assert torch.allclose(out[0, :, 27, 27], expected, atol=1e-6)
+    assert torch.count_nonzero(out[:, :, :27, :]).item() == 0
+
+
+def _cinic_normalize(raw: torch.Tensor) -> torch.Tensor:
+    normalization = dataset_normalization("cinic10")
+    mean = raw.new_tensor(normalization.mean).view(1, 3, 1, 1)
+    std = raw.new_tensor(normalization.std).view(1, 3, 1, 1)
+    return (raw - mean) / std
+
+
+def _cinic_denormalize(value: torch.Tensor) -> torch.Tensor:
+    normalization = dataset_normalization("cinic10")
+    mean = value.new_tensor(normalization.mean).view(1, 3, 1, 1)
+    std = value.new_tensor(normalization.std).view(1, 3, 1, 1)
+    return value * std + mean
+
+
+def test_cinic_dba_global_trigger_is_white_union_of_four_local_parts():
+    raw = torch.full((1, 3, 32, 32), 0.25)
+    images = _cinic_normalize(raw)
+    global_trigger = apply_dba(
+        images,
+        size=4,
+        part=None,
+        value=1.0,
+        dataset_name="cinic10",
+    )
+    local_union = images.clone()
+    for part in range(4):
+        local = apply_dba(
+            images,
+            size=4,
+            part=part,
+            value=1.0,
+            dataset_name="cinic10",
+        )
+        changed = local != images
+        local_union = torch.where(changed, local, local_union)
+    assert torch.equal(global_trigger, local_union)
+    raw_global = _cinic_denormalize(global_trigger)
+    changed = (raw_global - raw).abs() > 1e-6
+    assert changed.any()
+    assert torch.allclose(
+        raw_global[changed],
+        torch.ones_like(raw_global[changed]),
+        atol=1e-6,
+    )
+
+
+def test_cinic_blend_matches_raw_pixel_checker_mixture():
+    raw = torch.full((1, 3, 32, 32), 0.25)
+    blended = apply_blend(
+        _cinic_normalize(raw),
+        alpha=0.2,
+        dataset_name="cinic10",
+    )
+    raw_blended = _cinic_denormalize(blended)
+    values = torch.unique(raw_blended.round(decimals=5))
+    expected = torch.tensor([0.2, 0.4], dtype=values.dtype)
+    assert torch.allclose(values, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("round_number", "expected_value"),
+    [(1, 1.0), (11, 0.8), (21, 0.6), (31, 0.9)],
+)
+def test_cinic_dynamic_trigger_uses_raw_round_intensity(
+    round_number,
+    expected_value,
+):
+    raw = torch.full((1, 3, 32, 32), 0.25)
+    dynamic = apply_dynamic(
+        _cinic_normalize(raw),
+        size=4,
+        round_number=round_number,
+        attack_start_round=1,
+        period=10,
+        dataset_name="cinic10",
+    )
+    raw_dynamic = _cinic_denormalize(dynamic)
+    changed = (raw_dynamic - raw).abs() > 1e-5
+    assert changed.any()
+    assert torch.allclose(
+        raw_dynamic[changed],
+        torch.full_like(raw_dynamic[changed], expected_value),
+        atol=1e-5,
+    )
 
 
 def test_dba_global_trigger_is_union_of_four_local_triggers():
