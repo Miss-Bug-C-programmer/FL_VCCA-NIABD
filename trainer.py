@@ -208,6 +208,9 @@ class ProxyKDBatches:
             raise ValueError("Proxy KD targets must match the nonempty dataset")
         require_finite_tensor(self.targets, phase="training", metric="proxy_kd_targets")
         self.loader, self.cursor, self.iterator = loader, 0, iter(loader)
+        self.batches_per_pass = int(len(loader))
+        if self.batches_per_pass <= 0:
+            raise ValueError("Proxy KD loader must contain at least one batch")
 
     def next(self):
         try:
@@ -243,6 +246,53 @@ def _proxy_kd_loss(model, batches, device, temperature, strict, context):
     target = torch.nan_to_num(target.float(), nan=0., posinf=30., neginf=-30.).clamp(-30., 30.)
     return F.kl_div(F.log_softmax(logits / temperature, dim=1),
                     F.softmax(target / temperature, dim=1), reduction="batchmean") * temperature ** 2
+
+
+@torch.no_grad()
+def recalibrate_batch_norm(model, dataloader, device='cpu', amp=False):
+    """Recompute server BN buffers from one canonical public-proxy pass.
+
+    Distillation repeatedly visits the same small proxy set.  Letting every
+    optimizer pass update BN makes the final buffers depend on repetition and
+    batch order, while publication and evaluation use those buffers in eval
+    mode.  Calibration uses no labels or private data: all non-BN modules are
+    held in eval mode and only BN running statistics are refreshed.
+    """
+    device = normalize_device(device)
+    layers = [
+        layer
+        for layer in model.modules()
+        if isinstance(
+            layer,
+            (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm),
+        )
+    ]
+    if not layers:
+        return 0
+    if any(not layer.track_running_stats for layer in layers):
+        raise ValueError("BN calibration requires track_running_stats=True")
+
+    model_was_training = bool(model.training)
+    states = [(layer, bool(layer.training), layer.momentum) for layer in layers]
+    batches = 0
+    try:
+        model.eval()
+        for layer in layers:
+            layer.reset_running_stats()
+            layer.momentum = None
+            layer.train(True)
+        for batch in dataloader:
+            images = batch[0] if isinstance(batch, (tuple, list)) else batch
+            images = images.to(device, non_blocking=True)
+            with _amp_context(device, enabled=bool(amp) and use_amp_for_device(device)):
+                model(images)
+            batches += 1
+    finally:
+        model.train(model_was_training)
+        for layer, was_training, momentum in states:
+            layer.momentum = momentum
+            layer.train(was_training)
+    return int(batches)
 
 
 def scaler_state_dict(scaler):
@@ -325,6 +375,18 @@ def local_train(
     loss_fn = nn.CrossEntropyLoss()
     step = 0
     consecutive_amp_overflows = 0
+    # A fixed public proxy set must not be replayed once for every private
+    # mini-batch.  Give joint KD one complete proxy pass per local epoch, so
+    # its exposure is independent of private partition size while malicious
+    # multi-epoch training still receives the same per-epoch public budget.
+    proxy_kd_budget = (
+        int(proxy_kd_batches.batches_per_pass) * int(epochs)
+        if float(client_kd_weight) > 0.0
+        else 0
+    )
+    proxy_kd_attempts = 0
+    if isinstance(numeric_stats, dict):
+        numeric_stats["client_kd_batch_budget"] = int(proxy_kd_budget)
 
     for _ in range(epochs):
         for imgs, labels in dataloader:
@@ -367,10 +429,14 @@ def local_train(
                         context=context,
                     )
                 loss = loss_fn(output, labels)
-                kd_active = float(client_kd_weight) > 0
+                kd_active = (
+                    float(client_kd_weight) > 0.0
+                    and proxy_kd_attempts < proxy_kd_budget
+                )
                 if kd_active:
                     kd = _proxy_kd_loss(model, proxy_kd_batches, device, float(distill_temperature),
                                         bool(strict_numeric_checks), context)
+                    proxy_kd_attempts += 1
                     loss = loss.float() + float(client_kd_weight) * kd
                     _increment_stat(numeric_stats, "proxy_kd_batch_count")
 

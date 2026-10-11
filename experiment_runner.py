@@ -2009,7 +2009,7 @@ def run_experiment(
             else 8
         ),
         "formal_config_unchanged": training_policy is None,
-        "training_policy_version": "fedagg-training-balanced-v3" if training_policy else "legacy",
+        "training_policy_version": "fedagg-training-balanced-v4" if training_policy else "legacy",
         "training_policy": asdict(training_policy) if training_policy else None,
     }
     manifest_bytes = json.dumps(

@@ -11,7 +11,7 @@ from defense import DefenseResult, TeacherDefenseRecord
 from numeric_integrity import require_finite_tensor
 
 
-NIABD_ALGORITHM_VERSION = "niabd-v8-adaptive-recovery"
+NIABD_ALGORITHM_VERSION = "niabd-v9-gauge-invariant-minority-risk"
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
 _ROBUST_MAD_SCALE = 1.4826
 
@@ -174,6 +174,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._phase = self.NORMAL
         self._risk_ema = 0.0
         self._round_risk = 0.0
+        self._minority_risk = 0.0
         self._recovery_risk = 0.0
         self._recovery_risk_ema = 0.0
         self._consensus_shift = 0.0
@@ -204,6 +205,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._phase = self.NORMAL
         self._risk_ema = 0.0
         self._round_risk = 0.0
+        self._minority_risk = 0.0
         self._recovery_risk = 0.0
         self._recovery_risk_ema = 0.0
         self._consensus_shift = 0.0
@@ -228,6 +230,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "phase": self._phase,
             "risk_ema": float(self._risk_ema),
             "round_risk": float(self._round_risk),
+            "minority_risk": float(self._minority_risk),
             "recovery_risk": float(self._recovery_risk),
             "recovery_risk_ema": float(self._recovery_risk_ema),
             "consensus_shift": float(self._consensus_shift),
@@ -261,6 +264,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         self._phase = phase
         self._risk_ema = float(state.get("risk_ema", 0.0))
         self._round_risk = float(state.get("round_risk", self._risk_ema))
+        self._minority_risk = float(state.get("minority_risk", 0.0))
         self._recovery_risk = float(state.get("recovery_risk", 0.0))
         self._recovery_risk_ema = float(
             state.get("recovery_risk_ema", self._recovery_risk)
@@ -333,7 +337,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
     def _stack_knowledge(
         self,
         teacher_knowledge: Sequence[TeacherKnowledge],
-    ) -> Tuple[torch.Tensor, Tuple[torch.dtype, ...]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.dtype, ...], torch.Tensor]:
         if not teacher_knowledge:
             raise ValueError("NIABD requires at least one teacher.")
         tensors = [
@@ -353,7 +357,20 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             raise RuntimeError("NIABD proxy_version changed; call reset().")
         if incoming:
             self._proxy_version = incoming
-        return torch.stack(tensors, dim=0), tuple(item.logits.dtype for item in teacher_knowledge)
+        raw = torch.stack(tensors, dim=0)
+        # Softmax probabilities are invariant to a per-query common logit
+        # offset.  NIABD must therefore score, remember, and purify a canonical
+        # representative of that equivalence class.  The offsets are restored
+        # on output so the transport interface and benign in-threshold packets
+        # keep their original numeric gauge.
+        row_offsets = raw.mean(dim=-1, keepdim=True)
+        centered = raw - row_offsets
+        require_finite_tensor(centered, phase="niabd", metric="centered_teacher_logits")
+        return (
+            centered,
+            tuple(item.logits.dtype for item in teacher_knowledge),
+            row_offsets,
+        )
 
     def _validate_memory_shape(self, shape: torch.Size) -> None:
         if self._trusted_mean is None:
@@ -425,6 +442,20 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             dim=1,
         )
         mean_excess = torch.relu(abs_deviation - threshold_view).mean(dim=(1, 2))
+        # Preserve proxy and class locality before reducing to one teacher
+        # score.  Flattening P*C lets a coherent shift in one class or a small
+        # subset of proxy queries disappear among thousands of normal cells.
+        sample_tail = torch.quantile(
+            abs_deviation.amax(dim=2),
+            float(self.config.memory_quantile),
+            dim=1,
+        )
+        class_tail = torch.quantile(
+            abs_deviation,
+            float(self.config.memory_quantile),
+            dim=1,
+        ).amax(dim=1)
+        localized_tail = torch.maximum(sample_tail, class_tail)
         consensus_quantile = torch.quantile(
             consensus_deviation.reshape(consensus_deviation.shape[0], -1),
             float(self.config.memory_quantile),
@@ -436,6 +467,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 self._upper_robust_z(high_quantile, self.config.teacher_score_scale_floor),
                 self._upper_robust_z(mean_excess, self.config.teacher_score_scale_floor),
                 self._upper_robust_z(consensus_quantile, self.config.teacher_score_scale_floor),
+                self._upper_robust_z(localized_tail, self.config.teacher_score_scale_floor),
             ],
             dim=0,
         ).amax(dim=0)
@@ -444,12 +476,14 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             & (high_quantile <= float(self.config.benign_deviation_limit))
             & (anomaly_fraction <= float(self.config.maximum_memory_anomaly_fraction))
             & (consensus_quantile <= float(self.config.benign_deviation_limit))
+            & (localized_tail <= float(self.config.benign_deviation_limit))
         )
         return {
             "anomaly_fraction": anomaly_fraction,
             "high_quantile_deviation": high_quantile,
             "mean_excess": mean_excess,
             "consensus_deviation": consensus_quantile,
+            "localized_tail_deviation": localized_tail,
             "teacher_memory_score": score,
             "eligible": eligible,
         }
@@ -785,6 +819,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "niabd_memory_updated": bool(prototype_updated),
             "niabd_phase": self._phase,
             "niabd_round_risk": float(self._round_risk),
+            "niabd_minority_risk": float(self._minority_risk),
             "niabd_risk_ema": float(self._risk_ema),
             "niabd_recovery_risk": float(self._recovery_risk),
             "niabd_recovery_risk_ema": float(self._recovery_risk_ema),
@@ -828,7 +863,9 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 f"missing={missing_action}."
             )
 
-        action_stacked, original_dtypes = self._stack_knowledge(action_knowledge)
+        action_stacked, original_dtypes, action_offsets = self._stack_knowledge(
+            action_knowledge
+        )
         same_reference = (
             len(reference_items) == len(action_knowledge)
             and all(
@@ -839,7 +876,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         if same_reference:
             reference_stacked = action_stacked
         else:
-            reference_stacked, _ = self._stack_knowledge(reference_items)
+            reference_stacked, _, _ = self._stack_knowledge(reference_items)
         if action_stacked.shape[1:] != reference_stacked.shape[1:]:
             raise ValueError("NIABD action/reference cohorts must share one proxy shape.")
         action_reference_indices = torch.tensor(
@@ -850,6 +887,8 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         student = self._to_cpu_float(student_logits, name="student_logits")
         if student.shape != action_stacked.shape[1:]:
             raise ValueError("NIABD student and teacher logits must share a proxy shape.")
+        student = student - student.mean(dim=-1, keepdim=True)
+        require_finite_tensor(student, phase="niabd", metric="centered_student_logits")
         self._validate_memory_shape(student.shape)
 
         reference_candidates, warmup_reason = self._warmup_candidates(reference_stacked)
@@ -990,6 +1029,36 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 median_excess,
             )
         )
+        # Minority protection and majority recovery answer different
+        # questions.  Recovery may tolerate up to the configured compact-
+        # majority complement, but that tolerance must not make a smaller,
+        # consistently abnormal faction invisible to continuous purification.
+        localized_history = reference_metrics["localized_tail_deviation"]
+        localized_current = torch.maximum(
+            consensus_teacher_deviation,
+            torch.quantile(
+                reference_consensus_z,
+                float(self.config.memory_quantile),
+                dim=1,
+            ).amax(dim=1),
+        )
+        corroborated_minority = (
+            (localized_history > float(self.config.benign_deviation_limit))
+            & (localized_current > float(self.config.benign_deviation_limit))
+        )
+        one_teacher_fraction = 1.0 / float(reference_stacked.shape[0])
+        minority_fraction = float(
+            corroborated_minority.float().mean().item()
+        )
+        minority_scale = max(
+            float(self.config.maximum_memory_anomaly_fraction),
+            one_teacher_fraction,
+            float(self.config.epsilon),
+        )
+        self._minority_risk = max(
+            0.0,
+            minority_fraction - one_teacher_fraction,
+        ) / minority_scale
         student_consensus_distance = float(
             torch.quantile(
                 ((student - current_consensus).abs() / (std + self.config.epsilon))
@@ -1020,7 +1089,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         # change; common benign drift alone contributes no protection boost.
         preemptive_strength = 0.0
         if self._phase == self.NORMAL:
-            corroborated_risk = min(self._round_risk, self._recovery_risk)
+            corroborated_risk = min(self._round_risk, self._minority_risk)
             preemptive_strength = max(
                 0.0,
                 min(
@@ -1116,6 +1185,20 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         purified = (
             weights * action_stacked
             + (1.0 - weights) * reference.unsqueeze(0)
+        )
+        purified = purified - purified.mean(dim=-1, keepdim=True)
+        # Preserve byte-level benign behavior where no class coordinate was
+        # changed.  For a purified row, keep the canonical zero-mean gauge so a
+        # large, probability-irrelevant sender offset cannot re-enter the
+        # downstream numeric range after class-dependent interpolation.
+        row_was_purified = (
+            (1.0 - weights).amax(dim=-1, keepdim=True)
+            > float(self.config.epsilon)
+        )
+        purified = torch.where(
+            row_was_purified,
+            purified,
+            purified + action_offsets,
         )
         require_finite_tensor(purified, phase="niabd", metric="purified_logits")
 
@@ -1214,6 +1297,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 "niabd_action_teachers": int(action_stacked.shape[0]),
                 "niabd_recovery_risk": float(self._recovery_risk),
                 "niabd_recovery_risk_ema": float(self._recovery_risk_ema),
+                "niabd_minority_risk": float(self._minority_risk),
                 "niabd_student_supports_drift": bool(student_supports_drift),
             }
         )
@@ -1295,6 +1379,7 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "niabd_memory_updated": memory_updated,
             "niabd_phase": self._phase,
             "niabd_round_risk": float(self._round_risk),
+            "niabd_minority_risk": float(self._minority_risk),
             "niabd_risk_ema": float(self._risk_ema),
             "niabd_recovery_risk": float(self._recovery_risk),
             "niabd_recovery_risk_ema": float(self._recovery_risk_ema),

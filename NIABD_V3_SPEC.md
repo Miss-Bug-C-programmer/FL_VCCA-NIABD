@@ -1,4 +1,4 @@
-# NIABD v2.1 transactional specification
+# NIABD v9 transactional specification
 
 NIABD remains a server-side prediction-layer defense. Clients upload only
 serialized proxy logits and lineage metadata. The Server owns the proxy labels,
@@ -11,6 +11,14 @@ The persistent memory is `prototype_mean[P,C]`, `prototype_variance[P,C]`, and
 deviations, purifies admitted logits, and then performs a transactional memory
 update. Thresholds are updated only when the normal eligible set reaches
 `minimum_consensus_teachers`; drift-only or frozen rounds do not change them.
+
+Teacher, student, consensus, and persistent-memory responses use row-centered
+logits internally.  This preserves class margins while making all decisions
+invariant to a per-query common logit offset.  Local proxy and class tails are
+retained before teacher-level scoring.  Current minority evidence controls
+continuous preemptive purification; the compact-majority fraction controls
+only recovery authorization.  Neither path consumes attack identity, attack
+timing, trigger inputs, private labels, or test labels.
 
 Warmup and drift recovery use the same deterministic gate:
 

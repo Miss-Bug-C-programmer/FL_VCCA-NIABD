@@ -1,10 +1,10 @@
 # FedAgg Server-Client with VCAA and NIABD
 
-## NIABD v7 production semantics
+## NIABD v9 production semantics
 
 `niabd.py` is the single active NIABD implementation in this directory. It
-identifies itself as `niabd-v7-information-and-risk-correlated-purification`;
-earlier versions remain experimental comparisons, not runtime options. The
+identifies itself as `niabd-v9-gauge-invariant-minority-risk`; earlier
+versions remain experimental comparisons, not runtime options. The
 result schema, run manifest, and checkpoints obtain the active version from
 the implementation. A checkpoint from a different NIABD version cannot be
 resumed as v7.
@@ -32,6 +32,22 @@ proxy response is also weighted by its class-predictive information. Once
 the observable state becomes SUSPICIOUS, full historical correction applies.
 Phase transitions, student reference, and memory eligibility/update remain
 active in every state.
+
+NIABD v9 stores a row-centered representation of every proxy response.  A
+per-query common logit offset therefore cannot change anomaly scores, memory,
+or purified probabilities.  The sender's original offset is preserved for an
+unchanged row and omitted after a row is purified.  Minority anomaly evidence
+is computed separately from the compact-majority recovery gate: the latter may
+authorize clipped memory recovery, but no longer creates a 25% zero-risk band
+for continuous purification.  Local proxy-tail and class-tail evidence is kept
+before teacher-level reduction so a coherent class response cannot disappear
+inside a flattened P*C average.
+
+Balanced training v4 also bounds weak client reverse KD to one complete proxy
+pass per local epoch and recalibrates server BN buffers with one canonical
+proxy pass after distillation.  The private-data CE objective, logits-only
+transport, VCAA admission authority, NIABD interfaces, and probability-space
+aggregation remain unchanged.
 
 New CLI controls are:
 

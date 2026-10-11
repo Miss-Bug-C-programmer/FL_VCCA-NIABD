@@ -7,7 +7,12 @@ import contextlib
 from numeric_integrity import NumericIntegrityError
 from simulate import evaluate_with_loss
 import trainer as trainer_module
-from trainer import distill_with_logits, local_train
+from trainer import (
+    ProxyKDBatches,
+    distill_with_logits,
+    local_train,
+    recalibrate_batch_norm,
+)
 
 
 class _BadLogits(nn.Module):
@@ -224,3 +229,50 @@ def test_amp_distillation_overflow_skips_step_and_recovers(monkeypatch):
     assert stats["optimizer_step_count"] == 1
     assert scaler.get_scale() == 8.0
     assert all(torch.isfinite(value).all() for value in model.parameters())
+
+
+def test_joint_kd_uses_one_proxy_pass_per_local_epoch():
+    private_inputs = torch.randn(12, 3)
+    private_labels = torch.arange(12) % 2
+    private_loader = DataLoader(
+        TensorDataset(private_inputs, private_labels),
+        batch_size=2,
+        shuffle=False,
+    )
+    proxy_loader = _loader()
+    batches = ProxyKDBatches(proxy_loader, torch.zeros(4, 2))
+    stats = {}
+
+    local_train(
+        nn.Linear(3, 2),
+        private_loader,
+        device="cpu",
+        epochs=2,
+        proxy_kd_batches=batches,
+        client_kd_weight=0.1,
+        numeric_stats=stats,
+    )
+
+    assert stats["optimizer_step_count"] == 12
+    assert stats["client_kd_batch_budget"] == 4
+    assert stats["client_kd_optimizer_step_count"] == 4
+
+
+def test_bn_recalibration_uses_one_proxy_pass_and_restores_mode():
+    model = nn.Sequential(
+        nn.Linear(3, 4),
+        nn.BatchNorm1d(4),
+        nn.ReLU(),
+        nn.Linear(4, 2),
+    )
+    model.eval()
+
+    batches = recalibrate_batch_norm(model, _loader(), device="cpu")
+
+    bn = model[1]
+    assert batches == 2
+    assert model.training is False
+    assert bn.training is False
+    assert int(bn.num_batches_tracked.item()) == 2
+    assert torch.isfinite(bn.running_mean).all()
+    assert torch.isfinite(bn.running_var).all()

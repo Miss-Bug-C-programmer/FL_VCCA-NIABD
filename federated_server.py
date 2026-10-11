@@ -19,7 +19,14 @@ from admission import (
 )
 from defense import DefenseResult, KnowledgeDefenseController
 from logits_transport import ClientLogitsPacket, ServerLogitsPacket
-from trainer import TrainingPolicy, distill_with_logits, predict_logits, scaler_state_dict, restore_scaler_state
+from trainer import (
+    TrainingPolicy,
+    distill_with_logits,
+    predict_logits,
+    recalibrate_batch_norm,
+    scaler_state_dict,
+    restore_scaler_state,
+)
 from device_utils import make_grad_scaler, use_amp_for_device
 from numeric_integrity import require_finite_tensor
 from robust_aggregation import aggregate_probabilities
@@ -60,7 +67,7 @@ class FederatedServer:
         self._defense_reference_ids: tuple[int, ...] = ()
 
     def snapshot_training_state(self):
-        return copy.deepcopy({"version": "fedagg-training-balanced-v3",
+        return copy.deepcopy({"version": "fedagg-training-balanced-v4",
             "policy": asdict(self.training_policy) if self.training_policy else None,
             "optimizer": self.distill_optimizer.state_dict() if self.distill_optimizer else None,
             "scaler": scaler_state_dict(self.distill_scaler) if self.distill_scaler else None,
@@ -68,7 +75,7 @@ class FederatedServer:
             "weight": self.publication_weight})
 
     def restore_training_state(self, state):
-        if state.get("version") != "fedagg-training-balanced-v3" or state.get("policy") != asdict(self.training_policy):
+        if state.get("version") != "fedagg-training-balanced-v4" or state.get("policy") != asdict(self.training_policy):
             raise ValueError("Balanced training checkpoint policy mismatch")
         self.distill_optimizer.load_state_dict(state["optimizer"])
         restore_scaler_state(self.distill_scaler, state["scaler"])
@@ -412,6 +419,13 @@ class FederatedServer:
                     # Skipped AMP steps may still update BN buffers during forward.
                     # Preserve the scaler backoff, but do not commit a new model.
                     self.model.load_state_dict(model_state, strict=True)
+                else:
+                    stats["bn_calibration_batches"] = recalibrate_batch_norm(
+                        self.model,
+                        self.proxy_loader,
+                        device=self.device,
+                        amp=self.amp,
+                    )
                 after = self._tracking_statistics(target, temperature)
                 self.last_training_diagnostics.update(tracking_kl_before=before["kl"], tracking_kl_after=after["kl"],
                     **{k: v for k, v in after.items() if k != "kl"})

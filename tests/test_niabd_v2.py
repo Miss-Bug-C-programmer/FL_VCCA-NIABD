@@ -110,7 +110,7 @@ def test_large_benign_proxy_set_keeps_updating_memory():
 def test_abnormal_minority_cannot_move_robust_prototype():
     first = _stable_logits(teachers=20, samples=40, classes=3)
     second = first.clone()
-    second[16:] += 8.0
+    second[16:, :, 2] += 8.0
     controller = NeuroInspiredAdaptiveBackdoorDefense(
         NIABDConfig(warmup_rounds=1)
     )
@@ -130,7 +130,8 @@ def test_abnormal_minority_cannot_move_robust_prototype():
 
 def test_consensus_drift_can_recover_without_absorbing_split_clusters():
     first = _stable_logits(teachers=8, samples=16, classes=3)
-    drifted = first + 0.5
+    drifted = first.clone()
+    drifted[:, :, 0] += 0.5
     controller = NeuroInspiredAdaptiveBackdoorDefense(
         NIABDConfig(warmup_rounds=1, minimum_standard_deviation=0.1)
     )
@@ -140,12 +141,12 @@ def test_consensus_drift_can_recover_without_absorbing_split_clusters():
     assert drift.metrics["prototype_updated"] == 1.0
 
     split = first.clone()
-    split[:4] += 10.0
-    split[4:] -= 10.0
+    split[:4, :, 0] += 10.0
+    split[4:, :, 1] += 10.0
     observations_before = controller.observation_count
     frozen = _purify(controller, split, 3)
     assert frozen.metrics["prototype_updated"] == 0.0
-    assert frozen.metrics["niabd_prototype_update_reason"] == "freeze_no_safe_candidate"
+    assert frozen.metrics["niabd_prototype_update_reason"] == "normal_no_safe_candidate"
     assert controller.observation_count == observations_before
 
 
@@ -189,6 +190,28 @@ def test_student_reference_is_aligned_per_proxy_sample():
     assert result.purified_knowledge[0].logits.shape == student.shape
     assert float(result.purified_knowledge[0].logits[:, 2].mean()) < 1.0
     assert all(torch.isfinite(item.logits).all() for item in result.purified_knowledge)
+
+
+def test_common_logit_offset_does_not_change_niabd_probability_behavior():
+    logits = _stable_logits(teachers=8, samples=16, classes=4)
+    shifted = logits + 7.0
+    first = NeuroInspiredAdaptiveBackdoorDefense(NIABDConfig(warmup_rounds=1))
+    second = NeuroInspiredAdaptiveBackdoorDefense(NIABDConfig(warmup_rounds=1))
+    _purify(first, logits, 1)
+    _purify(second, shifted, 1)
+
+    result_a = _purify(first, logits, 2)
+    result_b = _purify(second, shifted, 2)
+
+    assert first.phase == second.phase
+    assert first.prototype_mean is not None and second.prototype_mean is not None
+    assert torch.allclose(first.prototype_mean, second.prototype_mean, atol=1e-5)
+    for left, right in zip(result_a.purified_knowledge, result_b.purified_knowledge):
+        assert torch.allclose(
+            torch.softmax(left.logits, dim=1),
+            torch.softmax(right.logits, dim=1),
+            atol=1e-6,
+        )
 
 
 def test_proxy_labels_do_not_change_niabd_output_or_metrics():

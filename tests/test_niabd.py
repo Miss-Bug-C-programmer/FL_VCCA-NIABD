@@ -190,7 +190,9 @@ def test_niabd_automatically_protects_memory_and_recovers_without_oracle():
     _run_controller(controller, base, 1)
     trusted_before = controller.trusted_mean
     assert trusted_before is not None
-    suspicious = _run_controller(controller, base + 0.5, 2)
+    predictive_drift = base.clone()
+    predictive_drift[:, :, 0] += 0.5
+    suspicious = _run_controller(controller, predictive_drift, 2)
     assert controller.phase == "SUSPICIOUS"
     assert suspicious.metrics["niabd_trusted_memory_frozen"] is True
     assert torch.allclose(controller.trusted_mean, trusted_before)
@@ -218,7 +220,9 @@ def test_niabd_checkpoint_restores_controller_state_and_next_output():
     )
     _run_controller(controller, base, 1)
     _run_controller(controller, base + 0.5, 2)
-    for values, round_number in ((base, 3), (base, 4), (base + 0.5, 5)):
+    predictive_drift = base.clone()
+    predictive_drift[:, :, 0] += 0.5
+    for values, round_number in ((base, 3), (base, 4), (predictive_drift, 5)):
         snapshot = controller.snapshot_state()
         restored = NeuroInspiredAdaptiveBackdoorDefense(controller.config)
         restored.restore_state(snapshot)

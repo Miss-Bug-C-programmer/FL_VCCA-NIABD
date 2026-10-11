@@ -71,7 +71,8 @@ def test_real_batch_poisoning_flows_through_serialized_logits_and_niabd():
     assert metrics["poisoned_samples"][1] > 0
     assert metrics["poisoned_samples"][2] > 0
     assert len(metrics["basr_global"]) == 3
-    assert all(0.0 <= value <= 1.0 for value in metrics["basr_global"])
+    assert torch.isnan(torch.tensor(metrics["basr_global"][0]))
+    assert all(0.0 <= value <= 1.0 for value in metrics["basr_global"][1:])
     assert len(metrics["backdoor_client_records"]) == 3
     assert any(
         row["is_malicious"]

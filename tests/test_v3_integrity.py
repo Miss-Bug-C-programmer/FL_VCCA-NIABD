@@ -125,8 +125,9 @@ def test_niabd_warmup_freezes_when_consensus_is_not_established():
     knowledge = _knowledge(count=4)
     knowledge[-1] = TeacherKnowledge(
         metadata=knowledge[-1].metadata,
-        logits=knowledge[-1].logits + 100.0,
+        logits=knowledge[-1].logits.clone(),
     )
+    knowledge[-1].logits[:, 0] += 100.0
     defense = NeuroInspiredAdaptiveBackdoorDefense(
         NIABDConfig(
             warmup_rounds=1,
