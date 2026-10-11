@@ -2582,6 +2582,7 @@ def main() -> None:
             "cifar10",
             "cifar100",
             "femnist",
+            "mnist",
             "cinic10",
             "tiny-imagenet-200",
         ],

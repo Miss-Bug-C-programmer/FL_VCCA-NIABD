@@ -24,6 +24,16 @@ DATASET_NORMALIZATIONS = {
     "cifar100": _LEGACY_RGB_NORMALIZATION,
     "femnist": _LEGACY_RGB_NORMALIZATION,
     "tiny-imagenet-200": _LEGACY_RGB_NORMALIZATION,
+    # Native one-channel MNIST tensors use the canonical train-set statistics.
+    # Triggers are specified in raw [0, 1] pixel space and converted after
+    # normalization, matching the CINIC-10 trigger semantics without changing
+    # either existing dataset path.
+    "mnist": DatasetNormalization(
+        mean=(0.1307,),
+        std=(0.3081,),
+        transform_identity="tensor-normalize-mnist-official-v1",
+        raw_space_triggers=True,
+    ),
     # Official statistics shipped with the local CINIC-10 distribution.
     "cinic10": DatasetNormalization(
         mean=(0.47889522, 0.47227842, 0.43047404),

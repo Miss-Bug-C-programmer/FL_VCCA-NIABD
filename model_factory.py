@@ -22,6 +22,7 @@ DATASET_SPECS = {
     "cifar10": DatasetSpec(num_classes=10),
     "cifar100": DatasetSpec(num_classes=100),
     "femnist": DatasetSpec(num_classes=62),
+    "mnist": DatasetSpec(num_classes=10, in_channels=1),
     "cinic10": DatasetSpec(num_classes=10),
     "tiny-imagenet-200": DatasetSpec(num_classes=200),
 }

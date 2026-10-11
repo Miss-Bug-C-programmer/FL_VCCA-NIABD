@@ -62,6 +62,50 @@ def test_cinic_badnets_white_patch_uses_official_channel_normalization():
     assert torch.count_nonzero(out[:, :, :27, :]).item() == 0
 
 
+def test_mnist_attacks_preserve_grayscale_shape_and_raw_pixel_semantics():
+    normalization = dataset_normalization("mnist")
+    mean = torch.tensor(normalization.mean).view(1, 1, 1, 1)
+    std = torch.tensor(normalization.std).view(1, 1, 1, 1)
+    raw = torch.full((2, 1, 28, 28), 0.25)
+    images = (raw - mean) / std
+
+    badnets = apply_badnets(
+        images,
+        size=4,
+        value=1.0,
+        dataset_name="mnist",
+    )
+    dba = apply_dba(
+        images,
+        size=4,
+        part=None,
+        value=1.0,
+        dataset_name="mnist",
+    )
+    blend = apply_blend(images, alpha=0.2, dataset_name="mnist")
+    dynamic = apply_dynamic(
+        images,
+        size=4,
+        round_number=10,
+        attack_start_round=10,
+        period=10,
+        dataset_name="mnist",
+    )
+
+    for triggered in (badnets, dba, blend, dynamic):
+        assert triggered.shape == images.shape
+        raw_triggered = triggered * std + mean
+        assert float(raw_triggered.min()) >= -1e-6
+        assert float(raw_triggered.max()) <= 1.0 + 1e-6
+        assert not torch.equal(triggered, images)
+
+    assert torch.allclose(
+        (badnets * std + mean)[:, :, -5:-1, -5:-1],
+        torch.ones(2, 1, 4, 4),
+        atol=1e-6,
+    )
+
+
 def _cinic_normalize(raw: torch.Tensor) -> torch.Tensor:
     normalization = dataset_normalization("cinic10")
     mean = raw.new_tensor(normalization.mean).view(1, 3, 1, 1)

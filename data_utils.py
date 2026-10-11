@@ -523,6 +523,19 @@ def _load_dataset_pair(dataset_path: str, dataset_name: str):
         )
     elif name == 'femnist':
         trainset, testset = _load_femnist_datasets(dataset_path)
+    elif name == 'mnist':
+        trainset = datasets.MNIST(
+            root=dataset_path,
+            train=True,
+            download=False,
+            transform=transform,
+        )
+        testset = datasets.MNIST(
+            root=dataset_path,
+            train=False,
+            download=False,
+            transform=transform,
+        )
     elif name == 'cinic10':
         train_dir = os.path.join(dataset_path, 'train')
         test_dir = os.path.join(dataset_path, 'test')
@@ -567,7 +580,8 @@ def _load_dataset_pair(dataset_path: str, dataset_name: str):
                 )
     else:
         raise ValueError(
-            'Unsupported dataset_name. Use cifar10, cifar100, femnist, cinic10, or tiny-imagenet-200.'
+            'Unsupported dataset_name. Use cifar10, cifar100, femnist, mnist, '
+            'cinic10, or tiny-imagenet-200.'
         )
     return trainset, testset
 

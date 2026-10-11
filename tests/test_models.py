@@ -51,3 +51,17 @@ def test_femnist_keeps_existing_62_class_scope():
     )
     assert clients[0].fc.out_features == 62
     assert server.fc.out_features == 62
+
+
+def test_mnist_uses_native_grayscale_input_and_ten_classes():
+    spec = dataset_spec("mnist")
+    assert spec.num_classes == 10
+    assert spec.in_channels == 1
+    clients, server = build_models(
+        dataset_name="mnist",
+        num_clients=1,
+        device="cpu",
+    )
+    inputs = torch.randn(2, 1, 28, 28)
+    assert clients[0](inputs).shape == (2, 10)
+    assert server(inputs).shape == (2, 10)
