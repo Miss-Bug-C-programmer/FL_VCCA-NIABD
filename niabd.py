@@ -11,7 +11,7 @@ from defense import DefenseResult, TeacherDefenseRecord
 from numeric_integrity import require_finite_tensor
 
 
-NIABD_ALGORITHM_VERSION = "niabd-v9-gauge-invariant-minority-risk"
+NIABD_ALGORITHM_VERSION = "niabd-v13-score-corroborated-recovery"
 RESULT_SCHEMA_VERSION = "fedagg-results-v3"
 _ROBUST_MAD_SCALE = 1.4826
 
@@ -488,14 +488,139 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             "eligible": eligible,
         }
 
+    def _required_consensus_teachers(self, count: int) -> int:
+        """Return the strict-majority quorum for an available teacher cohort.
+
+        ``minimum_consensus_teachers`` remains the minimum *available* cohort
+        size.  Requiring that same number to be memory-eligible made a four
+        teacher cohort an unintended unanimity gate: one bounded non-IID
+        minority response permanently disabled NIABD.  Once the configured
+        cohort is available, the recovery fraction defines the safe compact
+        majority and is never allowed to fall below two teachers.
+        """
+
+        return max(
+            2,
+            int(
+                ceil(
+                    float(self.config.consensus_recovery_fraction)
+                    * int(count)
+                )
+            ),
+        )
+
+    def _bounded_bootstrap_minority(
+        self,
+        stacked: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        center: torch.Tensor,
+        student: Optional[torch.Tensor],
+    ) -> bool:
+        """Authorize a small-cohort majority only for bounded disagreement.
+
+        The test is based solely on proxy responses and the immutable student
+        reference.  The majority's own class-response magnitude supplies the
+        scale, so the gate is invariant to a common logit offset and does not
+        contain dataset, seed, client-identity, attack, or evaluation signals.
+        An unbounded minority remains fail-closed; a bounded non-IID minority
+        is excluded from the memory update rather than averaged into it.
+        """
+
+        minority = ~candidate_mask
+        if not bool(minority.any().item()):
+            return True
+        if student is None or student.shape != center.shape:
+            return False
+
+        information_scale = torch.quantile(
+            center.abs().reshape(-1),
+            float(self.config.memory_quantile),
+        ).clamp_min(float(self.config.minimum_standard_deviation))
+        allowed = (
+            float(self.config.benign_deviation_limit) * information_scale
+        )
+        minority_distance = torch.quantile(
+            (stacked[minority] - center.unsqueeze(0)).abs().reshape(
+                int(minority.sum().item()), -1
+            ),
+            float(self.config.memory_quantile),
+            dim=1,
+        ).amax()
+        student_distance = torch.quantile(
+            (student - center).abs().reshape(-1),
+            float(self.config.memory_quantile),
+        )
+        return bool(
+            (minority_distance <= allowed).item()
+            and (student_distance <= allowed).item()
+        )
+
+    def _student_anchored_candidates(
+        self,
+        stacked: torch.Tensor,
+        student: Optional[torch.Tensor],
+        required: int,
+        *,
+        enforce_absolute_distance: bool = True,
+    ) -> torch.Tensor:
+        """Find an informative student-corroborated compact majority.
+
+        Independent non-IID teachers can have no compact all-teacher MAD cluster
+        before trusted memory exists.  After the student has learned from a real
+        aggregation step, its proxy response provides an independent anchor for
+        selecting the closest strict majority.  A near-uniform student is not
+        allowed to authorize bootstrap, and the caller still applies the
+        bounded-minority gate before any memory update.
+        """
+
+        count = int(stacked.shape[0])
+        empty = torch.zeros(count, dtype=torch.bool)
+        if student is None or student.shape != stacked.shape[1:]:
+            return empty
+
+        student_log_probabilities = torch.log_softmax(student, dim=-1)
+        student_probabilities = student_log_probabilities.exp()
+        student_information = (
+            1.0
+            + (
+                student_probabilities * student_log_probabilities
+            ).sum(dim=-1)
+            / log(float(student.shape[-1]))
+        ).mean()
+        if float(student_information.item()) < float(
+            self.config.teacher_score_effective_floor
+        ):
+            return empty
+
+        teacher_probabilities = torch.softmax(stacked, dim=-1)
+        distance = (
+            teacher_probabilities
+            - student_probabilities.unsqueeze(0)
+        ).square().mean(dim=(1, 2))
+        ranked = torch.argsort(distance)
+        boundary = distance[ranked[int(required) - 1]]
+        if (
+            enforce_absolute_distance
+            and float(boundary.item())
+            > float(self.config.teacher_score_effective_floor)
+        ):
+            return empty
+        return (distance < boundary) | torch.isclose(
+            distance,
+            boundary,
+            rtol=1e-5,
+            atol=1e-8,
+        )
+
     def _warmup_candidates(
-        self, stacked: torch.Tensor, *, trim_for_recovery: bool = False
+        self,
+        stacked: torch.Tensor,
+        *,
+        student: Optional[torch.Tensor] = None,
+        trim_for_recovery: bool = False,
     ) -> Tuple[torch.Tensor, str]:
         count = int(stacked.shape[0])
-        required = max(
-            int(self.config.minimum_consensus_teachers),
-            int(ceil(float(self.config.consensus_recovery_fraction) * count)),
-        )
+        required = self._required_consensus_teachers(count)
         if count < int(self.config.minimum_consensus_teachers):
             return torch.zeros(count, dtype=torch.bool), "freeze_insufficient_teachers"
         center, variance = self._robust_center_variance(stacked)
@@ -503,6 +628,34 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         distance = torch.quantile(z.reshape(count, -1), float(self.config.memory_quantile), dim=1)
         mask = distance <= float(self.config.benign_deviation_limit)
         if int(mask.sum().item()) < required:
+            anchored = self._student_anchored_candidates(
+                stacked,
+                student,
+                required,
+            )
+            if int(anchored.sum().item()) < required:
+                return mask, "freeze_no_safe_candidate"
+            anchored_center, _ = self._robust_center_variance(
+                stacked[anchored]
+            )
+            if not self._bounded_bootstrap_minority(
+                stacked,
+                anchored,
+                anchored_center,
+                student,
+            ):
+                return mask, "freeze_no_safe_candidate"
+            mask = anchored
+        if (
+            int(mask.sum().item())
+            < int(self.config.minimum_consensus_teachers)
+            and not self._bounded_bootstrap_minority(
+                stacked,
+                mask,
+                center,
+                student,
+            )
+        ):
             return mask, "freeze_no_safe_candidate"
         if trim_for_recovery and int(mask.sum().item()) > required:
             # A historical-memory fallback must not silently promote every
@@ -891,7 +1044,10 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         require_finite_tensor(student, phase="niabd", metric="centered_student_logits")
         self._validate_memory_shape(student.shape)
 
-        reference_candidates, warmup_reason = self._warmup_candidates(reference_stacked)
+        reference_candidates, warmup_reason = self._warmup_candidates(
+            reference_stacked,
+            student=student,
+        )
         action_candidates = reference_candidates.index_select(0, action_reference_indices)
         if self._trusted_mean is None:
             if warmup_reason != "warmup_robust_update":
@@ -1002,6 +1158,25 @@ class NeuroInspiredAdaptiveBackdoorDefense:
         median_consensus_deviation = float(
             torch.median(consensus_teacher_deviation).item()
         )
+        recovery_required = self._required_consensus_teachers(
+            int(reference_stacked.shape[0])
+        )
+        anchored_recovery = self._student_anchored_candidates(
+            reference_stacked,
+            student,
+            recovery_required,
+            enforce_absolute_distance=False,
+        )
+        anchored_recovery_ready = (
+            int(reference_stacked.shape[0])
+            >= int(self.config.minimum_consensus_teachers)
+            and int(anchored_recovery.sum().item()) >= recovery_required
+        )
+        anchored_consensus: Optional[torch.Tensor] = None
+        if anchored_recovery_ready:
+            anchored_consensus, _ = self._robust_center_variance(
+                reference_stacked[anchored_recovery]
+            )
         # Recovery asks whether the current cohort contains the configured
         # compact majority, rather than whether it has no more than the much
         # smaller historical-memory anomaly budget.  Reusing
@@ -1022,11 +1197,15 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             median_consensus_deviation
             - float(self.config.benign_deviation_limit),
         ) / float(self.config.benign_deviation_limit)
-        self._recovery_risk = float(
-            max(
-                0.0,
-                outlier_excess,
-                median_excess,
+        self._recovery_risk = (
+            0.0
+            if anchored_recovery_ready
+            else float(
+                max(
+                    0.0,
+                    outlier_excess,
+                    median_excess,
+                )
             )
         )
         # Minority protection and majority recovery answer different
@@ -1059,9 +1238,17 @@ class NeuroInspiredAdaptiveBackdoorDefense:
             0.0,
             minority_fraction - one_teacher_fraction,
         ) / minority_scale
+        recovery_consensus = (
+            anchored_consensus
+            if anchored_consensus is not None
+            else current_consensus
+        )
         student_consensus_distance = float(
             torch.quantile(
-                ((student - current_consensus).abs() / (std + self.config.epsilon))
+                (
+                    (student - recovery_consensus).abs()
+                    / (std + self.config.epsilon)
+                )
                 .reshape(-1),
                 0.95,
             ).item()
@@ -1140,12 +1327,32 @@ class NeuroInspiredAdaptiveBackdoorDefense:
                 purification_excess, float(alpha) * memory_excess
             )
         elif self._phase == self.RECOVERY:
-            # RECOVERY differs from SUSPICIOUS through clipped memory updates,
-            # not by abruptly disabling continuous purification.  A moderate
-            # historical correction protects the server while the reference
-            # moves toward the compact current majority.
-            purification_excess = torch.maximum(
-                purification_excess, float(alpha) * memory_excess
+            # A student-corroborated strict-majority teacher may avoid a pure
+            # historical-drift correction only while its independent robust
+            # teacher score remains below the configured anomaly boundary.
+            # The stricter memory-eligibility conjunction is intentionally not
+            # reused here: during common representation drift its absolute
+            # neuron gates can reject the entire benign cohort, even though the
+            # relative teacher score still separates its abnormal minority.
+            # Memory writes retain the original strict eligibility path.  The
+            # teacher also continues through the full anomaly path above, and
+            # every teacher outside this doubly corroborated set keeps strong
+            # historical correction.
+            action_recovery_majority = (
+                anchored_recovery.index_select(0, action_reference_indices)
+                & (
+                    action_metrics["teacher_memory_score"]
+                    <= float(self.config.teacher_score_beta)
+                )
+            ).view(-1, 1, 1)
+            historical_protection = torch.maximum(
+                purification_excess,
+                float(alpha) * memory_excess,
+            )
+            purification_excess = torch.where(
+                action_recovery_majority,
+                purification_excess,
+                historical_protection,
             )
         elif preemptive_strength > 0.0:
             purification_excess = torch.maximum(
@@ -1204,23 +1411,25 @@ class NeuroInspiredAdaptiveBackdoorDefense:
 
         insufficient_consensus = (
             self._phase in {self.NORMAL, self.RECOVERY}
-            and int(reference_eligible.sum().item())
-            < int(self.config.minimum_consensus_teachers)
+            and (
+                int(reference_stacked.shape[0])
+                < int(self.config.minimum_consensus_teachers)
+                or int(reference_eligible.sum().item())
+                < self._required_consensus_teachers(
+                    int(reference_stacked.shape[0])
+                )
+            )
         )
         update_mask = reference_eligible.clone()
         consensus_recovery = False
         if insufficient_consensus:
             recovery_candidates, recovery_reason = self._warmup_candidates(
-                reference_stacked, trim_for_recovery=True
+                reference_stacked,
+                student=student,
+                trim_for_recovery=True,
             )
-            required = max(
-                int(self.config.minimum_consensus_teachers),
-                int(
-                    ceil(
-                        float(self.config.consensus_recovery_fraction)
-                        * int(reference_stacked.shape[0])
-                    )
-                ),
+            required = self._required_consensus_teachers(
+                int(reference_stacked.shape[0])
             )
             if (
                 recovery_reason == "warmup_robust_update"

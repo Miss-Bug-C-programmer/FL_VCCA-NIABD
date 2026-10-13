@@ -1,0 +1,36 @@
+{
+  "manifest_version": "fedagg-manifest-v3",
+  "result_schema_version": "fedagg-results-v3",
+  "run_class": "formal",
+  "attack_condition": "attacked",
+  "dataset": "cifar10",
+  "runtime": "process-semi-async",
+  "rounds": 80,
+  "seeds": [
+    1
+  ],
+  "num_clients_list": [
+    20
+  ],
+  "partition_schemes": [
+    "dirichlet"
+  ],
+  "private_dataset_size": 0,
+  "aggregation_rule": "mean-soft-probabilities",
+  "aggregation_trim_fraction": 0.1,
+  "server_architecture": "resnet18",
+  "client_architectures": [],
+  "method": "niabd",
+  "vcaa_enabled": false,
+  "niabd_enabled": true,
+  "admission_owner": "none",
+  "defense_owner": "niabd",
+  "vcaa_algorithm_version": "none",
+  "vcaa_config": null,
+  "age_scale_mode": "none",
+  "freshness_runtime_semantics": "server-observed-generated-received-consumed-lineage",
+  "amp_enabled": true,
+  "max_consecutive_amp_overflows": 8,
+  "formal_config_unchanged": true,
+  "manifest_sha256": "0f26b71ab6d80d7c9f3881cd54ae9e7c80a3ef846d8dabda18132fbfd99ca526"
+}

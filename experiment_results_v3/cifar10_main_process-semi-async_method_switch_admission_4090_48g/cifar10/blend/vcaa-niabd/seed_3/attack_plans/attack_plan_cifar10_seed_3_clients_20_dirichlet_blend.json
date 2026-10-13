@@ -1,0 +1,42 @@
+{
+  "config": {
+    "attack_end_round": 35,
+    "attack_start_round": 15,
+    "attack_type": "blend",
+    "blend_alpha": 0.2,
+    "dba_parts": 4,
+    "dynamic_period": 10,
+    "malicious_fraction": 0.2,
+    "poison_interval": 1,
+    "poison_ratio": 0.2,
+    "target_label": 0,
+    "trigger_size": 4,
+    "trigger_value": 1.0
+  },
+  "dba_trigger_assignments": [
+    [
+      7,
+      0
+    ],
+    [
+      9,
+      1
+    ],
+    [
+      10,
+      2
+    ],
+    [
+      18,
+      3
+    ]
+  ],
+  "malicious_client_ids": [
+    7,
+    9,
+    10,
+    18
+  ],
+  "num_clients": 20,
+  "seed": 3
+}
