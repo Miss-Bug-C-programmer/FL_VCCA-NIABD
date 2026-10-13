@@ -212,6 +212,9 @@ BACKDOOR_COLUMNS = (
     "diagnostic_usage", "diagnostic_reporter_trust", "diagnostic_seed",
     "diagnostic_proxy_samples", "clean_proxy_target_probability",
     "triggered_proxy_target_probability",
+    "diagnostic_teacher_target_probability_before_purification",
+    "diagnostic_teacher_target_probability_after_purification",
+    "diagnostic_teacher_target_probability_delta",
     "clean_trigger_logit_l1_deviation",
     "clean_trigger_logit_l2_deviation",
     "clean_trigger_prediction_flip_rate",
@@ -570,6 +573,27 @@ def _round_rows(
             ),
             "trigger_lift": float(
                 _metric(metrics, "trigger_lift", round_idx, np.nan)
+            ),
+            "diagnostic_student_target_probability_before": float(
+                _metric(metrics, "diagnostic_student_target_probability_before", round_idx, np.nan)
+            ),
+            "diagnostic_teacher_target_probability_before_purification": float(
+                _metric(metrics, "diagnostic_teacher_target_probability_before_purification", round_idx, np.nan)
+            ),
+            "diagnostic_teacher_target_probability_after_purification": float(
+                _metric(metrics, "diagnostic_teacher_target_probability_after_purification", round_idx, np.nan)
+            ),
+            "diagnostic_aggregated_target_probability": float(
+                _metric(metrics, "diagnostic_aggregated_target_probability", round_idx, np.nan)
+            ),
+            "diagnostic_student_target_probability_after": float(
+                _metric(metrics, "diagnostic_student_target_probability_after", round_idx, np.nan)
+            ),
+            "diagnostic_purification_target_probability_delta": float(
+                _metric(metrics, "diagnostic_purification_target_probability_delta", round_idx, np.nan)
+            ),
+            "diagnostic_student_target_probability_delta": float(
+                _metric(metrics, "diagnostic_student_target_probability_delta", round_idx, np.nan)
             ),
             "aa_target_label": int(
                 _metric(metrics, "aa_target_label", round_idx,
@@ -2627,7 +2651,7 @@ def main() -> None:
     parser.add_argument("--aggregation-trim-fraction", type=float, default=0.1)
     parser.add_argument(
         "--server-architecture",
-        choices=["resnet18", "small_cnn", "mobilenet_v2"],
+        choices=["resnet18", "resnet18_v2", "small_cnn", "mobilenet_v2"],
         default="resnet18",
     )
     parser.add_argument(

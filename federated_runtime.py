@@ -28,6 +28,7 @@ from admission import (
 from defense import DefenseResult, KnowledgeDefenseController
 from federated_client import FederatedClient
 from federated_server import FederatedServer
+from numeric_integrity import require_finite_tensor
 from result_schema import VCAA_ALGORITHM_VERSION
 
 
@@ -56,6 +57,40 @@ def _model_is_finite(model: nn.Module) -> bool:
 def _tensor_sha256(tensor: torch.Tensor) -> str:
     value = tensor.detach().cpu().contiguous()
     return hashlib.sha256(value.numpy().tobytes()).hexdigest()
+
+
+def _mean_target_probability(logits: torch.Tensor, target_label: int) -> float:
+    """Experiment-only clean-proxy diagnostic; never a defense input."""
+
+    tensor = logits.detach().cpu().float()
+    if tensor.ndim != 2 or not 0 <= int(target_label) < int(tensor.shape[1]):
+        raise ValueError("Target-probability diagnostic received invalid logits.")
+    require_finite_tensor(
+        tensor,
+        phase="diagnostic",
+        metric="clean_proxy_logits",
+    )
+    return float(torch.softmax(tensor, dim=1)[:, int(target_label)].mean().item())
+
+
+def _mean_teacher_target_probability(
+    knowledge_by_client: Dict[int, TeacherKnowledge],
+    client_ids: Sequence[int],
+    target_label: int,
+) -> float:
+    ids = [int(client_id) for client_id in client_ids]
+    if not ids:
+        return float("nan")
+    return float(
+        sum(
+            _mean_target_probability(
+                knowledge_by_client[client_id].logits,
+                int(target_label),
+            )
+            for client_id in ids
+        )
+        / len(ids)
+    )
 
 
 def _finite_int(value, default: int = 0) -> int:
@@ -869,6 +904,13 @@ def run_fedagg_server_client(
         "clean_target_denominator": [],
         "clean_target_valid": [],
         "trigger_lift": [],
+        "diagnostic_student_target_probability_before": [],
+        "diagnostic_teacher_target_probability_before_purification": [],
+        "diagnostic_teacher_target_probability_after_purification": [],
+        "diagnostic_aggregated_target_probability": [],
+        "diagnostic_student_target_probability_after": [],
+        "diagnostic_purification_target_probability_delta": [],
+        "diagnostic_student_target_probability_delta": [],
         "aa_target_label": [],
         "aa_trigger_type": [],
         "aa_trigger_size": [],
@@ -965,6 +1007,10 @@ def run_fedagg_server_client(
             client.train_local(
                 epochs=effective_local_epochs,
                 learning_rate=float(learning_rate),
+                # Reverse KD is a public-information budget shared by every
+                # client.  It follows the configured base epochs, never an
+                # attack-only private epoch multiplier.
+                proxy_kd_passes=int(local_epochs),
                 batch_transform=poisoner,
                 round_number=round_number,
             )
@@ -1044,6 +1090,7 @@ def run_fedagg_server_client(
             decision,
             num_clients=len(clients),
         )
+        raw_knowledge_by_client = knowledge_by_client
         defense_start = time.perf_counter()
         defense_result = server.apply_defense(
             knowledge_by_client,
@@ -1091,6 +1138,80 @@ def run_fedagg_server_client(
                 attack_plan.malicious_client_ids if attack_plan is not None else ()
             ),
         )
+        target_probability_diagnostic = {
+            "diagnostic_scope": "experiment-only oracle diagnostic",
+            "diagnostic_usage": "not a deployable defense signal",
+            "diagnostic_student_target_probability_before": float("nan"),
+            "diagnostic_teacher_target_probability_before_purification": float("nan"),
+            "diagnostic_teacher_target_probability_after_purification": float("nan"),
+            "diagnostic_aggregated_target_probability": float("nan"),
+            "diagnostic_student_target_probability_after": float("nan"),
+            "diagnostic_purification_target_probability_delta": float("nan"),
+            "diagnostic_student_target_probability_delta": float("nan"),
+        }
+        if enable_backdoor_diagnostics:
+            if attack_plan is None:
+                raise ValueError(
+                    "Backdoor diagnostics require an explicit AttackPlan."
+                )
+            target_label = int(attack_plan.config.target_label)
+            student_target_before = _mean_target_probability(
+                student_snapshot,
+                target_label,
+            )
+            teacher_target_before = _mean_teacher_target_probability(
+                raw_knowledge_by_client,
+                admitted_ids,
+                target_label,
+            )
+            teacher_target_after = _mean_teacher_target_probability(
+                knowledge_by_client,
+                admitted_ids,
+                target_label,
+            )
+            target_probability_diagnostic.update(
+                diagnostic_student_target_probability_before=(
+                    student_target_before
+                ),
+                diagnostic_teacher_target_probability_before_purification=(
+                    teacher_target_before
+                ),
+                diagnostic_teacher_target_probability_after_purification=(
+                    teacher_target_after
+                ),
+                diagnostic_purification_target_probability_delta=(
+                    teacher_target_after - teacher_target_before
+                ),
+            )
+            for record in backdoor_records:
+                client_id = int(record["client_id"])
+                before = (
+                    _mean_target_probability(
+                        raw_knowledge_by_client[client_id].logits,
+                        target_label,
+                    )
+                    if client_id in raw_knowledge_by_client
+                    else float("nan")
+                )
+                after = (
+                    _mean_target_probability(
+                        knowledge_by_client[client_id].logits,
+                        target_label,
+                    )
+                    if client_id in knowledge_by_client
+                    else float("nan")
+                )
+                record.update(
+                    diagnostic_teacher_target_probability_before_purification=(
+                        before
+                    ),
+                    diagnostic_teacher_target_probability_after_purification=(
+                        after
+                    ),
+                    diagnostic_teacher_target_probability_delta=(
+                        after - before
+                    ),
+                )
 
         distill_start = time.perf_counter()
         aggregation_ids = admitted_ids
@@ -1117,6 +1238,14 @@ def run_fedagg_server_client(
             trim_fraction=float(aggregation_trim_fraction),
             weights=aggregation_weights,
         )
+        if enable_backdoor_diagnostics and aggregated_probabilities is not None:
+            target_probability_diagnostic[
+                "diagnostic_aggregated_target_probability"
+            ] = float(
+                aggregated_probabilities[
+                    :, int(attack_plan.config.target_label)
+                ].mean().item()
+            )
         try:
             server_updated = server.train_from_teacher_probabilities(
                 aggregated_probabilities,
@@ -1177,6 +1306,25 @@ def run_fedagg_server_client(
             if round_defense_state is not None:
                 defense_controller.restore_state(round_defense_state)
 
+        if enable_backdoor_diagnostics:
+            student_target_after = _mean_target_probability(
+                server.student_proxy_logits(),
+                int(attack_plan.config.target_label),
+            )
+            student_target_before = float(
+                target_probability_diagnostic[
+                    "diagnostic_student_target_probability_before"
+                ]
+            )
+            target_probability_diagnostic.update(
+                diagnostic_student_target_probability_after=(
+                    student_target_after
+                ),
+                diagnostic_student_target_probability_delta=(
+                    student_target_after - student_target_before
+                ),
+            )
+
         if training_policy is not None:
             if rollback:
                 server.restore_training_state(round_training_state)
@@ -1194,6 +1342,7 @@ def run_fedagg_server_client(
                                        for client in clients) if not rollback else 0
             diagnostic["client_optimizer_steps"] = sum(int(client.last_numeric_stats.get("optimizer_step_count", 0)) for client in clients)
             diagnostic["client_kd_optimizer_steps"] = sum(int(client.last_numeric_stats.get("client_kd_optimizer_step_count", 0)) for client in clients)
+            diagnostic.update(target_probability_diagnostic)
             metrics.setdefault("training_diagnostics", []).append(diagnostic)
             print("[Training] " + json.dumps(diagnostic, sort_keys=True))
 
@@ -1558,6 +1707,16 @@ def run_fedagg_server_client(
         for key in ("clean_target_numerator", "clean_target_denominator"):
             metrics[key].append(int(backdoor_eval[key]))
         metrics["clean_target_valid"].append(bool(backdoor_eval["clean_target_valid"]))
+        for key in (
+            "diagnostic_student_target_probability_before",
+            "diagnostic_teacher_target_probability_before_purification",
+            "diagnostic_teacher_target_probability_after_purification",
+            "diagnostic_aggregated_target_probability",
+            "diagnostic_student_target_probability_after",
+            "diagnostic_purification_target_probability_delta",
+            "diagnostic_student_target_probability_delta",
+        ):
+            metrics[key].append(float(target_probability_diagnostic[key]))
         metrics["aa_target_label"].append(
             int(attack_plan.config.target_label) if attack_plan is not None else -1
         )

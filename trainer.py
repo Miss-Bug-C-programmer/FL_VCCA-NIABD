@@ -332,6 +332,7 @@ def local_train(
     scaler=None,
     max_consecutive_amp_overflows=DEFAULT_MAX_CONSECUTIVE_AMP_OVERFLOWS,
     proxy_kd_batches=None, client_kd_weight=0.0, distill_temperature=2.0,
+    proxy_kd_passes=None,
 ):
     """Train one local client model.
 
@@ -354,6 +355,11 @@ def local_train(
         raise ValueError("distill_temperature must be finite and positive")
     if client_kd_weight > 0 and proxy_kd_batches is None:
         raise ValueError("Positive KD weight requires aligned proxy batches")
+    if proxy_kd_passes is not None:
+        if isinstance(proxy_kd_passes, bool) or int(proxy_kd_passes) != proxy_kd_passes:
+            raise ValueError("proxy_kd_passes must be an integer when provided")
+        if int(proxy_kd_passes) < 0:
+            raise ValueError("proxy_kd_passes must be nonnegative")
     model.train()
     if bool(strict_numeric_checks):
         initial_context = dict(numeric_context or {})
@@ -376,19 +382,24 @@ def local_train(
     step = 0
     consecutive_amp_overflows = 0
     # A fixed public proxy set must not be replayed once for every private
-    # mini-batch.  Give joint KD one complete proxy pass per local epoch, so
-    # its exposure is independent of private partition size while malicious
-    # multi-epoch training still receives the same per-epoch public budget.
+    # mini-batch.  Runtime callers provide an explicit public-data budget so
+    # attack-only private epoch multipliers cannot also multiply reverse KD.
+    # Direct callers that omit it retain the historical one-pass-per-epoch
+    # behavior for backwards compatibility.
+    effective_proxy_kd_passes = (
+        int(epochs) if proxy_kd_passes is None else int(proxy_kd_passes)
+    )
     proxy_kd_budget = (
-        int(proxy_kd_batches.batches_per_pass) * int(epochs)
+        int(proxy_kd_batches.batches_per_pass) * effective_proxy_kd_passes
         if float(client_kd_weight) > 0.0
         else 0
     )
     proxy_kd_attempts = 0
     if isinstance(numeric_stats, dict):
+        numeric_stats["client_kd_pass_budget"] = int(effective_proxy_kd_passes)
         numeric_stats["client_kd_batch_budget"] = int(proxy_kd_budget)
 
-    for _ in range(epochs):
+    for local_epoch_index in range(epochs):
         for imgs, labels in dataloader:
             step += 1
             context = _batch_numeric_context(numeric_context, step)
@@ -432,6 +443,10 @@ def local_train(
                 kd_active = (
                     float(client_kd_weight) > 0.0
                     and proxy_kd_attempts < proxy_kd_budget
+                    and (
+                        proxy_kd_passes is None
+                        or local_epoch_index < effective_proxy_kd_passes
+                    )
                 )
                 if kd_active:
                     kd = _proxy_kd_loss(model, proxy_kd_batches, device, float(distill_temperature),

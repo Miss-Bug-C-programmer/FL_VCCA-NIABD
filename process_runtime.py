@@ -758,6 +758,9 @@ def _client_process_main(
                     proxy_kd_batches=proxy_kd_batches,
                     client_kd_weight=float(task.get("client_kd_weight", 0.0)) if joint_kd else 0.0,
                     distill_temperature=float(task["distillation_temperature"]),
+                    # Keep the public reverse-KD exposure independent from
+                    # attack-only private epoch multipliers.
+                    proxy_kd_passes=int(task["local_epochs"]),
                     numeric_context=numeric_context,
                     scaler=local_scaler,
                     max_consecutive_amp_overflows=int(
@@ -879,10 +882,9 @@ def _client_process_main(
                     local_numeric_stats.get("optimizer_step_count", 0)
                 ),
                 distillation_optimizer_step_count=int(
-                    distillation_numeric_stats.get(
-                        "optimizer_step_count",
-                        0,
-                    )
+                    local_numeric_stats.get("client_kd_optimizer_step_count", 0)
+                    if joint_kd
+                    else distillation_numeric_stats.get("optimizer_step_count", 0)
                 ),
             )
             upload_delay_s = float(task["upload_delay_s"])
@@ -2038,8 +2040,10 @@ def run_fedagg_server_client_process_async(
                     current_round=server_round, query_id=data_plan.proxy_version,
                     proxy_version=data_plan.proxy_version, enable_reverse=enable_client_distillation)
                 diagnostic["client_optimizer_steps"] = sum(int(event["local_optimizer_step_count"]) for event in round_events)
-                diagnostic["client_kd_optimizer_steps"] = sum(int(event["local_optimizer_step_count"]) for event in round_events
-                    if coordinator.task_registry[str(event["task_id"])].task.client_kd_weight > 0)
+                diagnostic["client_kd_optimizer_steps"] = sum(
+                    int(event["distillation_optimizer_step_count"])
+                    for event in round_events
+                )
                 metrics.setdefault("training_diagnostics", []).append(diagnostic)
                 print("[Training] " + json.dumps(diagnostic, sort_keys=True))
                 latest_server_packet = server.published_packet
@@ -2175,8 +2179,7 @@ def run_fedagg_server_client_process_async(
                     admitted_ids
                 ),
                 "client_reverse_distillations": sum(
-                    int(event["local_optimizer_step_count"]) > 0 and
-                    coordinator.task_registry[str(event["task_id"])].task.client_kd_weight > 0
+                    int(event["distillation_optimizer_step_count"]) > 0
                     for event in round_events
                 ) if training_policy is not None else sum(
                     1 for event in round_events

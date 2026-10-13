@@ -8,7 +8,7 @@ from typing import List, Sequence
 import torch
 import torch.nn as nn
 
-from models import build_mobilenet_v2, build_resnet18, SmallCNN
+from models import build_mobilenet_v2, build_resnet18, build_resnet18_v2, SmallCNN
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,12 @@ def build_model(
             in_channels=spec.in_channels,
             small_input=spec.small_input,
         )
+    elif architecture in {"resnet18_v2", "resnet18-v2", "resnetv2"}:
+        model = build_resnet18_v2(
+            spec.num_classes,
+            in_channels=spec.in_channels,
+            small_input=spec.small_input,
+        )
     elif architecture in {"small_cnn", "smallcnn"}:
         model = SmallCNN(spec.num_classes, in_channels=spec.in_channels)
     elif architecture in {"mobilenet_v2", "mobilenet-v2", "mobilenet"}:
@@ -65,7 +71,8 @@ def build_model(
         )
     else:
         raise ValueError(
-            f"Unsupported architecture={architecture!r}; expected resnet18, small_cnn, or mobilenet_v2."
+            f"Unsupported architecture={architecture!r}; expected resnet18, "
+            "resnet18_v2, small_cnn, or mobilenet_v2."
         )
     return model.to(torch.device(device))
 

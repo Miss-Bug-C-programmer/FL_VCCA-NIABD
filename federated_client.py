@@ -84,6 +84,7 @@ class FederatedClient:
         *,
         epochs: int,
         learning_rate: float,
+        proxy_kd_passes: int | None = None,
         batch_transform=None,
         round_number: int = 0,
     ) -> None:
@@ -101,6 +102,7 @@ class FederatedClient:
             round_number=int(round_number),
             optimizer=self.local_optimizer, scaler=self.local_scaler, numeric_stats=self.last_numeric_stats,
             proxy_kd_batches=batches, client_kd_weight=self.kd_weight, distill_temperature=self.kd_temperature,
+            proxy_kd_passes=proxy_kd_passes,
         )
         self.model_round += int(self.last_numeric_stats.get("optimizer_step_count", 0) > 0)
 
